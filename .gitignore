@@ -1,0 +1,17 @@
+/target
+/data
+.env
+
+# --- SECRETS / KEYS: never commit these ---
+# Private keys. Committing this = anyone with the repo can drain the wallets.
+wallets/
+test-wallet.json
+*keypair*.json
+# Trade history + kill switch (operational state, not source).
+sniper_audit.jsonl
+/HALT
+
+detected_pools.jsonl
+*.jsonl
+*.db
+*.sqlite

@@ -1,0 +1,87 @@
+[package]
+name = "volens"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time Solana new liquidity pool detector (Raydium V4 + CPMM + PumpSwap)"
+license = "MIT"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
+futures = "0.3"
+
+# Yellowstone gRPC (Geyser) streaming
+yellowstone-grpc-client = "13.2"
+yellowstone-grpc-proto = "12.5"
+tonic = "0.14"
+
+# WebSocket fallback source (logsSubscribe on a standard RPC plan, no gRPC).
+# rustls to match reqwest — pulling in native-tls would mean two TLS stacks.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+
+# Config + serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+dotenvy = "0.15"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Alerts (thin Telegram Bot API client via reqwest; avoids the full teloxide framework)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Encoding / time
+bs58 = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- Solana primitives, only for the `sniper` execution path ---
+# Split crates rather than the monolithic solana-sdk, and optional so a default
+# (detector-only) build pays nothing for them. Used for PDA/ATA derivation,
+# message serialization and signing — correctness-critical work that must not be
+# hand-rolled in code that moves money.
+solana-pubkey = { version = "4", features = ["curve25519"], optional = true }
+solana-instruction = { version = "3", optional = true }
+solana-keypair = { version = "3", optional = true }
+solana-signer = { version = "3", optional = true }
+solana-message = { version = "4", features = ["serde"], optional = true }
+solana-transaction = { version = "4", features = ["serde", "verify"], optional = true }
+solana-hash = { version = "4", optional = true }
+solana-system-interface = { version = "3", features = ["bincode"], optional = true }
+spl-associated-token-account-interface = { version = "2", optional = true }
+spl-token-interface = { version = "3", optional = true }
+solana-compute-budget-interface = { version = "3", features = ["borsh"], optional = true }
+bincode = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+
+# Optional SQLite persistence (bundled sqlite needs a C compiler; off by default)
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+# Used only to assert our hardcoded Anchor discriminators are correct.
+sha2 = "0.10"
+
+[features]
+default = []
+sqlite = ["dep:rusqlite"]
+# Guarded auto-execution. Off by default: a default build cannot trade at all.
+# Enabling the feature still does not arm anything — see [sniper] in config.toml
+# and the safety model at the top of src/sniper.rs.
+sniper = [
+    "dep:solana-pubkey", "dep:solana-instruction", "dep:solana-keypair",
+    "dep:solana-signer", "dep:solana-message", "dep:solana-transaction",
+    "dep:solana-hash", "dep:solana-system-interface",
+    "dep:spl-associated-token-account-interface", "dep:spl-token-interface",
+    "dep:solana-compute-budget-interface", "dep:bincode", "dep:base64",
+]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

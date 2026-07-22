@@ -1,0 +1,242 @@
+# volens — new liquidity pool detector
+# Secrets belong in .env / the environment, NOT here. Env vars override this file.
+
+[grpc]
+# --- Transaction source ---
+# volens needs ONE source. gRPC is preferred; WebSocket is the fallback.
+#
+#   gRPC (Yellowstone/Geyser)  — full transactions streamed at `processed`.
+#                                Needs a plan that includes Geyser.
+#   WebSocket (logsSubscribe)  — works on a STANDARD RPC plan with no Geyser.
+#                                Leave `endpoint` empty to use it.
+#
+# The WebSocket path is SECONDS slower, and that is not tunable: logsSubscribe
+# delivers only {signature, err, logs}, so each candidate needs a follow-up
+# getTransaction — and getTransaction refuses any commitment below `confirmed`.
+# Measured end to end: 1.4-6s (avg 2.35s) behind the log event. Fine for
+# alerting; a real disadvantage against snipers running Geyser.
+#
+# Leave empty to run WebSocket-only on [rpc].url. Override with GRPC_ENDPOINT.
+endpoint = ""
+# Auth token — leave blank here and set GRPC_X_TOKEN in the environment.
+x_token = ""
+# processed = fastest (best for detection), confirmed = safer, finalized = slowest.
+commitment = "processed"
+backoff_min_secs = 1
+backoff_max_secs = 30
+# Fall back to WebSocket when gRPC cannot connect. Set false to make a broken
+# gRPC endpoint a hard failure instead — correct if running seconds behind
+# silently would be worse for you than not running.
+fallback_to_websocket = true
+# Consecutive CONNECT failures before falling back. Not 1: a single blip should
+# not demote a healthy gRPC setup for the rest of the session. A session that
+# connected and later dropped is a normal reconnect and does not count.
+# Fallback is permanent for the process — restart once gRPC is fixed.
+max_failures_before_fallback = 3
+
+[filters]
+# Only emit pools paired against a recognized quote asset (WSOL/USDC).
+# Set false to see every pool creation, including exotic pairs.
+require_quote_pair = true
+# Enable/disable venues: raydium_v4 | raydium_cpmm | pumpswap
+programs = ["raydium_v4", "raydium_cpmm", "pumpswap"]
+# Mints treated as the "quote" side (i.e. never the newly launched token).
+quote_mints = [
+  "So11111111111111111111111111111111111111112", # WSOL
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", # USDC
+]
+
+[alerts]
+# Auto-enabled if TELEGRAM_BOT_TOKEN is set in the environment.
+telegram_enabled = false
+telegram_bot_token = ""
+telegram_chat_id = ""
+# Suppress repeat alerts for the same pool within this window.
+dedup_ttl_secs = 300
+
+# --- Inbound commands ---
+# Accept commands from Telegram: /status, /metrics, /balance, /halt, /help.
+#
+# /balance is read-only but NOT consequence-free: it reveals the trading
+# wallet's SOL and token-account count to everyone in authorized_chat_ids.
+# In a group chat, that is every member. There is deliberately no command that
+# can MOVE funds — no withdraw, no send, no key export.
+#
+# NOT auto-enabled by TELEGRAM_BOT_TOKEN, unlike outbound alerts. Sending alerts
+# and accepting remote control are different trust decisions.
+#
+# /halt writes [sniper].kill_switch_file, which is checked before every trade —
+# so it stops trading immediately, with no restart, and stays halted across a
+# reboot because the file persists. There is deliberately NO /resume, /arm, or
+# /size: commands here can only REDUCE risk. Anyone who can message the bot can
+# stop your sniper (a safe failure); restarting it requires host access.
+commands_enabled = true
+
+# Chat IDs allowed to issue commands. REQUIRED when commands_enabled — an empty
+# list is a startup error, never "allow everyone". Unauthorized senders are
+# ignored silently (a reply would confirm the bot exists to a prober) and logged.
+# Get yours by messaging @userinfobot. Override: TELEGRAM_AUTHORIZED_CHAT_IDS
+# (comma-separated).
+authorized_chat_ids = []
+
+[storage]
+# jsonl | sqlite | none    (sqlite requires: cargo build --features sqlite)
+backend = "jsonl"
+path = "detected_pools.jsonl"
+
+[rpc]
+# Standard JSON-RPC endpoint for post-detection enrichment, separate from the
+# gRPC stream. Setting env RPC_URL auto-enables the liquidity + safety filters.
+url = ""
+# 'confirmed' is more reliable than 'processed' for freshly created accounts.
+commitment = "confirmed"
+# Accounts may need a slot or two to become queryable after creation.
+initial_delay_ms = 400
+retries = 3
+retry_delay_ms = 500
+# Explicit WebSocket URL. Empty derives it from `url` (https -> wss), which is
+# correct for Helius, Triton and QuickNode. Set only if your provider serves
+# WebSocket on a different host or path. Override: RPC_WS_URL.
+ws_url = ""
+
+[liquidity]
+# Read the quote-side vault after detection and drop pools that launched thin.
+enabled = false
+# Minimum quote-side liquidity in UI units of the quote asset:
+# SOL for WSOL pairs, USDC for USDC pairs. Override: MIN_QUOTE_LIQUIDITY.
+# Only the quote side is measured — the token side can hold a billion units of
+# something worthless, so it says nothing about committed capital.
+# Raised from 5 to 15: the single biggest noise cut. Most dead/rug PumpSwap
+# launches start thin; 15 SOL filters the bulk of them. Tune up for less noise.
+min_quote_liquidity = 15.0
+# If the balance can't be read, emit anyway with unknown liquidity rather than
+# dropping. A missed real launch costs more than one noisy alert.
+emit_on_unknown = true
+
+[watch]
+# Delayed follow-up re-check on each detected pool.
+#
+# WHY: LP burn/lock is almost always a SEPARATE, LATER transaction than pool
+# creation. Measured on mainnet: one PumpSwap pool burned its LP 479s (~8 min)
+# after launch; a Raydium CPMM pool never burned at all. So LP custody cannot be
+# checked at detection time — a synchronous filter would reject legit launches.
+# The re-check also catches the outcome that actually costs money: liquidity
+# being pulled shortly after launch.
+# Auto-enabled when RPC_URL is set. Set false to turn the follow-up off entirely.
+enabled = false
+# When to re-check. Also when the VOLUME signal is measured, so this doubles as
+# the "volume in the first N seconds" window. 60s catches early momentum; raise
+# to catch slower rugs, lower to bias toward fresh volume.
+delay_secs = 60
+# Fraction of quote liquidity that must vanish to call it a pull.
+rug_drop_pct = 0.5
+# --- Volume / alpha signal ---
+# Net quote growth (SOL/USDC) within the window that flags a "📈 VOLUME SPIKE".
+# Buyers add quote and take token, so a rising quote vault IS net buy inflow —
+# this is the "potential alpha / real volume" filter, no extra RPC calls needed.
+# It fires a distinct alert on pools that actually drew buys. 0 disables.
+min_volume_growth_sol = 5.0
+# Alert on every follow-up, not just notable ones (pull / burn / volume).
+# Off by default so follow-ups don't become their own noise source.
+alert_on_all = false
+
+[safety]
+# Mint-authority checks on the launched token — the highest-signal rug filters
+# available from a single account read.
+enabled = false
+# Live mint authority => supply can be inflated at will.
+require_mint_authority_revoked = true
+# Live freeze authority => the classic honeypot: you can buy, then get frozen
+# out of selling. This one catches a lot.
+require_freeze_authority_revoked = true
+# Token-2022 extensions that can tax or block a sale (transfer fees, transfer
+# hooks, permanent delegate, non-transferable, default frozen state).
+reject_risky_extensions = true
+emit_on_unknown = true
+
+[log]
+# trace | debug | info | warn | error   (RUST_LOG overrides this entirely)
+level = "info"
+
+[sniper]
+# Guarded auto-execution. Requires: cargo build --features sniper
+# A default build cannot trade at all; enabling this without the feature is a
+# startup error, not a silent no-op.
+enabled = true
+# Live execution. This WILL spend real funds when true.
+#
+# No live trade has ever been executed by this code. Construction is verified
+# (golden fixtures + mainnet simulation on all three venues); signing,
+# submission, and confirmation are not — they cannot be without sending.
+# Read the "First Armed Trade Checklist" in the README before setting this.
+armed = false
+trade_size_sol = 0.05
+# Hard per-trade ceiling. trade_size_sol may not exceed it.
+max_trade_size_sol = 0.25
+daily_cap_sol = 1.0
+max_trades_per_day = 10
+# Refuse a second trade on the same pool within this window (seconds).
+# The alert dedup is NOT a spend guard: it expires, and a gRPC reconnect can
+# replay recent slots. Without this, a re-detected pool buys again. 0 disables.
+pool_cooldown_secs = 3600
+# Liquidity re-checked at execution time. Stricter than the alert filter on
+# purpose: unknown liquidity is alertable but NOT tradable.
+min_liquidity_sol = 10.0
+slippage_bps = 300
+# Touch this file to halt all execution immediately — no restart needed.
+kill_switch_file = "HALT"
+# Append-only record of every decision, allowed or denied.
+audit_log = "sniper_audit.jsonl"
+
+# Keypair file (Solana CLI JSON array). REQUIRED to arm.
+# Use a DEDICATED wallet, never your main one.
+keypair_path = ""
+
+# Pubkey to build and simulate as while in dry run.
+#
+# REQUIRED for a useful dry run. Without it the sniper refuses with
+# NoSimulationIdentity BEFORE building anything — you get a log full of skips
+# and learn nothing about whether your transactions are correct.
+#
+# With it set, a dry run builds the REAL transaction and simulates it against
+# live mainnet, reporting whether the trade would have succeeded. A pubkey
+# cannot sign, so this adds no capability.
+#
+# Use the FUNDED wallet you intend to arm with. Simulation runs against real
+# on-chain state, so an unfunded or unrelated address can report a clean result
+# that proves nothing about the real trade — the account simply doesn't have the
+# balance the real trade would need.
+simulate_as = "FBRjXds5PVUFxAEfdKGjKSpGbYmS8z5Qbdsoqk3q6SUM"
+
+# Refuse trades that move the pool more than this themselves. A brand-new thin
+# pool can be moved 30%+ by a single buy. 1000 = 10%.
+max_price_impact_bps = 1000
+
+# Simulate before every send, and refuse on failure. Leave this on.
+preflight = true
+confirm_timeout_secs = 30
+compute_unit_limit = 300000
+priority_fee_micro_lamports = 100000
+
+# Alert on EVERY dry-run rehearsal, not just ones that would fail. Only affects
+# DRY RUN — armed trades always alert with the real result. Off: irrelevant once
+# you're trading live. (Kept as a switch for future dry-run demos.)
+alert_on_all_rehearsals = false
+
+# --- Jito bundles ---
+# Submit atomically via Jito's block engine instead of plain RPC. Bundles bypass
+# the public mempool (front-run resistant) and are all-or-nothing.
+#
+# The tip rides INSIDE the bundle, so a bundle that does not land costs nothing —
+# no tip, no fee, nothing executed. That makes a non-landing bundle genuinely
+# safe to retry, unlike an unconfirmed plain transaction which may still land.
+#
+# Jito does NOT simulate bundles, so preflight above stays mandatory.
+jito_enabled = false
+jito_block_engine_url = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
+# Too low and the bundle simply never lands. Tip accounts are fetched from the
+# engine at startup, never hardcoded.
+jito_tip_lamports = 100000
+# Retry via plain RPC if the bundle does not land. OFF by default: a fallback can
+# land a trade you had already treated as skipped.
+jito_fallback_to_rpc = false

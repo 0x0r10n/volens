@@ -1,0 +1,28 @@
+services:
+  volens:
+    build: .
+    container_name: volens
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Persist detected pools + audit log across restarts.
+      - ./data:/app/data
+      # Generated keypairs. A NAMED volume, not a host bind mount: the private
+      # keys live inside Docker's managed storage, owned by the container user,
+      # never sitting in the repo or host filesystem. Generate them in the
+      # container (see README) — do not copy keys in.
+      - volens-wallets:/app/wallets
+      # Edit config without rebuilding the image.
+      - ./config.toml:/app/config.toml:ro
+    environment:
+      # Write the JSONL/sqlite output into the mounted volume.
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  volens-wallets:
