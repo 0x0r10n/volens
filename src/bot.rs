@@ -15,9 +15,11 @@
 //! * **Unauthorized senders get silence.** Not an error reply. Replying confirms
 //!   the bot exists and that the token is live, which is useful to a prober and
 //!   useless to you. The attempt is logged locally instead.
-//! * **Commands can pause/unpause and tighten — but never ARM or move funds.**
-//!   `/halt` and `/resume` toggle the kill switch; `/size` etc. are tighten-only
-//!   (clamped by the sniper's setters). What no command can do: arm a dry-run
+//! * **Commands can pause/unpause and tune — but never ARM or move funds.**
+//!   `/halt` and `/resume` toggle the kill switch. `/slippage` and
+//!   `/min-liquidity` are tighten-only; `/size` can raise the trade size up to
+//!   `max_trade_size_sol` (unbounded when that ceiling is 0), so an authorized
+//!   chat can increase spend. What no command can do: arm a dry-run
 //!   bot, or withdraw/transfer funds — there is no such primitive. So the worst
 //!   a compromised token achieves is un-pausing an *already host-armed* bot,
 //!   bounded by the daily caps, with no exfiltration path. Going live in the
@@ -900,8 +902,9 @@ impl Bot {
         }
     }
 
-    /// Apply a tighten-only parameter change. Every path clamps toward safer;
-    /// the sniper's setters refuse anything that would increase risk.
+    /// Apply a tunable parameter change. Slippage and min-liquidity are
+    /// tighten-only (clamp toward safer); `/size` can be raised up to the
+    /// configured `max_trade_size_sol` ceiling — unbounded when that is 0.
     fn render_set(&self, which: Tunable, arg: Option<&str>) -> String {
         #[cfg(not(feature = "sniper"))]
         {
@@ -963,14 +966,15 @@ impl Bot {
          New wallet · Metrics · Halt.\n\n\
          <b>Typed (take a value):</b>\n\
          • <code>/use name</code> — pick the active wallet (applies on restart)\n\
-         • <code>/size 0.01</code> — lower the trade size\n\
+         • <code>/size 0.01</code> — set the trade size (SOL)\n\
          • <code>/slippage 200</code> — tighten slippage\n\
          • <code>/min-liquidity 25</code> — raise the liquidity floor\n\n\
          <code>/halt</code> and <code>/resume</code> toggle the kill switch.\n\n\
-         Value commands are <b>tighten-only</b>: they can make trading safer, \
-         never riskier. <code>/resume</code> clears the pause but does NOT arm — \
-         there is no <code>/arm</code> and no withdraw. Going live (arming) \
-         requires host access."
+         <code>/slippage</code> and <code>/min-liquidity</code> are \
+         <b>tighten-only</b>. <code>/size</code> can be raised (up to the host \
+         ceiling), so it can increase spend. <code>/resume</code> clears the \
+         pause but does NOT arm — there is no <code>/arm</code> and no withdraw. \
+         Going live (arming) requires host access."
             .to_string()
     }
 
@@ -1130,7 +1134,7 @@ impl Bot {
                 {"command": "wallets", "description": "list wallets, mark active"},
                 {"command": "new_wallet", "description": "create a wallet to fund (optional name)"},
                 {"command": "use", "description": "pick active wallet: /use name"},
-                {"command": "size", "description": "lower trade size: /size 0.01"},
+                {"command": "size", "description": "set trade size: /size 0.01"},
                 {"command": "slippage", "description": "tighten slippage: /slippage 200"},
                 {"command": "min_liquidity", "description": "raise liquidity floor: /min_liquidity 25"},
                 {"command": "metrics", "description": "full counter breakdown"},

@@ -67,9 +67,11 @@ dedup_ttl_secs = 300
 #
 # /halt writes [sniper].kill_switch_file, which is checked before every trade —
 # so it stops trading immediately, with no restart, and stays halted across a
-# reboot because the file persists. There is deliberately NO /resume, /arm, or
-# /size: commands here can only REDUCE risk. Anyone who can message the bot can
-# stop your sniper (a safe failure); restarting it requires host access.
+# reboot because the file persists. /resume clears it. There is deliberately NO
+# /arm (arming stays a host-only config change). /size CAN raise the trade size
+# now that max_trade_size_sol is unset — so an authorized chat can increase
+# spend. Anyone who can message the bot can stop your sniper (a safe failure);
+# keep the allowlist tight, since it now also guards how much the bot spends.
 commands_enabled = true
 
 # Chat IDs allowed to issue commands. REQUIRED when commands_enabled — an empty
@@ -169,12 +171,24 @@ enabled = true
 # (golden fixtures + mainnet simulation on all three venues); signing,
 # submission, and confirmation are not — they cannot be without sending.
 # Read the "First Armed Trade Checklist" in the README before setting this.
-armed = false
+#
+# ARMED. Requires a funded keypair (resolved from the active wallet in the
+# store). The spend ceilings below are disabled, so keep HALT engaged until you
+# are watching, and go live with a small trade_size_sol first.
+armed = true
 trade_size_sol = 0.05
-# Hard per-trade ceiling. trade_size_sol may not exceed it.
-max_trade_size_sol = 0.25
-daily_cap_sol = 1.0
-max_trades_per_day = 10
+# --- Spend ceilings: 0 = DISABLED (unlimited) on all three. ---
+# These are the only automated backstops against a runaway (buggy detection, a
+# honeypot that passes checks, or a reconnect replaying slots). With them at 0,
+# nothing bounds spend except /halt or an empty wallet. Set them to real numbers
+# to cap worst-case loss.
+# Per-trade ceiling. trade_size_sol may not exceed it; 0 = no ceiling, and the
+# Telegram /size command can then set any value.
+max_trade_size_sol = 0
+# Max SOL spent per day. 0 = unlimited.
+daily_cap_sol = 0
+# Max trades per day. 0 = unlimited.
+max_trades_per_day = 0
 # Refuse a second trade on the same pool within this window (seconds).
 # The alert dedup is NOT a spend guard: it expires, and a gRPC reconnect can
 # replay recent slots. Without this, a re-detected pool buys again. 0 disables.

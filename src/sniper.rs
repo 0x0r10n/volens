@@ -238,15 +238,25 @@ impl DailyState {
 /// toward SAFER. The `SniperConfig` values are the risk ceilings; these start
 /// equal to them and can move to reduce risk, never past them.
 ///
-/// The safety property: a command can lower size, tighten slippage, or raise the
-/// minimum liquidity — all of which reduce exposure. It can never do the reverse.
-/// So a leaked bot token cannot make the bot spend more or accept worse fills;
-/// raising a ceiling requires editing config on the host.
+/// Slippage and min-liquidity are tighten-only: a command can tighten slippage
+/// or raise the minimum liquidity — both reduce exposure — never the reverse.
+/// Trade size is the exception: it is freely settable up to `max_trade_size_sol`
+/// (unbounded when that ceiling is 0), so with the ceiling removed the Telegram
+/// allowlist — not a tighten-only rule — is the guard on how much the bot spends.
 #[derive(Debug, Clone, Copy)]
 struct Tunable {
     trade_size_sol: f64,
     slippage_bps: u16,
     min_liquidity_sol: f64,
+}
+
+/// Render a SOL ceiling for display: 0 means the cap is disabled (unlimited).
+fn fmt_cap_sol(v: f64) -> String {
+    if v > 0.0 {
+        format!("{v} SOL")
+    } else {
+        "unlimited".into()
+    }
 }
 
 pub struct Sniper {
@@ -282,7 +292,9 @@ impl Sniper {
     /// Arming loads the configured keypair; a missing path or unreadable file is
     /// a hard error, never a silent fallback to dry run.
     pub fn new(cfg: SniperConfig, rpc: Arc<RpcClient>, rpc_cfg: &RpcConfig) -> Result<Self> {
-        if cfg.trade_size_sol > cfg.max_trade_size_sol {
+        // max_trade_size_sol == 0 means "no per-trade ceiling" (unlimited).
+        // Only enforce the ceiling when one is actually configured.
+        if cfg.max_trade_size_sol > 0.0 && cfg.trade_size_sol > cfg.max_trade_size_sol {
             bail!(
                 "sniper.trade_size_sol ({}) exceeds max_trade_size_sol ({})",
                 cfg.trade_size_sol,
@@ -406,31 +418,33 @@ impl Sniper {
         let t = *self.tunable.lock().unwrap();
         vec![
             ("Mode", if armed { "🔴 ARMED (live)".into() } else { "🧪 dry run".into() }),
-            ("Trade size", format!("{} SOL (ceiling {})", t.trade_size_sol, c.trade_size_sol)),
+            ("Trade size", format!("{} SOL", t.trade_size_sol)),
             ("Slippage", format!("{} bps ({:.1}%)", t.slippage_bps, t.slippage_bps as f64 / 100.0)),
             ("Min liquidity", format!("{} SOL (floor {})", t.min_liquidity_sol, c.min_liquidity_sol)),
             ("Max price impact", format!("{} bps", c.max_price_impact_bps)),
-            ("— hard cap: max trade", format!("{} SOL", c.max_trade_size_sol)),
-            ("— hard cap: daily spend", format!("{} SOL", c.daily_cap_sol)),
-            ("— hard cap: trades/day", format!("{}", c.max_trades_per_day)),
+            ("— hard cap: max trade", fmt_cap_sol(c.max_trade_size_sol)),
+            ("— hard cap: daily spend", fmt_cap_sol(c.daily_cap_sol)),
+            ("— hard cap: trades/day", if c.max_trades_per_day == 0 { "unlimited".into() } else { c.max_trades_per_day.to_string() }),
             ("Pool cooldown", format!("{}s", c.pool_cooldown_secs)),
             ("Preflight", if c.preflight { "on".into() } else { "OFF".into() }),
             ("Jito bundles", if c.jito_enabled { "on".into() } else { "off".into() }),
         ]
     }
 
-    /// Lower the working trade size. Tighten-only: refuses any value above the
-    /// configured `trade_size_sol` ceiling, so a command can shrink the trade
-    /// but never grow it. Raising the ceiling is a host-side config change.
+    /// Set the working trade size from Telegram. Accepts any positive value up
+    /// to the configured `max_trade_size_sol`; when that ceiling is 0 the size
+    /// is unbounded on the high side. Unlike slippage/min-liquidity this is NOT
+    /// tighten-only — it can be raised — so with the ceiling removed the
+    /// allowlist is the only guard, and a typo here spends real SOL.
     pub fn set_trade_size(&self, v: f64) -> Result<String, String> {
-        if v <= 0.0 || v.is_nan() {
+        if v <= 0.0 || v.is_nan() || v.is_infinite() {
             return Err("trade size must be greater than 0".into());
         }
-        if v > self.cfg.trade_size_sol {
+        if self.cfg.max_trade_size_sol > 0.0 && v > self.cfg.max_trade_size_sol {
             return Err(format!(
-                "can only LOWER the trade size from here. Ceiling is {} SOL — \
-                 raise it in config on the host.",
-                self.cfg.trade_size_sol
+                "trade size {v} exceeds max_trade_size_sol {} — raise it in \
+                 config on the host.",
+                self.cfg.max_trade_size_sol
             ));
         }
         self.tunable.lock().unwrap().trade_size_sol = v;
@@ -529,7 +543,7 @@ impl Sniper {
         }
 
         let size = tuned.trade_size_sol;
-        if size > self.cfg.max_trade_size_sol {
+        if self.cfg.max_trade_size_sol > 0.0 && size > self.cfg.max_trade_size_sol {
             return Err(Denial::TradeSizeExceedsMax { size, max: self.cfg.max_trade_size_sol });
         }
 
@@ -543,13 +557,14 @@ impl Sniper {
             {
                 return Err(Denial::PoolCoolingDown { seconds_remaining });
             }
-            if st.trades >= self.cfg.max_trades_per_day {
+            // 0 disables each daily limit (unlimited).
+            if self.cfg.max_trades_per_day > 0 && st.trades >= self.cfg.max_trades_per_day {
                 return Err(Denial::DailyTradeCountReached {
                     count: st.trades,
                     max: self.cfg.max_trades_per_day,
                 });
             }
-            if st.spent + size > self.cfg.daily_cap_sol {
+            if self.cfg.daily_cap_sol > 0.0 && st.spent + size > self.cfg.daily_cap_sol {
                 return Err(Denial::DailyCapReached {
                     spent: st.spent,
                     cap: self.cfg.daily_cap_sol,
@@ -1048,10 +1063,13 @@ mod tests {
         c.min_liquidity_sol = 10.0;
         let s = mk(c).unwrap();
 
-        // Size: lowering is allowed, raising above the ceiling is refused.
+        // Size: freely settable up to max_trade_size_sol (1.0 in this cfg).
+        // Raising IS allowed now — the ceiling, not a tighten-only rule, is the
+        // guard. Only above the configured max is refused.
         assert!(s.set_trade_size(0.02).is_ok());
-        assert!(s.set_trade_size(0.05).is_ok(), "equal to ceiling is fine");
-        assert!(s.set_trade_size(0.06).is_err(), "above ceiling must be refused");
+        assert!(s.set_trade_size(0.5).is_ok(), "raising within the ceiling is allowed");
+        assert!(s.set_trade_size(1.0).is_ok(), "equal to the max is fine");
+        assert!(s.set_trade_size(1.5).is_err(), "above max_trade_size_sol refused");
         assert!(s.set_trade_size(0.0).is_err(), "zero/negative refused");
 
         // Slippage: tightening allowed, loosening refused.
@@ -1061,6 +1079,35 @@ mod tests {
         // Min liquidity: raising allowed (more cautious), lowering refused.
         assert!(s.set_min_liquidity(20.0).is_ok());
         assert!(s.set_min_liquidity(9.0).is_err(), "below floor refused");
+    }
+
+    /// With the three ceilings set to 0, none of them gate a trade: size is
+    /// unbounded from Telegram, and consider() enforces no per-trade, daily, or
+    /// count cap. Only the kill switch and safety checks remain.
+    #[test]
+    fn zero_caps_mean_unlimited() {
+        let mut c = cfg();
+        c.trade_size_sol = 0.05;
+        c.max_trade_size_sol = 0.0; // disabled
+        c.daily_cap_sol = 0.0; // disabled
+        c.max_trades_per_day = 0; // disabled
+        let s = mk(c).unwrap();
+
+        // Size can be raised far past the old ceiling — no per-trade cap.
+        assert!(s.set_trade_size(100.0).is_ok(), "no ceiling → any positive size");
+        assert!(s.set_trade_size(0.01).is_ok(), "still settable down to dust");
+        assert!(s.set_trade_size(0.0).is_err(), "zero still refused");
+
+        // Many large trades in a row: neither the daily-spend nor the
+        // trade-count cap ever fires (both are 0 = unlimited).
+        let ev = event();
+        s.set_trade_size(50.0).unwrap();
+        for _ in 0..25 {
+            let plan = s.consider(&ev, Utc::now());
+            assert!(plan.is_ok(), "no daily/count cap should ever deny: {plan:?}");
+            let size = plan.unwrap().size;
+            s.reserve(&ev.pool, size, Utc::now());
+        }
     }
 
     /// A tuned-down size must actually be what `consider` plans and checks — not
