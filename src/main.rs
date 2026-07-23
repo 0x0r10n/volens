@@ -14,6 +14,8 @@ mod detector;
 mod execute;
 #[cfg(feature = "sniper")]
 mod jito;
+#[cfg(feature = "sniper")]
+mod jupiter;
 mod metrics;
 mod model;
 mod parser;

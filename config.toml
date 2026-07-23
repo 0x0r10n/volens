@@ -103,14 +103,16 @@ ws_url = ""
 
 [liquidity]
 # Read the quote-side vault after detection and drop pools that launched thin.
-enabled = false
+enabled = true
 # Minimum quote-side liquidity in UI units of the quote asset:
 # SOL for WSOL pairs, USDC for USDC pairs. Override: MIN_QUOTE_LIQUIDITY.
 # Only the quote side is measured — the token side can hold a billion units of
 # something worthless, so it says nothing about committed capital.
-# Raised from 5 to 15: the single biggest noise cut. Most dead/rug PumpSwap
-# launches start thin; 15 SOL filters the bulk of them. Tune up for less noise.
-min_quote_liquidity = 15.0
+# Raised to 20: the single biggest noise cut. Most dead/rug PumpSwap launches
+# start thin; 20 SOL filters the bulk of them. Tune up for less noise. This is
+# also the alert-side floor; the armed sniper re-checks against its own
+# [sniper].min_liquidity_sol at execution time.
+min_quote_liquidity = 20.0
 # If the balance can't be read, emit anyway with unknown liquidity rather than
 # dropping. A missed real launch costs more than one noisy alert.
 emit_on_unknown = true
@@ -125,10 +127,11 @@ emit_on_unknown = true
 # The re-check also catches the outcome that actually costs money: liquidity
 # being pulled shortly after launch.
 # Auto-enabled when RPC_URL is set. Set false to turn the follow-up off entirely.
-enabled = false
+enabled = true
 # When to re-check. Also when the VOLUME signal is measured, so this doubles as
 # the "volume in the first N seconds" window. 60s catches early momentum; raise
-# to catch slower rugs, lower to bias toward fresh volume.
+# to catch slower rugs, lower to bias toward fresh volume. Keep in the 30–60s
+# band: long enough for real buys to show, short enough to still be actionable.
 delay_secs = 60
 # Fraction of quote liquidity that must vanish to call it a pull.
 rug_drop_pct = 0.5
@@ -141,11 +144,36 @@ min_volume_growth_sol = 5.0
 # Alert on every follow-up, not just notable ones (pull / burn / volume).
 # Off by default so follow-ups don't become their own noise source.
 alert_on_all = false
+# --- THE BIG NOISE CUT: only announce pools with SECURED (burned/locked) LP ---
+# LP burn/lock is a LATER transaction than pool creation, so at t=0 every pool
+# looks "unlocked" and alerting there means alerting on literally everything.
+# With this on, NOTHING fires at detection; after delay_secs the pool is re-read
+# and only a burned/locked LP reaches the group. A liquidity PULL still alerts
+# regardless — if the sniper bought, that warning matters either way.
+# Detection is still logged and persisted; only the alert is withheld.
+alert_only_secured_lp = true
+# --- Re-check polling ---
+# A SINGLE check cannot work: LP burn was measured ~479s after launch on a real
+# PumpSwap pool, so one read at delay_secs misses most burns and those pools
+# would never be announced. The pool is polled until the LP is secured, the
+# liquidity is pulled, or max_watch_secs expires.
+#
+# ⚠️ CREDIT COST: roughly (max_watch_secs / recheck_interval_secs) reads per
+# pool — most pools never secure, so most of that spend produces no alert.
+# 600/120 = ~5 reads/pool. Lower max_watch_secs to spend less and catch fewer
+# slow burns; raise it for the opposite.
+recheck_interval_secs = 120
+max_watch_secs = 600
 
 [safety]
 # Mint-authority checks on the launched token — the highest-signal rug filters
 # available from a single account read.
-enabled = false
+#
+# REQUIRED for armed trading: the sniper fails CLOSED on mint safety, so with
+# this off it can't verify a mint is clean and refuses every buy. On = it reads
+# each mint and only clean ones (authorities revoked, no risky extensions) are
+# tradable. Costs one getAccountInfo per detected pool.
+enabled = true
 # Live mint authority => supply can be inflated at will.
 require_mint_authority_revoked = true
 # Live freeze authority => the classic honeypot: you can buy, then get frozen
@@ -176,6 +204,15 @@ enabled = true
 # store). The spend ceilings below are disabled, so keep HALT engaged until you
 # are watching, and go live with a small trade_size_sol first.
 armed = true
+# --- ENTRY STRATEGY: "open" or "guard" (toggleable from Telegram Settings) ---
+# open  = buy at pool creation. Fastest, but LP lock/burn is a LATER
+#         transaction, so at t=0 EVERY pool has unlocked LP — you are buying
+#         before the deployer has committed anything.
+# guard = wait for the [watch] re-check and buy ONLY pools whose LP is
+#         burned/locked by then, sized against freshly re-read liquidity.
+#         Cuts the rug surface hard; you enter after the initial move and will
+#         miss fast runners. Requires [watch].enabled = true.
+mode = "open"
 trade_size_sol = 0.05
 # --- Spend ceilings: 0 = DISABLED (unlimited) on all three. ---
 # These are the only automated backstops against a runaway (buggy detection, a
@@ -194,8 +231,9 @@ max_trades_per_day = 0
 # replay recent slots. Without this, a re-detected pool buys again. 0 disables.
 pool_cooldown_secs = 3600
 # Liquidity re-checked at execution time. Stricter than the alert filter on
-# purpose: unknown liquidity is alertable but NOT tradable.
-min_liquidity_sol = 10.0
+# purpose: unknown liquidity is alertable but NOT tradable. Raised to 20 to
+# match the tightened alert floor and keep thin-pool rugs off the trade path.
+min_liquidity_sol = 20.0
 slippage_bps = 300
 # Touch this file to halt all execution immediately — no restart needed.
 kill_switch_file = "HALT"
@@ -254,3 +292,16 @@ jito_tip_lamports = 100000
 # Retry via plain RPC if the bundle does not land. OFF by default: a fallback can
 # land a trade you had already treated as skipped.
 jito_fallback_to_rpc = false
+
+# --- Exits (the /positions "Sell N%" buttons) ---
+# Selling a held token back to SOL routes through Jupiter, which finds the best
+# path across every venue (you are NOT locked into the pool you bought from).
+# A sell converts token->SOL inside the SAME wallet — it never sends funds out,
+# which is why it is allowed where a withdraw is not. Gated like a buy: HALT
+# stops it, and a dry-run bot only simulates and reports what you'd receive.
+# Jupiter swap API root. Free tier: https://lite-api.jup.ag/swap/v1
+# Paid (higher limits): https://api.jup.ag/swap/v1
+jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
+# Slippage tolerance for exits (bps). Higher than the buy default: selling out
+# of a thin/moving pool needs room to fill. 500 = 5%.
+sell_slippage_bps = 500

@@ -581,12 +581,22 @@ impl Detector {
                 "🟢 new pool detected"
             );
             storage.record(&event).await;
-            alerter.notify(&event).await;
+            // In secured-LP mode the detection alert is suppressed: LP lock/burn
+            // is a LATER transaction, so at t=0 every pool looks unlocked and
+            // alerting here means alerting on everything. The watcher re-check
+            // becomes the alert, firing only once the LP is actually secured.
+            // Detection is still logged and persisted either way.
+            if !(watch.enabled && watch.alert_only_secured_lp) {
+                alerter.notify(&event).await;
+            }
 
             // Auto-execution, if compiled in. Runs after the alert so a slow or
             // refused trade never delays notification.
+            // Guard mode does NOT buy here: at t=0 every pool's LP is still
+            // unlocked, so the decision is deferred to the watcher re-check,
+            // which buys only once the LP is confirmed burned/locked.
             #[cfg(feature = "sniper")]
-            {
+            if sniper.snipe_mode() == crate::sniper::SnipeMode::Open {
                 let exec = sniper.handle(&event).await;
                 // Alerting lives here, not in the sniper: a failing Telegram
                 // call must not sit inside the execution path. Routine skips
@@ -608,6 +618,12 @@ impl Detector {
                 if let Some(lp) = event.lp_mint.clone() {
                     event.lp_supply_at_detection = rpc.token_supply(&lp).await;
                 }
+                // Guard mode buys from inside the watcher, so it needs the
+                // sniper. A unit value in a detector-only build.
+                #[cfg(feature = "sniper")]
+                let sniper_handle: watcher::SniperHandle = Some(sniper.clone());
+                #[cfg(not(feature = "sniper"))]
+                let sniper_handle: watcher::SniperHandle = ();
                 watcher::spawn_watch(
                     event,
                     rpc.clone(),
@@ -615,6 +631,7 @@ impl Detector {
                     storage.clone(),
                     metrics.clone(),
                     watch,
+                    sniper_handle,
                 );
             }
         });

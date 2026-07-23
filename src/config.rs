@@ -118,6 +118,31 @@ pub struct WatchConfig {
     /// Off by default so follow-ups don't become their own noise source.
     #[serde(default)]
     pub alert_on_all: bool,
+    /// Only alert on pools whose LP is SECURED (burned/locked), suppressing the
+    /// detection-time alert entirely.
+    ///
+    /// The big noise cut. LP burn/lock is a LATER transaction than pool
+    /// creation, so at detection every pool looks "unlocked" and alerting there
+    /// means alerting on everything. With this on, nothing fires at t=0; after
+    /// `delay_secs` the pool is re-read and only a burned/locked LP produces an
+    /// alert. A liquidity PULL still alerts regardless — if the sniper bought,
+    /// that warning matters whether or not you were told about the pool.
+    #[serde(default)]
+    pub alert_only_secured_lp: bool,
+    /// Gap between re-checks after the first one.
+    ///
+    /// A single check cannot work: LP burn is a LATER transaction and was
+    /// measured ~479s after launch on a real PumpSwap pool, so checking once at
+    /// `delay_secs` misses most burns entirely. The pool is polled until the LP
+    /// is secured, the liquidity is pulled, or `max_watch_secs` runs out.
+    /// COSTS RPC CREDITS: roughly (max_watch_secs / this) reads per pool.
+    #[serde(default = "default_recheck_interval")]
+    pub recheck_interval_secs: u64,
+    /// Stop watching a pool after this long. Pools that never secure their LP
+    /// are dropped silently — that is the noise filter doing its job. Raise to
+    /// catch slower burns at proportionally higher credit cost.
+    #[serde(default = "default_max_watch")]
+    pub max_watch_secs: u64,
 }
 
 /// Guarded auto-execution. Parsed even in builds without the `sniper` feature so
@@ -207,6 +232,21 @@ pub struct SniperConfig {
     /// always alert regardless.
     #[serde(default)]
     pub alert_on_all_rehearsals: bool,
+    /// Jupiter swap API root, used by the EXIT path (`/positions` Sell buttons)
+    /// to route a held token back to SOL. Free tier: `https://lite-api.jup.ag/swap/v1`.
+    /// Paid: `https://api.jup.ag/swap/v1`. Configurable because Jupiter has
+    /// migrated endpoints before.
+    #[serde(default = "default_jupiter_url")]
+    pub jupiter_base_url: String,
+    /// Slippage tolerance (bps) for exits. Higher than the buy default because
+    /// selling out of a thin/moving pool needs more room to fill.
+    #[serde(default = "default_sell_slippage_bps")]
+    pub sell_slippage_bps: u16,
+    /// When the sniper may buy: `open` (at pool creation, LP still unlocked) or
+    /// `guard` (only after the re-check confirms LP is burned/locked).
+    /// Switchable at runtime from Telegram.
+    #[serde(default = "default_snipe_mode")]
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -341,6 +381,11 @@ fn default_max_trades() -> u32 { 10 }
 fn default_pool_cooldown() -> u64 { 3600 }
 fn default_snipe_min_liq() -> f64 { 10.0 }
 fn default_slippage_bps() -> u16 { 300 }
+fn default_sell_slippage_bps() -> u16 { 500 }
+fn default_snipe_mode() -> String { "open".to_string() }
+fn default_recheck_interval() -> u64 { 120 }
+fn default_max_watch() -> u64 { 600 }
+fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
 fn default_kill_switch() -> String { "HALT".into() }
 fn default_audit_log() -> String { "sniper_audit.jsonl".into() }
 fn default_wallet_dir() -> String { "wallets".into() }
@@ -435,6 +480,9 @@ impl Default for SniperConfig {
             jito_block_engine_url: default_jito_url(),
             jito_tip_lamports: default_jito_tip(),
             jito_fallback_to_rpc: false,
+            jupiter_base_url: default_jupiter_url(),
+            sell_slippage_bps: default_sell_slippage_bps(),
+            mode: default_snipe_mode(),
             wallet_dir: default_wallet_dir(),
             alert_on_all_rehearsals: false,
         }
@@ -448,6 +496,9 @@ impl Default for WatchConfig {
             rug_drop_pct: default_rug_drop(),
             min_volume_growth_sol: default_min_volume_growth(),
             alert_on_all: false,
+            alert_only_secured_lp: false,
+            recheck_interval_secs: default_recheck_interval(),
+            max_watch_secs: default_max_watch(),
         }
     }
 }

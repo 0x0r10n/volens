@@ -354,6 +354,43 @@ impl Bot {
         if data == "cmd:wallets" {
             return Some((self.render_wallets().await, self.wallets_keyboard()));
         }
+        // Positions: text + a "Sell N%" button per holding.
+        if data == "cmd:positions" {
+            return Some(self.positions_screen().await);
+        }
+        // Settings: text + the Open/Guard strategy toggle.
+        if data == "cmd:settings" {
+            return Some(self.settings_screen());
+        }
+        // Flip the entry strategy: `mode:open` | `mode:guard`.
+        #[cfg(feature = "sniper")]
+        if let Some(m) = data.strip_prefix("mode:") {
+            if let (Some(mode), Some(sniper)) =
+                (crate::sniper::SnipeMode::parse(m), self.sniper.as_ref())
+            {
+                let msg = sniper.set_snipe_mode(mode);
+                info!(mode = m, "snipe mode changed from telegram");
+                let _ = msg;
+                return Some(self.settings_screen());
+            }
+        }
+        // Confirmed sell: `sellgo:<mint>:<pct>` actually submits (checked before
+        // `sell:` — the prefixes don't overlap, but be explicit).
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("sellgo:") {
+            if let Some((mint, pct)) = parse_sell(rest) {
+                let text = self.render_sell(mint, pct).await;
+                return Some((text, sold_keyboard()));
+            }
+        }
+        // Sell tap: `sell:<mint>:<pct>` -> a confirmation screen (two-tap, since
+        // an armed sell spends/moves the position).
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("sell:") {
+            if let Some((mint, pct)) = parse_sell(rest) {
+                return Some(self.sell_confirm_screen(mint, pct));
+            }
+        }
         if let Some(menu) = data.strip_prefix("nav:") {
             return Some(self.menu_screen(menu).await);
         }
@@ -657,6 +694,120 @@ impl Bot {
                 );
             }
             out
+        }
+    }
+
+    /// The `/positions` screen with a `Sell 50%` / `Sell 100%` button per
+    /// holding. The text is authoritative (PnL, cost basis); the buttons are a
+    /// best-effort convenience built from the same live holdings. Capped so a
+    /// wallet full of dust tokens can't produce an unwieldy keyboard.
+    async fn positions_screen(&self) -> (String, serde_json::Value) {
+        let text = self.render_positions().await;
+        #[allow(unused_mut)]
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        #[cfg(feature = "sniper")]
+        if let (Some(sniper), Some(rpc)) = (&self.sniper, &self.rpc) {
+            if let Some((address, _)) = sniper.trading_identity() {
+                if let Some(holdings) = rpc.token_holdings(&address).await {
+                    for (mint, _amt) in holdings.iter().take(8) {
+                        let short = short_mint(mint);
+                        rows.push(serde_json::json!([
+                            {"text": format!("Sell 50% {short}"), "callback_data": format!("sell:{mint}:50")},
+                            {"text": format!("Sell 100% {short}"), "callback_data": format!("sell:{mint}:100")},
+                        ]));
+                    }
+                }
+            }
+        }
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Settings screen with the Open/Guard entry-strategy toggle. The button
+    /// always names the mode it will switch TO, so a tap is unambiguous.
+    fn settings_screen(&self) -> (String, serde_json::Value) {
+        let text = self.render_settings();
+        #[allow(unused_mut)]
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        #[cfg(feature = "sniper")]
+        if let Some(sniper) = &self.sniper {
+            use crate::sniper::SnipeMode;
+            let (label, target) = match sniper.snipe_mode() {
+                SnipeMode::Open => ("🛡 Switch to GUARD (secured LP only)", "guard"),
+                SnipeMode::Guard => ("⚡ Switch to OPEN (snipe at launch)", "open"),
+            };
+            rows.push(serde_json::json!([
+                {"text": label, "callback_data": format!("mode:{target}")}
+            ]));
+        }
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Two-tap confirmation before an armed sell — a sell moves the position.
+    #[cfg(feature = "sniper")]
+    fn sell_confirm_screen(&self, mint: &str, pct: u8) -> (String, serde_json::Value) {
+        let text = format!(
+            "🔴 <b>Confirm sell</b>\n\n\
+             Sell <b>{pct}%</b> of <code>{}</code> ({}) back to SOL via Jupiter?\n\n\
+             <i>Executes only if the bot is ARMED and not halted; a dry-run bot \
+             simulates and reports what you'd receive. Slippage tolerance and \
+             route are picked by Jupiter.</i>",
+            escape_html(mint),
+            escape_html(&short_mint(mint)),
+        );
+        let kb = serde_json::json!({ "inline_keyboard": [[
+            {"text": format!("✅ Yes, sell {pct}%"), "callback_data": format!("sellgo:{mint}:{pct}")},
+            {"text": "◀️ Cancel", "callback_data": "cmd:positions"},
+        ]]});
+        (text, kb)
+    }
+
+    /// Execute a confirmed sell and render the outcome.
+    #[cfg(feature = "sniper")]
+    async fn render_sell(&self, mint: &str, pct: u8) -> String {
+        use crate::sniper::{SellOutcome, SubmitOutcome};
+        let Some(sniper) = &self.sniper else {
+            return "⚪ <b>Sniper not configured</b>".to_string();
+        };
+        match sniper.sell(mint, pct).await {
+            SellOutcome::NoPosition { mint } => {
+                format!("📭 No balance of <code>{}</code> to sell.", escape_html(&mint))
+            }
+            SellOutcome::Refused { reason } => {
+                format!("⚠️ <b>Sell refused</b>\n{}", escape_html(&reason))
+            }
+            SellOutcome::Failed { mint, reason } => format!(
+                "❌ <b>Sell failed</b> for <code>{}</code>\n{}",
+                escape_html(&mint),
+                escape_html(&reason)
+            ),
+            SellOutcome::Rehearsed { pct, sol_out, impact_pct, would_succeed, .. } => format!(
+                "🧪 <b>Dry-run sell</b> ({pct}%)\n\
+                 Estimated out: <b>{sol_out:.4} SOL</b> · impact {impact_pct:.2}%\n\
+                 Simulation: {}\n\n\
+                 <i>Nothing was signed — the bot is in dry run. Arm to sell for real.</i>",
+                if would_succeed { "✅ would succeed" } else { "❌ would FAIL" },
+            ),
+            SellOutcome::Submitted { pct, sol_out, result, .. } => {
+                let line = match result {
+                    SubmitOutcome::Executed { reference, .. } => format!(
+                        "✅ <b>SOLD</b> — <a href=\"https://solscan.io/tx/{r}\">{r_short}</a>",
+                        r = escape_html(&reference),
+                        r_short = escape_html(&short_mint(&reference)),
+                    ),
+                    SubmitOutcome::NotExecuted { reason } => {
+                        format!("⚪ <b>Not executed</b> (safe): {}", escape_html(&reason))
+                    }
+                    SubmitOutcome::Indeterminate { reference, reason } => format!(
+                        "⚠️ <b>UNKNOWN outcome</b> — may have landed, do NOT retry blindly.\n\
+                         ref <code>{}</code>\n{}",
+                        escape_html(&reference),
+                        escape_html(&reason)
+                    ),
+                };
+                format!("Sell {pct}% · est <b>{sol_out:.4} SOL</b>\n{line}")
+            }
         }
     }
 
@@ -1152,6 +1303,34 @@ impl Bot {
 }
 
 /// Which menu a command result should offer "Back" to.
+/// Parse `<mint>:<pct>` from a sell callback tail. Base58 mints contain no
+/// colon, so the last colon splits mint from percentage. Rejects out-of-range
+/// percentages so a malformed tap can never reach the sell path.
+#[cfg(feature = "sniper")]
+fn parse_sell(rest: &str) -> Option<(&str, u8)> {
+    let (mint, pct) = rest.rsplit_once(':')?;
+    let pct: u8 = pct.parse().ok()?;
+    if mint.is_empty() || !(1..=100).contains(&pct) {
+        return None;
+    }
+    Some((mint, pct))
+}
+
+/// `AAAA…ZZZZ` short form of a base58 string (mint or signature), for buttons.
+#[cfg(feature = "sniper")]
+fn short_mint(s: &str) -> String {
+    let n = s.len();
+    format!("{}…{}", &s[..4.min(n)], &s[n.saturating_sub(4)..])
+}
+
+/// Keyboard shown after a sell: a single button back to the positions list.
+#[cfg(feature = "sniper")]
+fn sold_keyboard() -> serde_json::Value {
+    serde_json::json!({ "inline_keyboard": [[
+        {"text": "◀️ Back to positions", "callback_data": "cmd:positions"},
+    ]]})
+}
+
 fn back_group(callback_data: &str) -> &'static str {
     match callback_data {
         // Wallet-group actions return to the wallet submenu.

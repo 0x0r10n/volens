@@ -31,6 +31,7 @@ use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+use solana_transaction::versioned::VersionedTransaction;
 use std::str::FromStr;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -240,6 +241,84 @@ impl Submitter {
         info!(%signature, "transaction submitted");
 
         self.confirm(signature).await
+    }
+
+    /// Sign and send a PRE-BUILT versioned transaction (e.g. a Jupiter swap).
+    ///
+    /// Unlike `send`, the message is already assembled by Jupiter — including a
+    /// fresh blockhash — so we only re-sign it with our key (Jupiter built it
+    /// with our pubkey as fee payer, so ours is the required signature) and
+    /// submit. Preflight still applies: a versioned tx can fail simulation just
+    /// like a legacy one, and this spends real funds.
+    pub async fn send_versioned(&self, tx_b64: &str, keypair: &Keypair) -> Result<Submission> {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(tx_b64)
+            .context("decoding jupiter transaction")?;
+        let unsigned: VersionedTransaction =
+            bincode::deserialize(&bytes).context("deserializing jupiter transaction")?;
+        // Re-sign over Jupiter's message (keeps its blockhash + ALT tables).
+        let signed = VersionedTransaction::try_new(unsigned.message, &[keypair])
+            .context("signing jupiter transaction")?;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(bincode::serialize(&signed).context("serializing signed transaction")?);
+
+        if self.preflight {
+            if let Err(e) = self.preflight_versioned(&b64).await {
+                warn!(error = %e, "preflight rejected jupiter swap; not sending");
+                return Ok(Submission::RejectedByPreflight { reason: e.to_string() });
+            }
+        } else {
+            warn!("preflight DISABLED — sending unsimulated swap");
+        }
+
+        let sent = self
+            .rpc(
+                "sendTransaction",
+                json!([b64, {
+                    "encoding":"base64",
+                    "skipPreflight": true,
+                    "maxRetries": 3,
+                }]),
+            )
+            .await;
+        let signature = match sent {
+            Ok(v) => match v.as_str() {
+                Some(s) => s.to_string(),
+                None => return Ok(Submission::Failed { reason: "no signature returned".into() }),
+            },
+            Err(e) => return Ok(Submission::Failed { reason: e.to_string() }),
+        };
+        info!(%signature, "swap submitted");
+        self.confirm(signature).await
+    }
+
+    /// Preflight a versioned transaction. Same as `preflight` but tells the node
+    /// the max transaction version it may encounter — omitting it makes a v0
+    /// transaction fail to simulate with "unsupported version".
+    async fn preflight_versioned(&self, tx_b64: &str) -> Result<()> {
+        let r = self
+            .rpc(
+                "simulateTransaction",
+                json!([tx_b64, {
+                    "encoding":"base64",
+                    "sigVerify": false,
+                    "replaceRecentBlockhash": true,
+                    "commitment": self.commitment,
+                    "maxSupportedTransactionVersion": 0,
+                }]),
+            )
+            .await?;
+        let value = r.get("value").cloned().unwrap_or(serde_json::Value::Null);
+        let err = value.get("err").cloned().unwrap_or(serde_json::Value::Null);
+        if !err.is_null() {
+            let logs = value
+                .get("logs")
+                .and_then(|l| l.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" | "))
+                .unwrap_or_default();
+            bail!("preflight failed: {err} :: {logs}");
+        }
+        Ok(())
     }
 
     /// Sign, simulate, then submit as an atomic Jito bundle.

@@ -63,6 +63,18 @@ impl Verdict {
 
 /// Decide the verdict from before/after readings. Pure, so it is unit-testable
 /// without any network.
+/// Is the LP supply burned (or otherwise gone to ~zero)?
+///
+/// Kept separate from `evaluate` on purpose: `evaluate` collapses to a SINGLE
+/// verdict with precedence, so a pool that burned its LP *and* drew volume
+/// reports `VolumeSpike` and the burn is invisible. Alert filtering needs the
+/// burn as an independent fact, not a verdict that a higher-priority signal can
+/// mask. Guards against calling a burn when there was no "before" reading.
+pub fn lp_is_burned(lp_supply_before: Option<f64>, lp_supply_after: Option<f64>) -> bool {
+    matches!(lp_supply_after, Some(after)
+        if after <= f64::EPSILON && lp_supply_before.is_some_and(|b| b > 0.0))
+}
+
 pub fn evaluate(
     liquidity_before: Option<f64>,
     liquidity_after: Option<f64>,
@@ -91,12 +103,8 @@ pub fn evaluate(
         }
     }
 
-    // LP burned: supply went to (approximately) zero. Guard against reporting a
-    // burn when we never had a "before" reading to compare against.
-    if let Some(after) = lp_supply_after {
-        if after <= f64::EPSILON && lp_supply_before.is_some_and(|b| b > 0.0) {
-            return Verdict::LpBurned;
-        }
+    if lp_is_burned(lp_supply_before, lp_supply_after) {
+        return Verdict::LpBurned;
     }
 
     if lp_supply_after.is_some() || liquidity_after.is_some() {
@@ -105,7 +113,14 @@ pub fn evaluate(
     Verdict::Unknown
 }
 
-/// Schedule the follow-up. Returns immediately; the work happens in a task.
+/// Handle to the sniper, for Guard-mode entries. A unit type in builds without
+/// the execution feature so the call site is identical either way.
+#[cfg(feature = "sniper")]
+pub type SniperHandle = Option<Arc<crate::sniper::Sniper>>;
+#[cfg(not(feature = "sniper"))]
+pub type SniperHandle = ();
+
+/// Schedule the follow-up watch. Returns immediately; the work happens in a task.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_watch(
     event: PoolEvent,
@@ -114,72 +129,143 @@ pub fn spawn_watch(
     storage: Arc<Storage>,
     metrics: Arc<Metrics>,
     cfg: WatchConfig,
+    sniper: SniperHandle,
 ) {
     tokio::spawn(async move {
+        // Two phases, because LP burn is a LATER transaction than pool creation
+        // (measured ~479s on a real PumpSwap pool). A single check at
+        // `delay_secs` would miss most burns and the pool would never be
+        // announced at all.
+        //
+        //  1. BEFORE secured — poll for the burn. Nothing is announced. Pools
+        //     that never secure are dropped silently: that is the noise filter.
+        //  2. AFTER secured  — the pool is announced once, then kept under
+        //     watch so further buy inflow on a *secured* token still alerts.
+        //
+        // A liquidity pull ends the watch at any point and always alerts.
+        let baseline_liq = event.quote_liquidity;
+        let lp_before = event.lp_supply_at_detection;
+        let mut secured = false;
+        // Growth is measured from here; reset on each volume alert so the same
+        // inflow is not reported over and over.
+        let mut volume_mark = baseline_liq;
+        let mut elapsed = cfg.delay_secs;
+
         tokio::time::sleep(Duration::from_secs(cfg.delay_secs)).await;
 
-        let liquidity_after = match event.quote_asset_vault.as_deref() {
-            Some(v) => rpc.vault_balance(v).await,
-            None => None,
-        };
-        let lp_supply_after = match event.lp_mint.as_deref() {
-            Some(m) => rpc.token_supply(m).await,
-            None => None,
-        };
+        loop {
+            let liquidity_now = match event.quote_asset_vault.as_deref() {
+                Some(v) => rpc.vault_balance(v).await,
+                None => None,
+            };
+            // Once burned, LP cannot un-burn — stop paying for that read.
+            let lp_now = if secured {
+                None
+            } else {
+                match event.lp_mint.as_deref() {
+                    Some(m) => rpc.token_supply(m).await,
+                    None => None,
+                }
+            };
 
-        let verdict = evaluate(
-            event.quote_liquidity,
-            liquidity_after,
-            event.lp_supply_at_detection,
-            lp_supply_after,
-            cfg.rug_drop_pct,
-            cfg.min_volume_growth_sol,
-        );
-
-        match &verdict {
-            Verdict::LiquidityPulled { before, after, drop_pct } => {
+            // --- Rug: takes precedence and ends the watch. Always alerted,
+            // announced or not: if the sniper bought, this is the one that costs
+            // money.
+            if let (Some(before), Some(after)) = (baseline_liq, liquidity_now)
+                && before > 0.0
+                && (before - after) / before >= cfg.rug_drop_pct
+            {
+                let drop_pct = (before - after) / before * 100.0;
                 metrics.incr(&metrics.rug_detected);
                 warn!(
                     pool = %event.pool,
                     token = event.new_token_mint.as_deref().unwrap_or("?"),
-                    before, after, drop_pct,
-                    after_secs = cfg.delay_secs,
+                    before, after, drop_pct, after_secs = elapsed,
                     "🚨 liquidity pulled"
                 );
+                let verdict = Verdict::LiquidityPulled { before, after, drop_pct };
+                let mut f = event.clone();
+                f.quote_liquidity = liquidity_now;
+                storage.record_followup(&f, verdict.label()).await;
+                alerter
+                    .send_html(render_followup(&event, &verdict, liquidity_now, elapsed))
+                    .await;
+                return;
             }
-            Verdict::VolumeSpike { before, after, growth } => {
+
+            // --- LP secured: the moment the pool becomes announceable.
+            if !secured && lp_is_burned(lp_before, lp_now) {
+                secured = true;
+                metrics.incr(&metrics.lp_burned);
+                info!(pool = %event.pool, after_secs = elapsed, "🔥 LP burned / secured");
+                let mut f = event.clone();
+                f.quote_liquidity = liquidity_now;
+                storage.record_followup(&f, Verdict::LpBurned.label()).await;
+                alerter
+                    .send_html(render_followup(&event, &Verdict::LpBurned, liquidity_now, elapsed))
+                    .await;
+
+                // GUARD MODE ENTRY: buy only now that LP is confirmed secured,
+                // sized against freshly re-read liquidity rather than detection.
+                #[cfg(feature = "sniper")]
+                if let Some(s) = &sniper
+                    && s.snipe_mode() == crate::sniper::SnipeMode::Guard
+                {
+                    let mut confirmed = event.clone();
+                    confirmed.quote_liquidity = liquidity_now;
+                    let exec = s.handle(&confirmed).await;
+                    if exec.is_alertable(false)
+                        && let Some(msg) = crate::alerts::render_execution(&exec)
+                    {
+                        alerter.send_html(msg).await;
+                    }
+                }
+
+                // Measure later volume from the moment of securing.
+                if liquidity_now.is_some() {
+                    volume_mark = liquidity_now;
+                }
+            }
+
+            // --- Volume, for SECURED pools only. Unsecured pools are never
+            // announced, so a spike on one would be noise about a token the
+            // group was deliberately not told about.
+            if secured
+                && cfg.min_volume_growth_sol > 0.0
+                && let (Some(mark), Some(now)) = (volume_mark, liquidity_now)
+                && now - mark >= cfg.min_volume_growth_sol
+            {
+                let growth = now - mark;
                 metrics.incr(&metrics.volume_confirmed);
                 info!(
                     pool = %event.pool,
                     token = event.new_token_mint.as_deref().unwrap_or("?"),
-                    before, after, growth,
-                    after_secs = cfg.delay_secs,
-                    "📈 volume spike (net buy inflow)"
+                    before = mark, after = now, growth, after_secs = elapsed,
+                    "📈 volume spike on secured pool"
                 );
+                let verdict = Verdict::VolumeSpike { before: mark, after: now, growth };
+                let mut f = event.clone();
+                f.quote_liquidity = liquidity_now;
+                storage.record_followup(&f, verdict.label()).await;
+                alerter
+                    .send_html(render_followup(&event, &verdict, liquidity_now, elapsed))
+                    .await;
+                volume_mark = liquidity_now;
             }
-            Verdict::LpBurned => {
-                metrics.incr(&metrics.lp_burned);
-                info!(pool = %event.pool, after_secs = cfg.delay_secs, "🔥 LP burned");
+
+            if elapsed >= cfg.max_watch_secs {
+                if !secured {
+                    info!(
+                        pool = %event.pool,
+                        watched_secs = elapsed,
+                        "LP never secured — dropping without announcing"
+                    );
+                }
+                return;
             }
-            v => info!(
-                pool = %event.pool,
-                verdict = v.label(),
-                liquidity = liquidity_after.unwrap_or(f64::NAN),
-                after_secs = cfg.delay_secs,
-                "follow-up"
-            ),
-        }
-
-        // Persist the follow-up as its own record so the JSONL/db keeps the
-        // full lifecycle, not just the launch moment.
-        let mut followup = event.clone();
-        followup.quote_liquidity = liquidity_after;
-        storage.record_followup(&followup, verdict.label()).await;
-
-        if verdict.is_notable() || cfg.alert_on_all {
-            alerter
-                .send_html(render_followup(&event, &verdict, liquidity_after, cfg.delay_secs))
-                .await;
+            let step = cfg.recheck_interval_secs.max(1);
+            tokio::time::sleep(Duration::from_secs(step)).await;
+            elapsed += step;
         }
     });
 }
@@ -336,5 +422,34 @@ mod tests {
         assert!(!Verdict::Unknown.is_notable());
         assert!(Verdict::LpBurned.is_notable());
         assert!(Verdict::LiquidityPulled { before: 1.0, after: 0.0, drop_pct: 100.0 }.is_notable());
+    }
+
+    #[test]
+    fn lp_burn_needs_a_before_reading() {
+        // Supply gone to zero, with a real "before": a genuine burn.
+        assert!(lp_is_burned(Some(1_000.0), Some(0.0)));
+        // No "before" reading — an LP mint that was always empty is NOT a burn.
+        assert!(!lp_is_burned(None, Some(0.0)));
+        // Still outstanding.
+        assert!(!lp_is_burned(Some(1_000.0), Some(1_000.0)));
+        // Unreadable after.
+        assert!(!lp_is_burned(Some(1_000.0), None));
+    }
+
+    /// The reason `lp_is_burned` exists separately: `evaluate` ranks a volume
+    /// spike ABOVE a burn, so a pool that burned LP *and* drew volume reports
+    /// VolumeSpike. Filtering on the verdict alone would drop exactly the best
+    /// pools — secured LP *and* real buying.
+    #[test]
+    fn volume_spike_masks_the_burn_in_the_verdict_but_not_the_signal() {
+        let v = evaluate(Some(10.0), Some(100.0), Some(1_000.0), Some(0.0), 0.5, 5.0);
+        assert!(
+            matches!(v, Verdict::VolumeSpike { .. }),
+            "volume outranks burn in the collapsed verdict"
+        );
+        assert!(
+            lp_is_burned(Some(1_000.0), Some(0.0)),
+            "but the burn is still true, and secured-LP filtering must see it"
+        );
     }
 }

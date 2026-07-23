@@ -145,6 +145,24 @@ pub enum Execution {
     Submitted { plan: TradePlan, result: SubmitOutcome },
 }
 
+/// Outcome of a manual EXIT (selling a held token back to SOL via `/positions`).
+/// Separate from `Execution` because a sell is user-initiated on one mint, not
+/// the sniper reacting to a detected pool.
+#[cfg(feature = "sniper")]
+#[derive(Debug, Clone)]
+pub enum SellOutcome {
+    /// The wallet holds none of this mint.
+    NoPosition { mint: String },
+    /// Refused before any network call (halted, bad percentage, no identity).
+    Refused { reason: String },
+    /// Something failed while quoting or building the swap.
+    Failed { mint: String, reason: String },
+    /// Dry run: the swap was quoted and simulated, nothing signed.
+    Rehearsed { mint: String, pct: u8, sol_out: f64, impact_pct: f64, would_succeed: bool },
+    /// Armed: the swap was submitted.
+    Submitted { mint: String, pct: u8, sol_out: f64, result: SubmitOutcome },
+}
+
 /// Outcome of a real submission, classified by what it means for the operator.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubmitOutcome {
@@ -243,11 +261,46 @@ impl DailyState {
 /// Trade size is the exception: it is freely settable up to `max_trade_size_sol`
 /// (unbounded when that ceiling is 0), so with the ceiling removed the Telegram
 /// allowlist — not a tighten-only rule — is the guard on how much the bot spends.
+/// When the sniper is allowed to buy.
+///
+/// The trade-off is not resolvable — it is a genuine strategy choice:
+/// * `Open` buys at pool creation. Fastest, but LP lock/burn is a LATER
+///   transaction, so at t=0 EVERY pool has unlocked LP. You are buying before
+///   the deployer has committed anything.
+/// * `Guard` waits for the follow-up re-check and buys only pools whose LP is
+///   burned/locked by then. Cuts the rug surface hard, but you enter after the
+///   initial move and will miss fast runners.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnipeMode {
+    Open,
+    Guard,
+}
+
+impl SnipeMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            SnipeMode::Open => "⚡ Open — snipe at launch (LP unlocked)",
+            SnipeMode::Guard => "🛡 Guard — only secured LP",
+        }
+    }
+
+    /// Parse from config/command. Unrecognized input is rejected rather than
+    /// silently defaulting: picking the wrong one changes what gets bought.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" | "fast" | "snipe" => Some(SnipeMode::Open),
+            "guard" | "guarded" | "safe" => Some(SnipeMode::Guard),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Tunable {
     trade_size_sol: f64,
     slippage_bps: u16,
     min_liquidity_sol: f64,
+    snipe_mode: SnipeMode,
 }
 
 /// Render a SOL ceiling for display: 0 means the cap is disabled (unlimited).
@@ -340,10 +393,17 @@ impl Sniper {
         let jito = cfg.jito_enabled.then(|| {
             JitoClient::new(&cfg.jito_block_engine_url, cfg.jito_tip_lamports)
         });
+        let snipe_mode = SnipeMode::parse(&cfg.mode).ok_or_else(|| {
+            anyhow::anyhow!(
+                "sniper.mode must be \"open\" or \"guard\" (got {:?})",
+                cfg.mode
+            )
+        })?;
         let tunable = Tunable {
             trade_size_sol: cfg.trade_size_sol,
             slippage_bps: cfg.slippage_bps,
             min_liquidity_sol: cfg.min_liquidity_sol,
+            snipe_mode,
         };
         Ok(Self {
             cfg,
@@ -418,6 +478,7 @@ impl Sniper {
         let t = *self.tunable.lock().unwrap();
         vec![
             ("Mode", if armed { "🔴 ARMED (live)".into() } else { "🧪 dry run".into() }),
+            ("Snipe mode", t.snipe_mode.label().to_string()),
             ("Trade size", format!("{} SOL", t.trade_size_sol)),
             ("Slippage", format!("{} bps ({:.1}%)", t.slippage_bps, t.slippage_bps as f64 / 100.0)),
             ("Min liquidity", format!("{} SOL (floor {})", t.min_liquidity_sol, c.min_liquidity_sol)),
@@ -429,6 +490,19 @@ impl Sniper {
             ("Preflight", if c.preflight { "on".into() } else { "OFF".into() }),
             ("Jito bundles", if c.jito_enabled { "on".into() } else { "off".into() }),
         ]
+    }
+
+    /// Which entry strategy is active right now.
+    pub fn snipe_mode(&self) -> SnipeMode {
+        self.tunable.lock().unwrap().snipe_mode
+    }
+
+    /// Switch between Open (buy at launch) and Guard (buy only once LP is
+    /// secured). Unlike the risk knobs this is not tighten-only in either
+    /// direction — it is a strategy choice, and Guard is the safer one.
+    pub fn set_snipe_mode(&self, m: SnipeMode) -> String {
+        self.tunable.lock().unwrap().snipe_mode = m;
+        format!("snipe mode: {}", m.label())
     }
 
     /// Set the working trade size from Telegram. Accepts any positive value up
@@ -517,11 +591,26 @@ impl Sniper {
 
         // Re-check safety at execution time rather than trusting the detection
         // snapshot: these are the properties that make a token untradeable.
-        if ev.mint_authority_revoked == Some(false) {
-            return Err(Denial::UnsafeMint { reason: "mint authority live".into() });
+        //
+        // Fail CLOSED: a buy requires positive proof each authority is revoked.
+        // Unknown (None — [safety] disabled or the mint read failed) is refused,
+        // not trusted. This is deliberately stricter than the alert path, which
+        // may emit on unknown: alerting on a maybe-risky pool is cheap, buying
+        // one is not. So "require fully clean mint" needs [safety].enabled = true
+        // (otherwise these stay None and every trade is refused here).
+        match ev.mint_authority_revoked {
+            Some(true) => {}
+            Some(false) => return Err(Denial::UnsafeMint { reason: "mint authority live".into() }),
+            None => return Err(Denial::UnsafeMint {
+                reason: "mint authority unverified (enable [safety])".into(),
+            }),
         }
-        if ev.freeze_authority_revoked == Some(false) {
-            return Err(Denial::UnsafeMint { reason: "freeze authority live".into() });
+        match ev.freeze_authority_revoked {
+            Some(true) => {}
+            Some(false) => return Err(Denial::UnsafeMint { reason: "freeze authority live".into() }),
+            None => return Err(Denial::UnsafeMint {
+                reason: "freeze authority unverified (enable [safety])".into(),
+            }),
         }
         if !ev.risky_extensions.is_empty() {
             return Err(Denial::UnsafeMint {
@@ -802,6 +891,115 @@ impl Sniper {
         }
     }
 
+    /// Sell a held token back to SOL via Jupiter — the manual EXIT behind a
+    /// `/positions` "Sell N%" button. `pct` is 1..=100 of the CURRENT on-chain
+    /// balance of `mint`. Gated exactly like a buy: HALT stops it, and a dry run
+    /// only quotes + simulates (reporting what you WOULD receive) while an armed
+    /// bot signs and submits. Selling converts token->SOL inside the SAME wallet
+    /// — it never sends funds anywhere, which is why it is allowed where a
+    /// withdraw is not.
+    #[cfg(feature = "sniper")]
+    pub async fn sell(&self, mint: &str, pct: u8) -> SellOutcome {
+        use crate::jupiter::{Jupiter, fraction_of};
+        use crate::model::WSOL_MINT;
+
+        if self.kill_switch_engaged() {
+            return SellOutcome::Refused {
+                reason: "kill switch engaged (HALT) — resume to sell".into(),
+            };
+        }
+        if !(1..=100).contains(&pct) {
+            return SellOutcome::Refused {
+                reason: "sell percentage must be between 1 and 100".into(),
+            };
+        }
+        let Some(owner) = self.owner() else {
+            return SellOutcome::Refused {
+                reason: "no trading identity — set an active wallet".into(),
+            };
+        };
+        let owner = owner.to_string();
+
+        // Exact on-chain balance in base units; "sell 50%" is integer math on it.
+        let Some((balance, _decimals)) = self.rpc.token_balance_raw(&owner, mint).await else {
+            return SellOutcome::NoPosition { mint: mint.to_string() };
+        };
+        let amount = fraction_of(balance, pct);
+        if amount == 0 {
+            return SellOutcome::Refused { reason: "computed sell amount is zero".into() };
+        }
+
+        let jup = Jupiter::new(&self.cfg.jupiter_base_url);
+        let quote = match jup.quote(mint, WSOL_MINT, amount, self.cfg.sell_slippage_bps).await {
+            Ok(q) => q,
+            Err(e) => {
+                return SellOutcome::Failed { mint: mint.to_string(), reason: format!("quote: {e:#}") };
+            }
+        };
+        let sol_out = quote.out_sol().unwrap_or(0.0);
+        let impact_pct = quote.price_impact_pct();
+
+        let tx_b64 = match jup.swap_tx(&quote, &owner).await {
+            Ok(t) => t,
+            Err(e) => {
+                return SellOutcome::Failed {
+                    mint: mint.to_string(),
+                    reason: format!("build swap: {e:#}"),
+                };
+            }
+        };
+
+        match &self.mode {
+            Mode::DryRun { .. } => {
+                // Simulate the real swap against live state; nothing is signed.
+                let would_succeed = match self.rpc.simulate_transaction(&tx_b64).await {
+                    Some(v) => v.get("err").map(|e| e.is_null()).unwrap_or(false),
+                    None => false,
+                };
+                info!(%mint, pct, sol_out, impact_pct, would_succeed, "sniper: DRY RUN SELL (nothing signed)");
+                self.audit_sell(
+                    &owner,
+                    mint,
+                    pct,
+                    sol_out,
+                    if would_succeed { "would-succeed" } else { "would-FAIL" },
+                )
+                .await;
+                SellOutcome::Rehearsed { mint: mint.to_string(), pct, sol_out, impact_pct, would_succeed }
+            }
+            Mode::Armed(cap) => {
+                warn!(%mint, pct, sol_out, "sniper: SUBMITTING REAL SELL");
+                let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
+                let (outcome, result) = classify_submission(res);
+                self.audit_sell(&owner, mint, pct, sol_out, &outcome).await;
+                SellOutcome::Submitted { mint: mint.to_string(), pct, sol_out, result }
+            }
+        }
+    }
+
+    /// Append a sell decision to the audit log. Tagged `action:"sell"` so the
+    /// `/positions` cost-basis parser can exclude it — a sell's `confirmed:`
+    /// outcome must NOT be counted as buy spend.
+    #[cfg(feature = "sniper")]
+    async fn audit_sell(&self, owner: &str, mint: &str, pct: u8, sol_out: f64, outcome: &str) {
+        if self.cfg.audit_log.is_empty() {
+            return;
+        }
+        let record = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "action": "sell",
+            "owner": owner,
+            "mint": mint,
+            "pct": pct,
+            "sol_out_est": sol_out,
+            "mode": match self.mode { Mode::Armed(_) => "armed", Mode::DryRun { .. } => "dry_run" },
+            "outcome": outcome,
+        });
+        if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
+            warn!(error = %e, "failed to write sell audit log");
+        }
+    }
+
     /// Simulate a built plan without signing. Used by dry run.
     async fn rehearse(&self, exec: &execute::ExecutionPlan) -> String {
         use base64::Engine;
@@ -865,6 +1063,53 @@ impl Sniper {
     }
 }
 
+/// Classify a submission by what it means for funds: the audit string plus the
+/// operator-facing outcome. Used by the EXIT path (`sell`). The buy path in
+/// `consider` keeps the equivalent inline — the two must stay in sync; the
+/// distinction that matters is Executed vs NotExecuted vs Indeterminate.
+#[cfg(feature = "sniper")]
+fn classify_submission(res: Result<Submission>) -> (String, SubmitOutcome) {
+    match res {
+        Ok(Submission::BundleLanded { bundle, slot }) => (
+            format!("bundle_landed:{bundle}"),
+            SubmitOutcome::Executed { reference: bundle, slot: Some(slot) },
+        ),
+        Ok(Submission::BundleNotLanded { bundle, last }) => (
+            format!("bundle_not_landed:{bundle}:{last}"),
+            SubmitOutcome::NotExecuted { reason: format!("bundle did not land ({last})") },
+        ),
+        Ok(Submission::Confirmed { signature, slot }) => (
+            format!("confirmed:{signature}"),
+            SubmitOutcome::Executed { reference: signature, slot: Some(slot) },
+        ),
+        // Not a failure: it may still land, so retrying could double-spend.
+        Ok(Submission::Unconfirmed { signature }) => (
+            format!("unconfirmed:{signature}"),
+            SubmitOutcome::Indeterminate {
+                reference: signature,
+                reason: "not confirmed within timeout; may still land".into(),
+            },
+        ),
+        Ok(Submission::RejectedByPreflight { reason }) => (
+            format!("preflight_rejected:{reason}"),
+            SubmitOutcome::NotExecuted { reason: format!("preflight rejected: {reason}") },
+        ),
+        // Indeterminate, NOT NotExecuted: a transport error can arrive after the
+        // node already accepted the transaction. Retrying could double-spend.
+        Ok(Submission::Failed { reason }) => (
+            format!("failed:{reason}"),
+            SubmitOutcome::Indeterminate { reference: "no-signature".into(), reason },
+        ),
+        Err(e) => {
+            let reason = format!("{e:#}");
+            (
+                format!("error:{reason}"),
+                SubmitOutcome::Indeterminate { reference: "no-signature".into(), reason },
+            )
+        }
+    }
+}
+
 async fn append_line(path: &str, value: &serde_json::Value) -> Result<()> {
     use tokio::io::AsyncWriteExt;
     if let Some(parent) = Path::new(path).parent() {
@@ -917,6 +1162,9 @@ mod tests {
             jito_fallback_to_rpc: false,
             wallet_dir: "wallets".into(),
             alert_on_all_rehearsals: false,
+            mode: "open".into(),
+            jupiter_base_url: "https://lite-api.jup.ag/swap/v1".into(),
+            sell_slippage_bps: 500,
         }
     }
 
@@ -1354,6 +1602,28 @@ mod tests {
         let mut ev = event();
         ev.risky_extensions = vec!["transferHook".into()];
         assert!(matches!(s.consider(&ev, Utc::now()), Err(Denial::UnsafeMint { .. })));
+    }
+
+    /// Fail-closed: unknown mint safety (None — e.g. [safety] disabled or the
+    /// read failed) must be refused for a buy, not trusted. This is the
+    /// difference between the alert path (may emit on unknown) and spending.
+    #[test]
+    fn unverified_mint_is_refused() {
+        let s = mk(cfg()).unwrap();
+
+        let mut ev = event();
+        ev.mint_authority_revoked = None;
+        assert!(
+            matches!(s.consider(&ev, Utc::now()), Err(Denial::UnsafeMint { .. })),
+            "unknown mint authority must be refused, not trusted"
+        );
+
+        let mut ev = event();
+        ev.freeze_authority_revoked = None;
+        assert!(
+            matches!(s.consider(&ev, Utc::now()), Err(Denial::UnsafeMint { .. })),
+            "unknown freeze authority must be refused, not trusted"
+        );
     }
 
     #[test]
