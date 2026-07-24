@@ -168,9 +168,13 @@ pub fn spawn_watch(
                 }
             };
 
-            // --- Rug: takes precedence and ends the watch. Always alerted,
-            // announced or not: if the sniper bought, this is the one that costs
-            // money.
+            // --- Rug: takes precedence and ends the watch.
+            //
+            // Only ALERT the group if the pool was actually announced (secured),
+            // or if we're not in secured-only mode. A pull on a pool that never
+            // secured is a rug on a token the group was deliberately never told
+            // about — announcing it is exactly the noise secured-only mode
+            // exists to remove. Still logged and persisted locally either way.
             if let (Some(before), Some(after)) = (baseline_liq, liquidity_now)
                 && before > 0.0
                 && (before - after) / before >= cfg.rug_drop_pct
@@ -180,16 +184,18 @@ pub fn spawn_watch(
                 warn!(
                     pool = %event.pool,
                     token = event.new_token_mint.as_deref().unwrap_or("?"),
-                    before, after, drop_pct, after_secs = elapsed,
+                    before, after, drop_pct, after_secs = elapsed, announced = secured,
                     "🚨 liquidity pulled"
                 );
                 let verdict = Verdict::LiquidityPulled { before, after, drop_pct };
                 let mut f = event.clone();
                 f.quote_liquidity = liquidity_now;
                 storage.record_followup(&f, verdict.label()).await;
-                alerter
-                    .send_html(render_followup(&event, &verdict, liquidity_now, elapsed))
-                    .await;
+                if secured || !cfg.alert_only_secured_lp {
+                    alerter
+                        .send_html(render_followup(&event, &verdict, liquidity_now, elapsed))
+                        .await;
+                }
                 return;
             }
 
