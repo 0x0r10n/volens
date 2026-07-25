@@ -63,7 +63,10 @@ impl WalletStore {
         Ok(n.to_string())
     }
 
-    fn path_for(&self, name: &str) -> Result<PathBuf> {
+    /// Keypair path for a named wallet. Public so the bot can act on a wallet
+    /// the user picked (deposit/withdraw/export), not only the active one.
+    /// `name` is sanitized, so a caller cannot escape the wallet directory.
+    pub fn path_for(&self, name: &str) -> Result<PathBuf> {
         let clean = Self::sanitize(name)?;
         Ok(self.dir.join(format!("{clean}.json")))
     }

@@ -338,7 +338,7 @@ impl Bot {
                 .await;
                 return;
             }
-            let (text, kb) = self.export_confirm_screen();
+            let (text, kb) = self.export_confirm_screen(None);
             self.reply_with(chat_id, text, kb).await;
             return;
         }
@@ -378,7 +378,7 @@ impl Bot {
         // needs the message id to schedule the deletion. Private chat only —
         // re-checked here so a stale button tapped inside a group cannot leak.
         #[cfg(feature = "sniper")]
-        if data == "expgo" {
+        if let Some(which) = data.strip_prefix("expgo:") {
             if msg.chat.id < 0 {
                 self.edit_message(
                     msg.chat.id,
@@ -389,7 +389,8 @@ impl Bot {
                 .await;
                 return;
             }
-            let (text, deletable) = self.render_export();
+            let wallet = (!which.is_empty()).then_some(which);
+            let (text, deletable) = self.render_export(wallet);
             self.edit_message(
                 msg.chat.id,
                 msg.message_id,
@@ -444,11 +445,32 @@ impl Bot {
         // new ✅ active marker is visible immediately.
         if let Some(name) = data.strip_prefix("use:") {
             self.render_use(Some(name));
+            // Back to the wallet's own screen so the new ✅ is visible in place.
+            #[cfg(feature = "sniper")]
+            return Some(self.wallet_detail_screen(name).await);
+            #[cfg(not(feature = "sniper"))]
             return Some((self.render_wallets().await, self.wallets_keyboard()));
         }
         // The wallets LIST: text + a "set active" button per wallet.
         if data == "cmd:wallets" {
             return Some((self.render_wallets().await, self.wallets_keyboard()));
+        }
+        // Per-wallet screens.
+        #[cfg(feature = "sniper")]
+        if let Some(name) = data.strip_prefix("w:") {
+            return Some(self.wallet_detail_screen(name).await);
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(name) = data.strip_prefix("dep:") {
+            return Some(self.wallet_deposit_screen(name));
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(name) = data.strip_prefix("wd:") {
+            return Some(self.wallet_withdraw_screen(name));
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(name) = data.strip_prefix("expask:") {
+            return Some(self.export_confirm_screen(Some(name)));
         }
         // Positions: text + a "Sell N%" button per holding.
         if data == "cmd:positions" {
@@ -462,9 +484,14 @@ impl Bot {
         // (no colon) and the address is base58 (no colon), so one split works.
         #[cfg(feature = "sniper")]
         if let Some(rest) = data.strip_prefix("wdgo:") {
-            if let Some((sol_s, address)) = rest.split_once(':') {
+            if let Some((sol_s, tail)) = rest.split_once(':') {
+                // tail is "<address>" or "<address>:<wallet>".
+                let (address, wallet) = match tail.split_once(':') {
+                    Some((a, w)) if !w.is_empty() => (a, Some(w)),
+                    _ => (tail, None),
+                };
                 if let Ok(sol) = sol_s.parse::<f64>() {
-                    let text = self.render_withdraw_exec(sol, address).await;
+                    let text = self.render_withdraw_exec(sol, address, wallet).await;
                     let kb = serde_json::json!({ "inline_keyboard": [[
                         {"text": "◀️ Menu", "callback_data": "nav:main"}
                     ]]});
@@ -739,17 +766,19 @@ impl Bot {
         #[cfg(feature = "sniper")]
         match parse_withdraw_args(args) {
             Err(msg) => (format!("⚠️ {}", escape_html(&msg)), empty),
-            Ok((sol, address)) => {
+            Ok((sol, address, wallet)) => {
                 let text = format!(
                     "🚨 <b>Confirm withdrawal</b>\n\n\
-                     Move <b>{sol} SOL</b> OUT of the trading wallet to:\n\
+                     Move <b>{sol} SOL</b> out of <b>{from}</b> to:\n\
                      <code>{addr}</code>\n\n\
                      <i>This sends real funds to another address and cannot be undone. \
                      Works only when the bot is ARMED; blocked while halted.</i>",
                     addr = escape_html(&address),
+                    from = escape_html(wallet.as_deref().unwrap_or("the trading wallet")),
                 );
+                let w = wallet.unwrap_or_default();
                 let kb = serde_json::json!({ "inline_keyboard": [[
-                    {"text": format!("✅ Send {sol} SOL"), "callback_data": format!("wdgo:{sol}:{address}")},
+                    {"text": format!("✅ Send {sol} SOL"), "callback_data": format!("wdgo:{sol}:{address}:{w}")},
                     {"text": "◀️ Cancel", "callback_data": "nav:main"},
                 ]]});
                 (text, kb)
@@ -757,9 +786,106 @@ impl Bot {
         }
     }
 
+    /// Per-wallet detail screen: address, balance, and the actions that apply to
+    /// THIS wallet (set active / deposit / withdraw / export).
+    #[cfg(feature = "sniper")]
+    async fn wallet_detail_screen(&self, name: &str) -> (String, serde_json::Value) {
+        let back = serde_json::json!({ "inline_keyboard": [[
+            {"text": "◀️ Wallets", "callback_data": "cmd:wallets"}
+        ]]});
+        let Some(store) = &self.store else {
+            return ("⚪ <b>Wallet store not configured</b>".to_string(), back);
+        };
+        let Some(addr) = store.pubkey_of(name) else {
+            return (format!("⚠️ Unknown wallet <b>{}</b>", escape_html(name)), back);
+        };
+        let addr = addr.to_string();
+        let is_active = store.active().as_deref() == Some(name);
+
+        let bal = match &self.rpc {
+            Some(rpc) => match rpc.sol_balance(&addr).await {
+                Some(v) => format!("{v:.4} SOL"),
+                // Never render an unreadable balance as zero — that reads as
+                // "drained" to someone checking their wallet.
+                None => "⚠️ could not read".to_string(),
+            },
+            None => "—".to_string(),
+        };
+
+        let text = format!(
+            "👛 <b>{name}</b>{active}\n\
+             <code>{addr}</code>\n\
+             <b>Balance:</b> {bal}\n\n\
+             <a href=\"https://solscan.io/account/{addr}\">view on Solscan</a>",
+            name = escape_html(name),
+            active = if is_active { " ✅ <i>active</i>" } else { "" },
+            addr = escape_html(&addr),
+            bal = bal,
+        );
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        if !is_active {
+            rows.push(serde_json::json!([
+                {"text": "✅ Set as active", "callback_data": format!("use:{name}")}
+            ]));
+        }
+        rows.push(serde_json::json!([
+            {"text": "📥 Deposit", "callback_data": format!("dep:{name}")},
+            {"text": "💸 Withdraw", "callback_data": format!("wd:{name}")},
+        ]));
+        rows.push(serde_json::json!([
+            {"text": "🔑 Export key", "callback_data": format!("expask:{name}")}
+        ]));
+        rows.push(serde_json::json!([
+            {"text": "◀️ Wallets", "callback_data": "cmd:wallets"},
+            {"text": "🏠 Menu", "callback_data": "nav:main"},
+        ]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Deposit address for a specific wallet.
+    #[cfg(feature = "sniper")]
+    fn wallet_deposit_screen(&self, name: &str) -> (String, serde_json::Value) {
+        let kb = serde_json::json!({ "inline_keyboard": [[
+            {"text": "◀️ Back", "callback_data": format!("w:{name}")}
+        ]]});
+        let Some(addr) = self.store.as_ref().and_then(|s| s.pubkey_of(name)) else {
+            return (format!("⚠️ Unknown wallet <b>{}</b>", escape_html(name)), kb);
+        };
+        let text = format!(
+            "📥 <b>Deposit to {name}</b>\n\n\
+             <code>{addr}</code>\n\n\
+             <i>Tap to copy. Receive-only — sharing this address can never move \
+             funds out.</i>",
+            name = escape_html(name),
+            addr = escape_html(&addr.to_string()),
+        );
+        (text, kb)
+    }
+
+    /// Withdraw instructions for a specific wallet. The amount and destination
+    /// have to be typed, so this hands back a ready-to-edit command rather than
+    /// pretending a button could capture them.
+    #[cfg(feature = "sniper")]
+    fn wallet_withdraw_screen(&self, name: &str) -> (String, serde_json::Value) {
+        let kb = serde_json::json!({ "inline_keyboard": [[
+            {"text": "◀️ Back", "callback_data": format!("w:{name}")}
+        ]]});
+        let text = format!(
+            "💸 <b>Withdraw from {name}</b>\n\n\
+             Send this, replacing the amount and address:\n\n\
+             <code>/withdraw 0.05 ADDRESS {name}</code>\n\n\
+             <i>You will get a confirmation showing the exact amount and \
+             destination before anything is sent. Blocked while halted.</i>",
+            name = escape_html(name),
+        );
+        (text, kb)
+    }
+
     /// Confirmation before revealing a private key.
     #[cfg(feature = "sniper")]
-    fn export_confirm_screen(&self) -> (String, serde_json::Value) {
+    fn export_confirm_screen(&self, wallet: Option<&str>) -> (String, serde_json::Value) {
+        let which = wallet.unwrap_or("");
         let text = format!(
             "🔑 <b>Export private key?</b>\n\n\
              This reveals the <b>full private key</b> of the active wallet — \
@@ -772,9 +898,14 @@ impl Bot {
              a fresh wallet if it ever held anything you care about.",
             ttl = self.export_ttl_secs,
         );
+        let back = if which.is_empty() {
+            "nav:main".to_string()
+        } else {
+            format!("w:{which}")
+        };
         let kb = serde_json::json!({ "inline_keyboard": [[
-            {"text": "🔑 Reveal key", "callback_data": "expgo"},
-            {"text": "◀️ Cancel", "callback_data": "nav:main"},
+            {"text": "🔑 Reveal key", "callback_data": format!("expgo:{which}")},
+            {"text": "◀️ Cancel", "callback_data": back},
         ]]});
         (text, kb)
     }
@@ -784,12 +915,24 @@ impl Bot {
     /// The key is formatted as `<code>` so Telegram gives a one-tap copy, and
     /// is NEVER written to the log or the audit file.
     #[cfg(feature = "sniper")]
-    fn render_export(&self) -> (String, bool) {
+    fn render_export(&self, wallet: Option<&str>) -> (String, bool) {
         let Some(store) = &self.store else {
             return ("⚪ <b>No wallet store configured</b>".to_string(), false);
         };
-        let (Some(name), Some(path)) = (store.active(), store.active_path()) else {
-            return ("⚪ <b>No active wallet</b>\nSet one with /wallets first.".to_string(), false);
+        let (name, path) = match wallet {
+            Some(n) => match store.path_for(n) {
+                Ok(p) if store.exists(n) => (n.to_string(), p),
+                _ => return (format!("⚠️ Unknown wallet <b>{}</b>", escape_html(n)), false),
+            },
+            None => match (store.active(), store.active_path()) {
+                (Some(n), Some(p)) => (n, p),
+                _ => {
+                    return (
+                        "⚪ <b>No active wallet</b>\nSet one with /wallets first.".to_string(),
+                        false,
+                    );
+                }
+            },
         };
         match crate::tx::export_secret_base58(&path.to_string_lossy()) {
             // Deliberately no `info!`/audit call anywhere in this arm.
@@ -811,12 +954,20 @@ impl Bot {
 
     /// Execute a confirmed withdrawal and render the outcome.
     #[cfg(feature = "sniper")]
-    async fn render_withdraw_exec(&self, sol: f64, dest: &str) -> String {
+    async fn render_withdraw_exec(&self, sol: f64, dest: &str, wallet: Option<&str>) -> String {
         use crate::sniper::{SubmitOutcome, WithdrawOutcome};
         let Some(sniper) = &self.sniper else {
             return "⚪ <b>Sniper not configured</b>".to_string();
         };
-        match sniper.withdraw(dest, sol).await {
+        // Resolve a named wallet to its keypair path; None = the armed wallet.
+        let path = match wallet {
+            Some(name) => match self.store.as_ref().and_then(|st| st.path_for(name).ok()) {
+                Some(p) => Some(p.to_string_lossy().into_owned()),
+                None => return format!("⚠️ Unknown wallet <b>{}</b>", escape_html(name)),
+            },
+            None => None,
+        };
+        match sniper.withdraw(dest, sol, path.as_deref()).await {
             WithdrawOutcome::Refused { reason } => {
                 format!("⚠️ <b>Withdraw refused</b>\n{}", escape_html(&reason))
             }
@@ -904,11 +1055,28 @@ impl Bot {
             let mut priced_any = false;
 
             for (mint, amount) in &holdings {
-                let short = format!("{}…{}", &mint[..4.min(mint.len())], &mint[mint.len().saturating_sub(4)..]);
+                let short = short_mint(mint);
+                // Name the token so a position is recognizable at a glance; the
+                // shortened mint stays as the identifier (names are not unique
+                // and are trivially spoofed, so the mint remains the truth).
+                let named = rpc
+                    .token_metadata(mint)
+                    .await
+                    .map(|(n, sym)| match (n.is_empty(), sym.is_empty()) {
+                        (false, false) => format!("{n} ({sym})"),
+                        (false, true) => n,
+                        (true, false) => sym,
+                        _ => String::new(),
+                    })
+                    .filter(|l| !l.is_empty());
+                let short = match &named {
+                    Some(label) => format!("{} · {}", escape_html(label), short),
+                    None => short,
+                };
                 match basis.get(mint) {
                     Some(cb) => {
                         // Try to mark it: read both vaults now, mid-price it.
-                        let value = self.mark_position(rpc, cb, *amount).await;
+                        let value = self.mark_position(rpc, cb, mint, *amount).await;
                         match value {
                             Some(v) => {
                                 let p = unrealized(cb.sol_spent, v);
@@ -919,7 +1087,7 @@ impl Bot {
                                 out.push_str(&format!(
                                     "\n<b>{short}</b> — {amt:.2} tokens\n\
                                      cost {cost:.4} → est {val:.4} SOL  ({sign}{abs:.4}, {pct:+.1}%)\n",
-                                    short = escape_html(&short),
+                                    short = short,
                                     amt = amount,
                                     cost = p.cost,
                                     val = p.value,
@@ -931,7 +1099,7 @@ impl Bot {
                             None => out.push_str(&format!(
                                 "\n<b>{short}</b> — {amt:.2} tokens\n\
                                  cost {cost:.4} SOL · <i>price unavailable</i>\n",
-                                short = escape_html(&short),
+                                short = short,
                                 amt = amount,
                                 cost = cb.sol_spent,
                             )),
@@ -939,7 +1107,7 @@ impl Bot {
                     }
                     None => out.push_str(&format!(
                         "\n<b>{short}</b> — {amt:.2} tokens · <i>untracked (not bought by this bot)</i>\n",
-                        short = escape_html(&short),
+                        short = short,
                         amt = amount,
                     )),
                 }
@@ -976,7 +1144,12 @@ impl Bot {
             if let Some((address, _)) = sniper.trading_identity() {
                 if let Some(holdings) = rpc.token_holdings(&address).await {
                     for (mint, _amt) in holdings.iter().take(8) {
-                        let short = short_mint(mint);
+                        // Prefer the ticker on the button — "Sell 50% DOGEK" is
+                        // far easier to act on than "Sell 50% Gw12…pump".
+                        let short = match rpc.token_metadata(mint).await {
+                            Some((_, sym)) if !sym.is_empty() => sym,
+                            _ => short_mint(mint),
+                        };
                         rows.push(serde_json::json!([
                             {"text": format!("Sell 50% {short}"), "callback_data": format!("sell:{mint}:50")},
                             {"text": format!("Sell 100% {short}"), "callback_data": format!("sell:{mint}:100")},
@@ -1085,13 +1258,29 @@ impl Bot {
         &self,
         rpc: &crate::rpc::RpcClient,
         cb: &crate::positions::CostBasis,
+        mint: &str,
         held: f64,
     ) -> Option<f64> {
         let base_vault = cb.base_vault.as_deref()?;
         let quote_vault = cb.quote_vault.as_deref()?;
-        let base_reserve = rpc.vault_balance(base_vault).await?;
-        let quote_reserve = rpc.vault_balance(quote_vault).await?;
-        crate::positions::mid_price_value(quote_reserve, base_reserve, held)
+
+        // ORIENTATION IS NOT ASSUMABLE. `base_vault`/`quote_vault` are the
+        // pool's own naming, and on Raydium CPMM / PumpSwap WSOL sits on the
+        // BASE side — so "quote_vault" there holds the launched token, not SOL.
+        // Taking the names at face value inverts the price (tokens-per-SOL
+        // instead of SOL-per-token) and produces a wildly wrong mark. Read which
+        // mint the vault actually holds and decide from that.
+        let base_holds_token = rpc.token_account_mint(base_vault).await? == mint;
+        let (token_vault, sol_vault) = if base_holds_token {
+            (base_vault, quote_vault)
+        } else {
+            (quote_vault, base_vault)
+        };
+
+        let token_reserve = rpc.vault_balance(token_vault).await?;
+        let sol_reserve = rpc.vault_balance(sol_vault).await?;
+        // value = held * (SOL per token)
+        crate::positions::mid_price_value(sol_reserve, token_reserve, held)
     }
 
     fn halt_engaged(&self) -> bool {
@@ -1495,13 +1684,15 @@ impl Bot {
             let active = store.active();
             for (name, _addr) in store.list() {
                 let is_active = active.as_deref() == Some(&name);
+                // Tapping a wallet opens its detail screen (deposit / withdraw /
+                // export / set active) rather than immediately switching to it.
                 let label = if is_active {
                     format!("✅ {name} (active)")
                 } else {
-                    format!("Set active: {name}")
+                    format!("👛 {name}")
                 };
                 rows.push(serde_json::json!([
-                    {"text": label, "callback_data": format!("use:{name}")}
+                    {"text": label, "callback_data": format!("w:{name}")}
                 ]));
             }
         }
@@ -1612,12 +1803,15 @@ impl DeleteHandle {
 /// user-facing error. Full address validation happens in the sniper; this is
 /// just enough to reject obvious junk before showing a confirm.
 #[cfg(feature = "sniper")]
-fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String), String> {
-    const USAGE: &str = "Usage: <code>/withdraw &lt;amount_SOL&gt; &lt;address&gt;</code>";
+fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String, Option<String>), String> {
+    const USAGE: &str =
+        "Usage: <code>/withdraw &lt;amount_SOL&gt; &lt;address&gt; [wallet]</code>";
     let args = args.unwrap_or("").trim();
     let mut it = args.split_whitespace();
     let amount = it.next().filter(|s| !s.is_empty()).ok_or(USAGE)?;
     let address = it.next().ok_or(USAGE)?;
+    // Optional: which wallet to send FROM. Omitted = the armed trading wallet.
+    let wallet = it.next().map(str::to_string);
     let sol: f64 = amount
         .parse()
         .map_err(|_| format!("'{amount}' is not a valid SOL amount"))?;
@@ -1628,7 +1822,7 @@ fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String), String> {
     if !(32..=44).contains(&address.len()) {
         return Err("that doesn't look like a Solana address".into());
     }
-    Ok((sol, address.to_string()))
+    Ok((sol, address.to_string(), wallet))
 }
 
 /// `AAAA…ZZZZ` short form of a base58 string (mint or signature), for buttons.
@@ -2075,7 +2269,21 @@ mod tests {
 
         // Valid parse.
         let ok = parse_withdraw_args(Some("0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX"));
-        assert_eq!(ok, Ok((0.5, "DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into())));
+        assert_eq!(
+            ok,
+            Ok((0.5, "DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into(), None))
+        );
+
+        // Optional third token names the wallet to send FROM.
+        let w = parse_withdraw_args(Some("0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX primary"));
+        assert_eq!(
+            w,
+            Ok((
+                0.5,
+                "DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into(),
+                Some("primary".into())
+            ))
+        );
 
         // Rejections: no address, bad amount, zero/negative, junk address.
         assert!(parse_withdraw_args(Some("0.5")).is_err(), "missing address");

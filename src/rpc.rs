@@ -421,6 +421,25 @@ impl RpcClient {
         parse_metadata_name_symbol(&data)
     }
 
+    /// Which mint a token account holds. Used to determine pool ORIENTATION:
+    /// `base_vault`/`quote_vault` are pool-native names, and on Raydium CPMM /
+    /// PumpSwap the "base" side is WSOL, so which vault holds the launched token
+    /// cannot be assumed from the field name. Reading the account settles it.
+    #[cfg(feature = "sniper")]
+    pub async fn token_account_mint(&self, address: &str) -> Option<String> {
+        let body = json!({
+            "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+            "params":[address, {"encoding":"jsonParsed","commitment": self.commitment}],
+        });
+        let resp: serde_json::Value = self
+            .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
+        Some(
+            resp.pointer("/result/value/data/parsed/info/mint")?
+                .as_str()?
+                .to_string(),
+        )
+    }
+
     /// Authority/extension state of a mint. `None` if unreadable.
     pub async fn mint_info(&self, mint: &str) -> Option<MintInfo> {
         self.with_retries("getAccountInfo", mint, true, parse_mint_info)

@@ -1075,8 +1075,22 @@ impl Sniper {
     /// solely in `Mode::Armed`, so a dry-run bot — or a leaked token on one —
     /// simply has no key to sign with), and it is HALT-gated. The caller (the
     /// bot) additionally requires a two-tap confirmation before reaching here.
+    ///
+    /// `from_keypair` selects which wallet to send FROM: `Some(path)` loads that
+    /// wallet from the store, `None` uses the armed trading wallet.
+    ///
+    /// Loading an arbitrary store wallet deliberately bypasses the armed-only
+    /// gate. That gate stopped being meaningful once `/export` could reveal any
+    /// store wallet's private key: export grants permanent, irrevocable control,
+    /// which strictly dominates a single withdrawal, so gating withdraw more
+    /// tightly than export would be security theatre. HALT still applies.
     #[cfg(feature = "sniper")]
-    pub async fn withdraw(&self, dest: &str, sol: f64) -> WithdrawOutcome {
+    pub async fn withdraw(
+        &self,
+        dest: &str,
+        sol: f64,
+        from_keypair: Option<&str>,
+    ) -> WithdrawOutcome {
         use crate::tx::pk;
 
         if self.kill_switch_engaged() {
@@ -1084,13 +1098,29 @@ impl Sniper {
                 reason: "kill switch engaged (HALT) — resume to withdraw".into(),
             };
         }
-        let cap = match &self.mode {
-            Mode::Armed(c) => c,
-            Mode::DryRun { .. } => {
-                return WithdrawOutcome::Refused {
-                    reason: "bot is in dry run — withdrawing requires an armed bot (host-side)".into(),
-                };
-            }
+        // Borrowed from either the loaded file or the armed capability.
+        let loaded;
+        let wallet: &Wallet = match from_keypair {
+            Some(path) => match Wallet::load(path) {
+                Ok(w) => {
+                    loaded = w;
+                    &loaded
+                }
+                Err(e) => {
+                    return WithdrawOutcome::Refused {
+                        reason: format!("could not load that wallet: {e:#}"),
+                    };
+                }
+            },
+            None => match &self.mode {
+                Mode::Armed(c) => &c.wallet,
+                Mode::DryRun { .. } => {
+                    return WithdrawOutcome::Refused {
+                        reason: "bot is in dry run — pick a specific wallet, or arm on the host"
+                            .into(),
+                    };
+                }
+            },
         };
         if !(sol.is_finite() && sol > 0.0) {
             return WithdrawOutcome::Refused { reason: "amount must be greater than 0".into() };
@@ -1099,7 +1129,7 @@ impl Sniper {
             Ok(p) => p,
             Err(_) => return WithdrawOutcome::Refused { reason: "invalid destination address".into() },
         };
-        let from = cap.wallet.pubkey();
+        let from = wallet.pubkey();
         if dest_pk == from {
             return WithdrawOutcome::Refused { reason: "destination is the trading wallet itself".into() };
         }
@@ -1121,7 +1151,7 @@ impl Sniper {
 
         warn!(%dest, sol, "sniper: SUBMITTING WITHDRAWAL — moving funds OUT");
         let ix = solana_system_interface::instruction::transfer(&from, &dest_pk, lamports);
-        let res = self.submitter.send(&[ix], &from, cap.wallet.keypair()).await;
+        let res = self.submitter.send(&[ix], &from, wallet.keypair()).await;
         let (outcome, result) = classify_submission(res);
         self.audit_withdraw(&from.to_string(), dest, sol, &outcome).await;
         WithdrawOutcome::Submitted { sol, dest: dest.to_string(), result }
@@ -1814,7 +1844,7 @@ mod tests {
     async fn withdraw_is_refused_in_dry_run() {
         let s = mk(cfg()).unwrap(); // cfg() is armed=false → DryRun
         let out = s
-            .withdraw("So11111111111111111111111111111111111111112", 0.1)
+            .withdraw("So11111111111111111111111111111111111111112", 0.1, None)
             .await;
         assert!(
             matches!(out, WithdrawOutcome::Refused { .. }),

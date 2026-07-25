@@ -9,7 +9,9 @@
 //!   made, reconstructed from the audit log. It cannot know the cost of tokens
 //!   that arrived by manual buys or airdrops, so those show as "untracked".
 //! * **Current value** (to get the PnL number) — a mid-price mark from the
-//!   pool's reserves: `price = quote_reserve / base_reserve`. This is
+//!   pool's reserves: `price = sol_reserve / token_reserve`, where orientation
+//!   is resolved by reading which mint each vault actually holds (the pool's own
+//!   "base"/"quote" naming is venue-relative and cannot be trusted). This is
 //!   **mark-to-mid**, not what you'd actually receive selling into a thin pool
 //!   (that includes slippage), so it flatters small/illiquid positions. Labelled
 //!   as an estimate for that reason.
@@ -98,18 +100,25 @@ fn executed(outcome: &str) -> bool {
     outcome.starts_with("confirmed:") || outcome.starts_with("bundle_landed:")
 }
 
-/// Mid-price mark of a holding, in quote units (SOL/USDC).
+/// Mid-price mark of a holding, in SOL.
 ///
-/// `value = held_tokens * (quote_reserve / base_reserve)`. This is the pool's
+/// `value = held_tokens * (sol_reserve / token_reserve)`. This is the pool's
 /// current mid-price — NOT a slippage-adjusted sell quote, so it overstates what
 /// a large or illiquid position would actually fetch. Returns `None` if the
-/// reserves can't price it (empty base reserve → no meaningful price).
-pub fn mid_price_value(quote_reserve: f64, base_reserve: f64, held_tokens: f64) -> Option<f64> {
-    if base_reserve <= 0.0 || !quote_reserve.is_finite() || !held_tokens.is_finite() {
+/// reserves can't price it (empty token reserve → no meaningful price).
+///
+/// Parameters are deliberately named by WHAT THE VAULT HOLDS, not by the pool's "base"/"quote"
+/// field names. Those names are venue-relative — on Raydium CPMM and PumpSwap
+/// the "base" side is WSOL — and naming these parameters after them once caused
+/// the price to be computed upside down (tokens-per-SOL), marking positions
+/// millions of times off. The caller must resolve orientation from the vault's
+/// actual mint before calling this.
+pub fn mid_price_value(sol_reserve: f64, token_reserve: f64, held_tokens: f64) -> Option<f64> {
+    if token_reserve <= 0.0 || !sol_reserve.is_finite() || !held_tokens.is_finite() {
         return None;
     }
-    let price = quote_reserve / base_reserve;
-    Some(held_tokens * price)
+    let price_sol_per_token = sol_reserve / token_reserve;
+    Some(held_tokens * price_sol_per_token)
 }
 
 /// Unrealized PnL given cost basis and a current mark.
@@ -153,6 +162,20 @@ mod tests {
         assert_eq!(p.trades, 2);
         assert_eq!(p.dex, "Raydium CPMM");
         assert_eq!(p.base_vault.as_deref(), Some("BV"));
+    }
+
+    /// Regression: the price is SOL-per-token. Passing the reserves the other
+    /// way round (the pool's "quote_vault" first, which on PumpSwap holds the
+    /// TOKEN) inverts it and marks a position millions of times too high.
+    #[test]
+    fn price_is_sol_per_token_not_the_inverse() {
+        // 10 SOL and 1_000_000 tokens => 0.00001 SOL/token. 100k tokens = 1 SOL.
+        let right = mid_price_value(10.0, 1_000_000.0, 100_000.0).unwrap();
+        assert!((right - 1.0).abs() < 1e-9, "got {right}");
+
+        // Arguments swapped: the bug that shipped. Off by 1e10 here.
+        let wrong = mid_price_value(1_000_000.0, 10.0, 100_000.0).unwrap();
+        assert!(wrong > right * 1e9, "inverted mark should be absurdly large");
     }
 
     #[test]
