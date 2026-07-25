@@ -144,6 +144,29 @@ impl Wallet {
     }
 }
 
+/// Read a keypair file and return the secret in base58 (the format Phantom,
+/// Solflare and Backpack accept on import).
+///
+/// # This returns a SECRET
+///
+/// Anyone holding this string owns the wallet, permanently and irreversibly.
+/// The caller is responsible for where it goes. Deliberately:
+/// * **Never logged.** No tracing call in this path touches the return value,
+///   and callers must not log it either — a key in a log file is a key leaked.
+/// * **Not part of `Wallet`.** It is a free function taking a path, so the
+///   normal trading paths (which hold a `Wallet`) have no method that can
+///   accidentally surface the secret.
+pub fn export_secret_base58(path: &str) -> Result<String> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading keypair {path}"))?;
+    let bytes: Vec<u8> =
+        serde_json::from_str(&raw).with_context(|| format!("parsing keypair {path}"))?;
+    if bytes.len() != 64 {
+        bail!("keypair {path}: expected 64 bytes, got {}", bytes.len());
+    }
+    Ok(bs58::encode(&bytes).into_string())
+}
+
 /// Associated token account address for `owner`/`mint` under the SPL Token program.
 pub fn ata(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
     get_associated_token_address_with_program_id(owner, mint, &TOKEN_PROGRAM)

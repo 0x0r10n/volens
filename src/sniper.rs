@@ -92,6 +92,8 @@ pub enum Denial {
     /// Already traded this pool recently. Guards against re-detection and
     /// stream replay buying the same pool twice.
     PoolCoolingDown { seconds_remaining: i64 },
+    /// Fully-diluted valuation at or above the configured ceiling.
+    MarketCapTooHigh { mcap_usd: f64, max_usd: f64 },
     /// The venue has no verified encoder, or state could not be read.
     CannotBuild { reason: String },
     /// The trade would move the pool more than we tolerate.
@@ -113,6 +115,7 @@ impl Denial {
             Denial::DailyCapReached { .. } => "daily spend cap reached",
             Denial::DailyTradeCountReached { .. } => "daily trade count reached",
             Denial::PoolCoolingDown { .. } => "pool traded recently",
+            Denial::MarketCapTooHigh { .. } => "market cap too high",
             Denial::CannotBuild { .. } => "cannot build trade",
             Denial::PriceImpactTooHigh { .. } => "price impact too high",
             Denial::NoSimulationIdentity => "no simulate_as configured",
@@ -161,6 +164,17 @@ pub enum SellOutcome {
     Rehearsed { mint: String, pct: u8, sol_out: f64, impact_pct: f64, would_succeed: bool },
     /// Armed: the swap was submitted.
     Submitted { mint: String, pct: u8, sol_out: f64, result: SubmitOutcome },
+}
+
+/// Outcome of a manual withdrawal (moving SOL OUT of the trading wallet).
+#[cfg(feature = "sniper")]
+#[derive(Debug, Clone)]
+pub enum WithdrawOutcome {
+    /// Refused before any signing (halted, not armed, bad amount/address, thin
+    /// balance). No transaction was built.
+    Refused { reason: String },
+    /// Submitted. `result` says whether it landed.
+    Submitted { sol: f64, dest: String, result: SubmitOutcome },
 }
 
 /// Outcome of a real submission, classified by what it means for the operator.
@@ -316,6 +330,10 @@ pub struct Sniper {
     cfg: SniperConfig,
     mode: Mode,
     state: Mutex<DailyState>,
+    /// Cached (price_usd, fetched_at) for SOL. Refreshed on a TTL so the market
+    /// cap check does not re-quote Jupiter on every pool.
+    #[cfg(feature = "sniper")]
+    sol_price: Mutex<Option<(f64, std::time::Instant)>>,
     /// See `Tunable`. Behind its own lock; read once per decision.
     tunable: Mutex<Tunable>,
     rpc: Arc<RpcClient>,
@@ -410,6 +428,7 @@ impl Sniper {
             mode,
             state: Mutex::new(DailyState::default()),
             tunable: Mutex::new(tunable),
+            sol_price: Mutex::new(None),
             rpc,
             submitter,
             jito,
@@ -687,6 +706,38 @@ impl Sniper {
             }
             Ok(p) => p,
         };
+
+        // MARKET CAP CEILING. Checked here, after every cheap gate has already
+        // passed, so the extra reads are only spent on a pool we are otherwise
+        // about to buy. An unreadable market cap does NOT block the trade: the
+        // other guards (liquidity, mint safety, price impact) still apply, and
+        // failing closed here would halt all trading whenever Jupiter is down.
+        if self.cfg.max_market_cap_usd > 0.0 {
+            match self.event_market_cap_usd(ev).await {
+                Some(mcap) if mcap >= self.cfg.max_market_cap_usd => {
+                    let d = Denial::MarketCapTooHigh {
+                        mcap_usd: mcap,
+                        max_usd: self.cfg.max_market_cap_usd,
+                    };
+                    info!(
+                        pool = %ev.pool,
+                        mcap_usd = mcap,
+                        max_usd = self.cfg.max_market_cap_usd,
+                        "sniper: skipped — market cap too high (already-run token)"
+                    );
+                    self.audit(ev, Some(&plan), Some(&d), None).await;
+                    return Execution::Skipped {
+                        pool: ev.pool.clone(),
+                        reason: d.label().to_string(),
+                    };
+                }
+                Some(mcap) => info!(pool = %ev.pool, mcap_usd = mcap, "market cap within ceiling"),
+                None => warn!(
+                    pool = %ev.pool,
+                    "market cap unreadable — proceeding on the other guards"
+                ),
+            }
+        }
 
         let Some(owner) = self.owner() else {
             let d = Denial::NoSimulationIdentity;
@@ -977,6 +1028,125 @@ impl Sniper {
         }
     }
 
+    /// SOL price in USD, cached for 5 minutes.
+    ///
+    /// A stale-by-minutes SOL price is irrelevant to a market-cap ceiling (the
+    /// threshold is an order-of-magnitude filter), and re-quoting per pool would
+    /// add a Jupiter round trip to every trade decision.
+    #[cfg(feature = "sniper")]
+    async fn sol_price_usd(&self) -> Option<f64> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
+        if let Some((price, at)) = *self.sol_price.lock().unwrap()
+            && at.elapsed() < TTL
+        {
+            return Some(price);
+        }
+        let jup = crate::jupiter::Jupiter::new(&self.cfg.jupiter_base_url);
+        match jup.sol_price_usd().await {
+            Ok(p) if p > 0.0 => {
+                *self.sol_price.lock().unwrap() = Some((p, std::time::Instant::now()));
+                Some(p)
+            }
+            Ok(_) => None,
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "could not fetch SOL price for market-cap check");
+                None
+            }
+        }
+    }
+
+    /// Fully-diluted market cap of the launched token, in USD.
+    /// Costs two RPC reads plus (at most, once per 5 min) one Jupiter quote.
+    #[cfg(feature = "sniper")]
+    async fn event_market_cap_usd(&self, ev: &PoolEvent) -> Option<f64> {
+        let quote_reserve = ev.quote_liquidity?;
+        let base_vault = ev.base_vault.as_deref()?;
+        let mint = ev.new_token_mint.as_deref()?;
+        let base_reserve = self.rpc.vault_balance(base_vault).await?;
+        let supply = self.rpc.token_supply(mint).await?;
+        let sol_usd = self.sol_price_usd().await?;
+        market_cap_usd(quote_reserve, base_reserve, supply, sol_usd)
+    }
+
+    /// Move SOL OUT of the trading wallet to an arbitrary address.
+    ///
+    /// This is a fund-EXFILTRATION primitive, so it carries the strictest gates
+    /// in the bot: it works ONLY when armed (the signing key exists in memory
+    /// solely in `Mode::Armed`, so a dry-run bot — or a leaked token on one —
+    /// simply has no key to sign with), and it is HALT-gated. The caller (the
+    /// bot) additionally requires a two-tap confirmation before reaching here.
+    #[cfg(feature = "sniper")]
+    pub async fn withdraw(&self, dest: &str, sol: f64) -> WithdrawOutcome {
+        use crate::tx::pk;
+
+        if self.kill_switch_engaged() {
+            return WithdrawOutcome::Refused {
+                reason: "kill switch engaged (HALT) — resume to withdraw".into(),
+            };
+        }
+        let cap = match &self.mode {
+            Mode::Armed(c) => c,
+            Mode::DryRun { .. } => {
+                return WithdrawOutcome::Refused {
+                    reason: "bot is in dry run — withdrawing requires an armed bot (host-side)".into(),
+                };
+            }
+        };
+        if !(sol.is_finite() && sol > 0.0) {
+            return WithdrawOutcome::Refused { reason: "amount must be greater than 0".into() };
+        }
+        let dest_pk = match pk(dest) {
+            Ok(p) => p,
+            Err(_) => return WithdrawOutcome::Refused { reason: "invalid destination address".into() },
+        };
+        let from = cap.wallet.pubkey();
+        if dest_pk == from {
+            return WithdrawOutcome::Refused { reason: "destination is the trading wallet itself".into() };
+        }
+        let lamports = (sol * 1_000_000_000.0).round() as u64;
+
+        // Leave a small reserve for the fee so a "withdraw everything" can't fail
+        // on being 5000 lamports short (or strand the account below rent).
+        const FEE_RESERVE: u64 = 10_000;
+        if let Some(bal_sol) = self.rpc.sol_balance(&from.to_string()).await {
+            let bal_lamports = (bal_sol * 1_000_000_000.0).round() as u64;
+            if lamports.saturating_add(FEE_RESERVE) > bal_lamports {
+                return WithdrawOutcome::Refused {
+                    reason: format!(
+                        "insufficient balance: {sol} SOL + fee exceeds {bal_sol:.4} SOL held"
+                    ),
+                };
+            }
+        }
+
+        warn!(%dest, sol, "sniper: SUBMITTING WITHDRAWAL — moving funds OUT");
+        let ix = solana_system_interface::instruction::transfer(&from, &dest_pk, lamports);
+        let res = self.submitter.send(&[ix], &from, cap.wallet.keypair()).await;
+        let (outcome, result) = classify_submission(res);
+        self.audit_withdraw(&from.to_string(), dest, sol, &outcome).await;
+        WithdrawOutcome::Submitted { sol, dest: dest.to_string(), result }
+    }
+
+    /// Append a withdrawal to the audit log, tagged so the cost-basis parser
+    /// ignores it (a withdraw's `confirmed:` is not a buy).
+    #[cfg(feature = "sniper")]
+    async fn audit_withdraw(&self, from: &str, dest: &str, sol: f64, outcome: &str) {
+        if self.cfg.audit_log.is_empty() {
+            return;
+        }
+        let record = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "action": "withdraw",
+            "from": from,
+            "dest": dest,
+            "sol": sol,
+            "outcome": outcome,
+        });
+        if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
+            warn!(error = %e, "failed to write withdraw audit log");
+        }
+    }
+
     /// Append a sell decision to the audit log. Tagged `action:"sell"` so the
     /// `/positions` cost-basis parser can exclude it — a sell's `confirmed:`
     /// outcome must NOT be counted as buy spend.
@@ -1061,6 +1231,33 @@ impl Sniper {
             warn!(error = %e, "failed to write sniper audit log");
         }
     }
+}
+
+/// Fully-diluted market cap in USD.
+///
+/// `quote_reserve` (SOL) / `base_reserve` (tokens) is the pool mid-price in SOL
+/// per token; times total supply gives the valuation in SOL; times the SOL price
+/// gives USD. Pure so the arithmetic is testable without a network.
+///
+/// Returns None when it cannot be computed rather than guessing — a fabricated
+/// market cap would gate real money on a made-up number.
+#[cfg(feature = "sniper")]
+pub fn market_cap_usd(
+    quote_reserve: f64,
+    base_reserve: f64,
+    total_supply: f64,
+    sol_price_usd: f64,
+) -> Option<f64> {
+    if !(base_reserve > 0.0)
+        || !quote_reserve.is_finite()
+        || !total_supply.is_finite()
+        || !(sol_price_usd > 0.0)
+    {
+        return None;
+    }
+    let price_sol = quote_reserve / base_reserve;
+    let mcap = price_sol * total_supply * sol_price_usd;
+    mcap.is_finite().then_some(mcap)
 }
 
 /// Classify a submission by what it means for funds: the audit string plus the
@@ -1163,6 +1360,10 @@ mod tests {
             wallet_dir: "wallets".into(),
             alert_on_all_rehearsals: false,
             mode: "open".into(),
+            export_ttl_secs: 60,
+            // Off in tests: the gate needs live RPC + Jupiter, and existing
+            // cases assert on the other guards. Covered by its own pure test.
+            max_market_cap_usd: 0.0,
             jupiter_base_url: "https://lite-api.jup.ag/swap/v1".into(),
             sell_slippage_bps: 500,
         }
@@ -1194,6 +1395,8 @@ mod tests {
             quote_vault: None,
             swap_accounts: Default::default(),
             lp_supply_at_detection: Some(1.0),
+            token_name: None,
+            token_symbol: None,
             signature: "SIG".into(),
             slot: 1,
             detected_at: Utc::now(),
@@ -1602,6 +1805,39 @@ mod tests {
         let mut ev = event();
         ev.risky_extensions = vec!["transferHook".into()];
         assert!(matches!(s.consider(&ev, Utc::now()), Err(Denial::UnsafeMint { .. })));
+    }
+
+    /// A dry-run bot holds no key, so withdraw must be refused before any
+    /// network call — the armed-only gate that stops a leaked token on a
+    /// dry-run bot from moving funds.
+    #[tokio::test]
+    async fn withdraw_is_refused_in_dry_run() {
+        let s = mk(cfg()).unwrap(); // cfg() is armed=false → DryRun
+        let out = s
+            .withdraw("So11111111111111111111111111111111111111112", 0.1)
+            .await;
+        assert!(
+            matches!(out, WithdrawOutcome::Refused { .. }),
+            "dry run must refuse withdrawal (no key loaded)"
+        );
+    }
+
+    #[test]
+    fn market_cap_math_and_guards() {
+        // 10 SOL quote / 1000 tokens = 0.01 SOL each; x 1M supply = 10,000 SOL;
+        // x $200 = $2,000,000.
+        let m = market_cap_usd(10.0, 1_000.0, 1_000_000.0, 200.0).unwrap();
+        assert!((m - 2_000_000.0).abs() < 1.0, "got {m}");
+
+        // A small-supply cheap token lands under a 50k ceiling.
+        let m = market_cap_usd(21.0, 1_000_000_000.0, 1_000_000_000.0, 200.0).unwrap();
+        assert!((m - 4_200.0).abs() < 1.0, "got {m}");
+
+        // Uncomputable inputs must be None, never a fabricated number.
+        assert_eq!(market_cap_usd(10.0, 0.0, 1.0, 200.0), None, "zero base reserve");
+        assert_eq!(market_cap_usd(10.0, -5.0, 1.0, 200.0), None, "negative reserve");
+        assert_eq!(market_cap_usd(10.0, 1.0, 1.0, 0.0), None, "no SOL price");
+        assert_eq!(market_cap_usd(f64::NAN, 1.0, 1.0, 200.0), None, "NaN in");
     }
 
     /// Fail-closed: unknown mint safety (None — e.g. [safety] disabled or the

@@ -285,6 +285,14 @@ pub struct PoolEvent {
     /// alone says nothing about rug risk.
     #[serde(default)]
     pub lp_supply_at_detection: Option<f64>,
+    /// Token name from on-chain metadata (Metaplex), when resolvable. Enrichment
+    /// only — never gates a trade. Absent for tokens with no metadata account or
+    /// when name resolution is disabled.
+    #[serde(default)]
+    pub token_name: Option<String>,
+    /// Token symbol/ticker from metadata, when resolvable.
+    #[serde(default)]
+    pub token_symbol: Option<String>,
     /// Transaction signature that created the pool (base58).
     pub signature: String,
     /// Slot the creating transaction landed in.
@@ -294,6 +302,18 @@ pub struct PoolEvent {
 }
 
 impl PoolEvent {
+    /// A human label for the token: `"Name (SYM)"`, or just one if only one is
+    /// known, or None if neither was resolved. For alert headers so a pool is
+    /// recognizable at a glance instead of a 44-char mint.
+    pub fn token_label(&self) -> Option<String> {
+        match (self.token_name.as_deref(), self.token_symbol.as_deref()) {
+            (Some(n), Some(s)) if !n.is_empty() && !s.is_empty() => Some(format!("{n} ({s})")),
+            (Some(n), _) if !n.is_empty() => Some(n.to_string()),
+            (_, Some(s)) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
     /// Vault addresses, kept on the event so the execution path does not have
     /// to re-derive orientation. Errors rather than guessing when absent.
     #[cfg(feature = "sniper")]

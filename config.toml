@@ -108,11 +108,11 @@ enabled = true
 # SOL for WSOL pairs, USDC for USDC pairs. Override: MIN_QUOTE_LIQUIDITY.
 # Only the quote side is measured — the token side can hold a billion units of
 # something worthless, so it says nothing about committed capital.
-# Raised to 20: the single biggest noise cut. Most dead/rug PumpSwap launches
-# start thin; 20 SOL filters the bulk of them. Tune up for less noise. This is
+# Set to 15: a strong noise cut. Most dead/rug PumpSwap launches
+# start thin; 15 SOL filters the bulk of them. Tune up for less noise. This is
 # also the alert-side floor; the armed sniper re-checks against its own
 # [sniper].min_liquidity_sol at execution time.
-min_quote_liquidity = 20.0
+min_quote_liquidity = 15.0
 # If the balance can't be read, emit anyway with unknown liquidity rather than
 # dropping. A missed real launch costs more than one noisy alert.
 emit_on_unknown = true
@@ -231,9 +231,9 @@ max_trades_per_day = 0
 # replay recent slots. Without this, a re-detected pool buys again. 0 disables.
 pool_cooldown_secs = 3600
 # Liquidity re-checked at execution time. Stricter than the alert filter on
-# purpose: unknown liquidity is alertable but NOT tradable. Raised to 20 to
-# match the tightened alert floor and keep thin-pool rugs off the trade path.
-min_liquidity_sol = 20.0
+# purpose: unknown liquidity is alertable but NOT tradable. Set to 15 to
+# match the alert floor and keep thin-pool rugs off the trade path.
+min_liquidity_sol = 15.0
 slippage_bps = 300
 # Touch this file to halt all execution immediately — no restart needed.
 kill_switch_file = "HALT"
@@ -302,6 +302,30 @@ jito_fallback_to_rpc = false
 # Jupiter swap API root. Free tier: https://lite-api.jup.ag/swap/v1
 # Paid (higher limits): https://api.jup.ag/swap/v1
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
+# --- Market cap ceiling ---
+# Refuse to buy a token whose fully-diluted market cap (mid-price x total
+# supply, in USD) is at or above this. 0 disables.
+#
+# WHY: a brand-new launch should be worth very little. A "new pool" that already
+# carries a large valuation is usually a MIGRATION of a token that has already
+# run — buying it is buying the top, which is how a late entry ends up holding
+# the bag when it dumps. Liquidity alone does not catch this: a pool can be
+# seeded with 20+ SOL and still be a token whose price has already peaked.
+#
+# Costs 2 RPC reads per trade candidate (base vault + token supply) plus one
+# Jupiter SOL-price quote every 5 min. Only spent on pools that already passed
+# every other gate, so it is a few reads a day, not per detection.
+#
+# NOT fail-closed: if the market cap cannot be computed (RPC or Jupiter down)
+# the trade proceeds on the other guards, rather than halting all trading.
+max_market_cap_usd = 50000.0
+
+# Seconds before an exported private key message is deleted from the chat.
+# Best-effort ONLY — deletion clears the chat VIEW, but the key has already
+# reached Telegram's servers, push notifications and every signed-in device.
+# Treat any exported wallet as permanently exposed.
+export_ttl_secs = 60
+
 # Slippage tolerance for exits (bps). Higher than the buy default: selling out
 # of a thin/moving pool needs room to fill. 500 = 5%.
 sell_slippage_bps = 500

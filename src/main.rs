@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         let bot = bot
             .with_wallet_store(store.clone())
             .with_audit_log(cfg.sniper.audit_log.clone())
+            .with_export_ttl(cfg.sniper.export_ttl_secs)
             .with_sniper(detector.sniper());
         info!(
             authorized_chats = bot.authorized_count(),

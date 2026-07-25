@@ -110,6 +110,27 @@ impl Jupiter {
         Ok(Quote { raw })
     }
 
+    /// Current SOL price in USD, derived from a real routed quote of
+    /// 1 SOL -> USDC.
+    ///
+    /// Deliberately reuses `/quote` rather than a separate price endpoint: it is
+    /// the same call the exit path already depends on, so there is one endpoint
+    /// to keep working instead of two, and the number is an actually-executable
+    /// price rather than an index.
+    pub async fn sol_price_usd(&self) -> Result<f64> {
+        const WSOL: &str = "So11111111111111111111111111111111111111112";
+        const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let q = self.quote(WSOL, USDC, 1_000_000_000, 50).await?;
+        let out: u64 = q
+            .raw
+            .get("outAmount")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("no outAmount in SOL price quote"))?;
+        // USDC has 6 decimals.
+        Ok(out as f64 / 1_000_000.0)
+    }
+
     /// Turn a quote into an unsigned swap transaction (base64 VersionedTransaction).
     /// `wrapAndUnwrapSol` makes the SOL output arrive as native SOL, not WSOL.
     pub async fn swap_tx(&self, quote: &Quote, user_pubkey: &str) -> Result<String> {

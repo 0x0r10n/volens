@@ -294,6 +294,10 @@ fn render_followup(
             None => String::new(),
         },
     };
+    let name = ev
+        .token_label()
+        .map(|l| format!("<b>{}</b>\n", crate::bot::escape_html(&l)))
+        .unwrap_or_default();
     let token = ev
         .new_token_mint
         .as_deref()
@@ -301,7 +305,7 @@ fn render_followup(
         .unwrap_or_default();
 
     format!(
-        "{head} — {dex}  (+{delay_secs}s)\n{token}{detail}<b>Pool:</b> <code>{pool}</code>\n\
+        "{head} — {dex}  (+{delay_secs}s)\n{name}{token}{detail}<b>Pool:</b> <code>{pool}</code>\n\
          <a href=\"{link}\">pool</a>",
         head = verdict.label(),
         dex = ev.dex.label(),

@@ -567,11 +567,25 @@ impl Detector {
                 }
             }
 
+            // Resolve the token NAME from on-chain metadata. Only here, after
+            // the pool has passed every filter, so we never pay for a name on a
+            // pool we drop. One getAccountInfo; a token with no metadata just
+            // stays nameless. Sniper-only: PDA derivation needs the Solana crates.
+            #[cfg(feature = "sniper")]
+            if let Some(mint) = event.new_token_mint.clone() {
+                if let Some((name, symbol)) = rpc.token_metadata(&mint).await {
+                    event.token_name = (!name.is_empty()).then_some(name);
+                    event.token_symbol = (!symbol.is_empty()).then_some(symbol);
+                }
+            }
+
             metrics.incr(&metrics.detected);
             info!(
                 dex = event.dex.label(),
                 pool = %event.pool,
                 token = event.new_token_mint.as_deref().unwrap_or("?"),
+                name = event.token_name.as_deref().unwrap_or("?"),
+                symbol = event.token_symbol.as_deref().unwrap_or("?"),
                 quote = event.quote_asset.as_deref().unwrap_or("?"),
                 liquidity = event.quote_liquidity.unwrap_or(f64::NAN),
                 mint_revoked = ?event.mint_authority_revoked,
@@ -710,6 +724,8 @@ pub fn classify_pool(
             swap_accounts: p.swap_accounts.clone(),
             lp_mint: Some(p.lp_mint.clone()),
             lp_supply_at_detection: None,
+            token_name: None,
+            token_symbol: None,
             signature: signature.to_string(),
             slot,
             detected_at: chrono::Utc::now(),

@@ -420,6 +420,8 @@ mod tests {
             quote_vault: Some("73HAh4ksFm1QuNGUomDsARoBaTs1hFdzc5x23et4psw7".into()),
             lp_mint: None,
             lp_supply_at_detection: None,
+            token_name: None,
+            token_symbol: None,
             signature: "SIG".into(),
             slot: 1,
             detected_at: chrono::Utc::now(),

@@ -167,6 +167,10 @@ pub fn render_execution(exec: &crate::sniper::Execution) -> Option<String> {
 
 /// Render an HTML-formatted Telegram message.
 fn render_message(ev: &PoolEvent) -> String {
+    let name_line = match ev.token_label() {
+        Some(label) => format!("<b>{}</b>\n", crate::bot::escape_html(&label)),
+        None => String::new(),
+    };
     let token_line = match (&ev.new_token_mint, ev.solscan_token()) {
         (Some(mint), Some(link)) => {
             format!("<b>New token:</b> <code>{mint}</code>\n<a href=\"{link}\">token on Solscan</a>\n")
@@ -203,6 +207,7 @@ fn render_message(ev: &PoolEvent) -> String {
 
     format!(
         "🟢 <b>New Pool Detected</b> — {dex}\n\
+         {name_line}\
          {token_line}\
          {liq_line}\
          {safety_line}\

@@ -74,6 +74,9 @@ pub struct Bot {
     audit_log: String,
     #[cfg(feature = "sniper")]
     sniper: Option<Arc<crate::sniper::Sniper>>,
+    /// Seconds before an exported key message is deleted. See `render_export`.
+    #[cfg(feature = "sniper")]
+    export_ttl_secs: u64,
 }
 
 impl Bot {
@@ -131,6 +134,8 @@ impl Bot {
             audit_log: String::new(),
             #[cfg(feature = "sniper")]
             sniper: None,
+            #[cfg(feature = "sniper")]
+            export_ttl_secs: 60,
         })
     }
 
@@ -152,6 +157,13 @@ impl Bot {
     #[cfg(feature = "sniper")]
     pub fn with_wallet_store(mut self, store: Arc<crate::walletstore::WalletStore>) -> Self {
         self.store = Some(store);
+        self
+    }
+
+    /// How long an exported private key stays in the chat before deletion.
+    #[cfg(feature = "sniper")]
+    pub fn with_export_ttl(mut self, secs: u64) -> Self {
+        self.export_ttl_secs = secs;
         self
     }
 
@@ -306,6 +318,38 @@ impl Bot {
         };
 
         info!(chat_id, command = cmd.name(), "telegram command");
+
+        // Withdraw is the one command that opens a confirm dialog (a button),
+        // because it moves funds out. Everything else replies with plain text.
+        // Private key export: PRIVATE CHAT ONLY. Telegram group ids are
+        // negative, user/private-chat ids positive. Posting a key into the
+        // alert group would expose it to every member, so that is refused
+        // outright rather than confirmed.
+        #[cfg(feature = "sniper")]
+        if matches!(cmd, Command::Export) {
+            if chat_id < 0 {
+                self.reply(
+                    chat_id,
+                    "⛔ <b>Refused.</b> <code>/export</code> reveals a private key and \
+                     will not run in a group — every member would see it.\n\n\
+                     Message the bot directly (private chat) if you really want this."
+                        .to_string(),
+                )
+                .await;
+                return;
+            }
+            let (text, kb) = self.export_confirm_screen();
+            self.reply_with(chat_id, text, kb).await;
+            return;
+        }
+
+        #[cfg(feature = "sniper")]
+        if let Command::Withdraw(args) = &cmd {
+            let (text, kb) = self.withdraw_prompt_screen(args.as_deref());
+            self.reply_with(chat_id, text, kb).await;
+            return;
+        }
+
         let reply = self.execute(cmd).await;
         self.reply(chat_id, reply).await;
     }
@@ -330,10 +374,62 @@ impl Bot {
         let Some(msg) = cb.message.as_ref() else { return };
         info!(user_id = from, action = data, "telegram button");
 
+        // Confirmed key export. Handled here, not in `screen_for`, because it
+        // needs the message id to schedule the deletion. Private chat only —
+        // re-checked here so a stale button tapped inside a group cannot leak.
+        #[cfg(feature = "sniper")]
+        if data == "expgo" {
+            if msg.chat.id < 0 {
+                self.edit_message(
+                    msg.chat.id,
+                    msg.message_id,
+                    "⛔ Refused — not in a group.".to_string(),
+                    serde_json::json!({ "inline_keyboard": [] }),
+                )
+                .await;
+                return;
+            }
+            let (text, deletable) = self.render_export();
+            self.edit_message(
+                msg.chat.id,
+                msg.message_id,
+                text,
+                serde_json::json!({ "inline_keyboard": [] }),
+            )
+            .await;
+            if deletable {
+                // Best-effort scrub: removes it from the chat view. The secret
+                // has still reached Telegram's servers and any push
+                // notification, so an exported key must be treated as exposed.
+                let this = self.clone_for_delete();
+                let (chat, mid, ttl) = (msg.chat.id, msg.message_id, self.export_ttl_secs);
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(ttl)).await;
+                    this.delete_message(chat, mid).await;
+                });
+            }
+            return;
+        }
+
         let Some((text, keyboard)) = self.screen_for(data).await else {
             return;
         };
         self.edit_message(msg.chat.id, msg.message_id, text, keyboard).await;
+    }
+
+    /// Minimal clone carrying just what the delayed delete needs (an owned
+    /// client + token), so the spawned task does not borrow `self`.
+    #[cfg(feature = "sniper")]
+    fn clone_for_delete(&self) -> DeleteHandle {
+        DeleteHandle { client: self.client.clone(), bot_token: self.bot_token.clone() }
+    }
+
+    /// Delete a message (used to scrub an exported key from the chat).
+    #[cfg(feature = "sniper")]
+    async fn delete_message(&self, chat_id: i64, message_id: i64) {
+        DeleteHandle { client: self.client.clone(), bot_token: self.bot_token.clone() }
+            .delete_message(chat_id, message_id)
+            .await;
     }
 
     /// Resolve a callback payload into the next screen: `(text, keyboard)`.
@@ -361,6 +457,20 @@ impl Bot {
         // Settings: text + the Open/Guard strategy toggle.
         if data == "cmd:settings" {
             return Some(self.settings_screen());
+        }
+        // Confirmed withdrawal: `wdgo:<sol>:<address>`. The amount is a float
+        // (no colon) and the address is base58 (no colon), so one split works.
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("wdgo:") {
+            if let Some((sol_s, address)) = rest.split_once(':') {
+                if let Ok(sol) = sol_s.parse::<f64>() {
+                    let text = self.render_withdraw_exec(sol, address).await;
+                    let kb = serde_json::json!({ "inline_keyboard": [[
+                        {"text": "◀️ Menu", "callback_data": "nav:main"}
+                    ]]});
+                    return Some((text, kb));
+                }
+            }
         }
         // Flip the entry strategy: `mode:open` | `mode:guard`.
         #[cfg(feature = "sniper")]
@@ -439,6 +549,7 @@ impl Bot {
             Command::Halt => self.do_halt(),
             Command::Resume => self.do_resume(),
             Command::Balance => self.render_balance().await,
+            Command::Deposit => self.render_deposit(),
             Command::Positions => self.render_positions().await,
             Command::Settings => self.render_settings(),
             Command::NewWallet(name) => self.render_new_wallet(name.as_deref()),
@@ -447,6 +558,10 @@ impl Bot {
             Command::SetSize(arg) => self.render_set(Tunable::Size, arg.as_deref()),
             Command::SetSlippage(arg) => self.render_set(Tunable::Slippage, arg.as_deref()),
             Command::SetMinLiquidity(arg) => self.render_set(Tunable::MinLiquidity, arg.as_deref()),
+            Command::Withdraw(args) => self.render_withdraw_prompt(args.as_deref()),
+            // Reached only for the non-sniper build or a stray call; the real
+            // path is the DM-guarded confirm in `handle_message`.
+            Command::Export => "⚠️ Use <code>/export</code> in a PRIVATE chat with the bot.".to_string(),
             Command::Help => Self::render_help(),
         }
     }
@@ -573,6 +688,157 @@ impl Bot {
                 sol_line = sol_line,
                 token_line = token_line,
             )
+        }
+    }
+
+    /// Show the active wallet's RECEIVE address so funds can be sent in.
+    ///
+    /// Safe to expose: a public address only lets people send TO the wallet,
+    /// never take from it. This is the opposite of an export/withdraw — no key,
+    /// no signing, nothing leaves. The address is rendered on its own line so
+    /// it's one-tap copyable in Telegram.
+    fn render_deposit(&self) -> String {
+        #[cfg(not(feature = "sniper"))]
+        {
+            return "⚪ <b>No wallet</b>\nThis build has no execution support.".to_string();
+        }
+        #[cfg(feature = "sniper")]
+        {
+            let Some(sniper) = &self.sniper else {
+                return "⚪ <b>Sniper not configured</b>".to_string();
+            };
+            let Some((address, _role)) = sniper.trading_identity() else {
+                return "⚪ <b>No trading wallet</b>\nSet an active wallet first.".to_string();
+            };
+            format!(
+                "📥 <b>Deposit</b>\n\
+                 Send <b>SOL</b> (or SPL tokens) to the active trading wallet:\n\n\
+                 <code>{address}</code>\n\n\
+                 <i>Tap the address to copy. This is a receive-only address — \
+                 sharing it can never move funds out.</i>\n\
+                 <a href=\"https://solscan.io/account/{address}\">view on Solscan</a>",
+                address = escape_html(&address),
+            )
+        }
+    }
+
+    /// Withdrawal confirmation screen. Validates `<amount> <address>` and, if
+    /// good, shows a Confirm button carrying the parsed values. Moving funds
+    /// out always goes through this two-tap gate.
+    fn render_withdraw_prompt(&self, args: Option<&str>) -> String {
+        self.withdraw_prompt_screen(args).0
+    }
+
+    fn withdraw_prompt_screen(&self, args: Option<&str>) -> (String, serde_json::Value) {
+        let empty = serde_json::json!({ "inline_keyboard": [] });
+        #[cfg(not(feature = "sniper"))]
+        {
+            let _ = args;
+            return ("⚪ <b>Withdraw unavailable</b> (no sniper feature).".to_string(), empty);
+        }
+        #[cfg(feature = "sniper")]
+        match parse_withdraw_args(args) {
+            Err(msg) => (format!("⚠️ {}", escape_html(&msg)), empty),
+            Ok((sol, address)) => {
+                let text = format!(
+                    "🚨 <b>Confirm withdrawal</b>\n\n\
+                     Move <b>{sol} SOL</b> OUT of the trading wallet to:\n\
+                     <code>{addr}</code>\n\n\
+                     <i>This sends real funds to another address and cannot be undone. \
+                     Works only when the bot is ARMED; blocked while halted.</i>",
+                    addr = escape_html(&address),
+                );
+                let kb = serde_json::json!({ "inline_keyboard": [[
+                    {"text": format!("✅ Send {sol} SOL"), "callback_data": format!("wdgo:{sol}:{address}")},
+                    {"text": "◀️ Cancel", "callback_data": "nav:main"},
+                ]]});
+                (text, kb)
+            }
+        }
+    }
+
+    /// Confirmation before revealing a private key.
+    #[cfg(feature = "sniper")]
+    fn export_confirm_screen(&self) -> (String, serde_json::Value) {
+        let text = format!(
+            "🔑 <b>Export private key?</b>\n\n\
+             This reveals the <b>full private key</b> of the active wallet — \
+             anyone who sees it owns the wallet, permanently.\n\n\
+             ⚠️ <b>Understand before tapping:</b> the message is deleted after \
+             {ttl}s, but that only clears the chat <i>view</i>. The key will \
+             have already reached Telegram's servers, your phone's \
+             notification shade, and any other device signed in. Treat this \
+             wallet as <b>permanently exposed</b> once exported — move funds to \
+             a fresh wallet if it ever held anything you care about.",
+            ttl = self.export_ttl_secs,
+        );
+        let kb = serde_json::json!({ "inline_keyboard": [[
+            {"text": "🔑 Reveal key", "callback_data": "expgo"},
+            {"text": "◀️ Cancel", "callback_data": "nav:main"},
+        ]]});
+        (text, kb)
+    }
+
+    /// Render the private key. Returns `(text, should_delete)`.
+    ///
+    /// The key is formatted as `<code>` so Telegram gives a one-tap copy, and
+    /// is NEVER written to the log or the audit file.
+    #[cfg(feature = "sniper")]
+    fn render_export(&self) -> (String, bool) {
+        let Some(store) = &self.store else {
+            return ("⚪ <b>No wallet store configured</b>".to_string(), false);
+        };
+        let (Some(name), Some(path)) = (store.active(), store.active_path()) else {
+            return ("⚪ <b>No active wallet</b>\nSet one with /wallets first.".to_string(), false);
+        };
+        match crate::tx::export_secret_base58(&path.to_string_lossy()) {
+            // Deliberately no `info!`/audit call anywhere in this arm.
+            Ok(secret) => (
+                format!(
+                    "🔑 <b>{name}</b> — private key (base58, Phantom-importable)\n\n\
+                     <code>{secret}</code>\n\n\
+                     <i>Tap to copy. This message self-deletes in {ttl}s. \
+                     Consider this wallet exposed from now on.</i>",
+                    name = escape_html(&name),
+                    secret = escape_html(&secret),
+                    ttl = self.export_ttl_secs,
+                ),
+                true,
+            ),
+            Err(e) => (format!("❌ <b>Export failed</b>\n{}", escape_html(&format!("{e:#}"))), false),
+        }
+    }
+
+    /// Execute a confirmed withdrawal and render the outcome.
+    #[cfg(feature = "sniper")]
+    async fn render_withdraw_exec(&self, sol: f64, dest: &str) -> String {
+        use crate::sniper::{SubmitOutcome, WithdrawOutcome};
+        let Some(sniper) = &self.sniper else {
+            return "⚪ <b>Sniper not configured</b>".to_string();
+        };
+        match sniper.withdraw(dest, sol).await {
+            WithdrawOutcome::Refused { reason } => {
+                format!("⚠️ <b>Withdraw refused</b>\n{}", escape_html(&reason))
+            }
+            WithdrawOutcome::Submitted { sol, dest, result } => {
+                let line = match result {
+                    SubmitOutcome::Executed { reference, .. } => format!(
+                        "✅ <b>SENT</b> — <a href=\"https://solscan.io/tx/{r}\">{rs}</a>",
+                        r = escape_html(&reference),
+                        rs = escape_html(&short_mint(&reference)),
+                    ),
+                    SubmitOutcome::NotExecuted { reason } => {
+                        format!("⚪ <b>Not sent</b> (safe): {}", escape_html(&reason))
+                    }
+                    SubmitOutcome::Indeterminate { reference, reason } => format!(
+                        "⚠️ <b>UNKNOWN outcome</b> — may have sent, do NOT retry blindly.\n\
+                         ref <code>{}</code>\n{}",
+                        escape_html(&reference),
+                        escape_html(&reason)
+                    ),
+                };
+                format!("Withdraw <b>{sol} SOL</b> → <code>{}</code>\n{line}", escape_html(&dest))
+            }
         }
     }
 
@@ -1208,9 +1474,10 @@ impl Bot {
         serde_json::json!({
             "inline_keyboard": [
                 [{"text": "💰 Balance", "callback_data": "cmd:balance"},
-                 {"text": "📈 Positions", "callback_data": "cmd:positions"}],
-                [{"text": "👛 List wallets", "callback_data": "cmd:wallets"},
-                 {"text": "🆕 New wallet", "callback_data": "cmd:new-wallet"}],
+                 {"text": "📥 Deposit", "callback_data": "cmd:deposit"}],
+                [{"text": "📈 Positions", "callback_data": "cmd:positions"},
+                 {"text": "👛 List wallets", "callback_data": "cmd:wallets"}],
+                [{"text": "🆕 New wallet", "callback_data": "cmd:new-wallet"}],
                 [{"text": "◀️ Back", "callback_data": "nav:main"}],
             ]
         })
@@ -1281,6 +1548,8 @@ impl Bot {
                 {"command": "status", "description": "running state, uptime, detections"},
                 {"command": "settings", "description": "trade size, slippage, caps, mode"},
                 {"command": "balance", "description": "active wallet SOL + token accounts"},
+                {"command": "deposit", "description": "show the wallet address to send funds to"},
+                {"command": "withdraw", "description": "send SOL out: /withdraw 0.5 <address> (armed only)"},
                 {"command": "positions", "description": "token positions + PnL"},
                 {"command": "wallets", "description": "list wallets, mark active"},
                 {"command": "new_wallet", "description": "create a wallet to fund (optional name)"},
@@ -1316,6 +1585,52 @@ fn parse_sell(rest: &str) -> Option<(&str, u8)> {
     Some((mint, pct))
 }
 
+/// Owned handle for the delayed delete of an exported-key message. Separate
+/// from `Bot` so the spawned task owns everything it needs.
+#[cfg(feature = "sniper")]
+pub(crate) struct DeleteHandle {
+    client: reqwest::Client,
+    bot_token: String,
+}
+
+#[cfg(feature = "sniper")]
+impl DeleteHandle {
+    async fn delete_message(&self, chat_id: i64, message_id: i64) {
+        let url = format!("https://api.telegram.org/bot{}/deleteMessage", self.bot_token);
+        let body = serde_json::json!({"chat_id": chat_id, "message_id": message_id});
+        match self.client.post(&url).json(&body).send().await {
+            Ok(r) if r.status().is_success() => debug!("exported key message deleted"),
+            // A failed delete leaves the key visible. Warn loudly: the operator
+            // needs to remove it by hand.
+            Ok(r) => warn!(status = %r.status(), "COULD NOT DELETE key message — delete it manually"),
+            Err(e) => warn!(error = %e, "COULD NOT DELETE key message — delete it manually"),
+        }
+    }
+}
+
+/// Parse `<amount_SOL> <address>` from a `/withdraw`. Ok((sol, address)) or a
+/// user-facing error. Full address validation happens in the sniper; this is
+/// just enough to reject obvious junk before showing a confirm.
+#[cfg(feature = "sniper")]
+fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String), String> {
+    const USAGE: &str = "Usage: <code>/withdraw &lt;amount_SOL&gt; &lt;address&gt;</code>";
+    let args = args.unwrap_or("").trim();
+    let mut it = args.split_whitespace();
+    let amount = it.next().filter(|s| !s.is_empty()).ok_or(USAGE)?;
+    let address = it.next().ok_or(USAGE)?;
+    let sol: f64 = amount
+        .parse()
+        .map_err(|_| format!("'{amount}' is not a valid SOL amount"))?;
+    if !(sol.is_finite() && sol > 0.0) {
+        return Err("amount must be greater than 0".into());
+    }
+    // Base58 Solana addresses are 32–44 chars; reject obvious non-addresses.
+    if !(32..=44).contains(&address.len()) {
+        return Err("that doesn't look like a Solana address".into());
+    }
+    Ok((sol, address.to_string()))
+}
+
 /// `AAAA…ZZZZ` short form of a base58 string (mint or signature), for buttons.
 #[cfg(feature = "sniper")]
 fn short_mint(s: &str) -> String {
@@ -1334,7 +1649,7 @@ fn sold_keyboard() -> serde_json::Value {
 fn back_group(callback_data: &str) -> &'static str {
     match callback_data {
         // Wallet-group actions return to the wallet submenu.
-        "cmd:balance" | "cmd:positions" | "cmd:wallets" | "cmd:new-wallet" => "wallet",
+        "cmd:balance" | "cmd:deposit" | "cmd:positions" | "cmd:wallets" | "cmd:new-wallet" => "wallet",
         _ => "main",
     }
 }
@@ -1381,6 +1696,7 @@ enum Command {
     Halt,
     Resume,
     Balance,
+    Deposit,
     Positions,
     Settings,
     NewWallet(Option<String>),
@@ -1389,6 +1705,10 @@ enum Command {
     SetSize(Option<String>),
     SetSlippage(Option<String>),
     SetMinLiquidity(Option<String>),
+    /// Raw args after `/withdraw` ("<amount> <address>"), parsed in the handler.
+    Withdraw(Option<String>),
+    /// Reveal the active wallet's private key. Private chat only.
+    Export,
     Help,
 }
 
@@ -1403,12 +1723,15 @@ impl Command {
         let first = it.next()?;
         let cmd = first.strip_prefix('/')?.split('@').next()?.to_ascii_lowercase();
         let arg = it.next().map(str::to_string);
+        // Everything after the command word, for multi-arg commands (withdraw).
+        let rest = text.split_once(char::is_whitespace).map(|(_, r)| r.trim().to_string());
         Some(match cmd.as_str() {
             "status" => Command::Status,
             "metrics" | "stats" => Command::Metrics,
             "halt" | "stop" | "kill" => Command::Halt,
             "resume" | "unhalt" => Command::Resume,
             "balance" => Command::Balance,
+            "deposit" | "receive" | "fund" => Command::Deposit,
             "positions" | "pnl" | "pos" => Command::Positions,
             "settings" | "config" | "params" => Command::Settings,
             "new-wallet" | "newwallet" | "new_wallet" | "genwallet" => Command::NewWallet(arg),
@@ -1419,6 +1742,8 @@ impl Command {
             "min-liquidity" | "min_liquidity" | "minliq" | "minliquidity" => {
                 Command::SetMinLiquidity(arg)
             }
+            "withdraw" | "send" => Command::Withdraw(rest),
+            "export" | "exportkey" | "privatekey" | "key" => Command::Export,
             "help" | "start" => Command::Help,
             _ => return None,
         })
@@ -1431,6 +1756,7 @@ impl Command {
             Command::Halt => "halt",
             Command::Resume => "resume",
             Command::Balance => "balance",
+            Command::Deposit => "deposit",
             Command::Positions => "positions",
             Command::Settings => "settings",
             Command::NewWallet(_) => "new-wallet",
@@ -1439,6 +1765,8 @@ impl Command {
             Command::SetSize(_) => "size",
             Command::SetSlippage(_) => "slippage",
             Command::SetMinLiquidity(_) => "min-liquidity",
+            Command::Withdraw(_) => "withdraw",
+            Command::Export => "export",
             Command::Help => "help",
         }
     }
@@ -1453,6 +1781,7 @@ impl Command {
             "halt" => Some(Command::Halt),
             "resume" => Some(Command::Resume),
             "balance" => Some(Command::Balance),
+            "deposit" => Some(Command::Deposit),
             "positions" => Some(Command::Positions),
             "settings" => Some(Command::Settings),
             "wallets" => Some(Command::Wallets),
@@ -1693,9 +2022,19 @@ mod tests {
     /// arm a dry-run bot, and there is no withdraw/send/trade primitive at all.
     #[test]
     fn no_arming_or_fund_moving_commands() {
-        for c in ["/arm", "/trade", "/buy", "/sell", "/withdraw", "/send", "/transfer", "/export"] {
+        // Arming and key export are NEVER commands — arming is host-only, and a
+        // key must never travel over Telegram. Withdraw/send DO exist now (an
+        // explicit owner choice), but are gated: armed-only + HALT + two-tap
+        // confirm; see the withdraw tests.
+        // Arming is NEVER a command — going live stays a host-side config
+        // change, so a leaked bot token cannot arm a dry-run bot.
+        for c in ["/arm", "/trade", "/buy", "/sell", "/transfer", "/sweep"] {
             assert_eq!(Command::parse(c), None, "{c} must not be a command");
         }
+        // Withdraw and export DO exist (explicit owner choices). Their safety
+        // is enforced by gates, not by absence: withdraw is armed-only +
+        // HALT-gated + two-tap; export is private-chat-only + two-tap.
+        assert_eq!(Command::parse("/export"), Some(Command::Export));
     }
 
     /// `/resume` and `/halt` are the two sides of the kill-switch toggle. Resume
@@ -1722,6 +2061,31 @@ mod tests {
         );
         // Missing argument still parses; the handler replies with usage.
         assert_eq!(Command::parse("/size"), Some(Command::SetSize(None)));
+    }
+
+    #[test]
+    fn withdraw_captures_all_args_and_validates() {
+        // The whole remainder after the command word is captured (amount + addr).
+        assert_eq!(
+            Command::parse("/withdraw 0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX"),
+            Some(Command::Withdraw(Some(
+                "0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into()
+            )))
+        );
+
+        // Valid parse.
+        let ok = parse_withdraw_args(Some("0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX"));
+        assert_eq!(ok, Ok((0.5, "DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into())));
+
+        // Rejections: no address, bad amount, zero/negative, junk address.
+        assert!(parse_withdraw_args(Some("0.5")).is_err(), "missing address");
+        assert!(parse_withdraw_args(Some("abc SomeAddr...")).is_err(), "bad amount");
+        assert!(
+            parse_withdraw_args(Some("0 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX")).is_err(),
+            "zero refused"
+        );
+        assert!(parse_withdraw_args(Some("0.5 short")).is_err(), "junk address");
+        assert!(parse_withdraw_args(None).is_err(), "no args");
     }
 
     #[test]
@@ -2066,7 +2430,10 @@ mod tests {
 
     #[test]
     fn balance_did_not_open_a_funds_moving_command() {
-        for c in ["/withdraw", "/send", "/transfer", "/sweep", "/export", "/seed"] {
+        // Balance is read-only. Withdraw/send now exist as an explicit owner
+        // choice (armed-only + HALT + two-tap confirm), but these never do:
+        // sweep-all, key export, or seed export.
+        for c in ["/transfer", "/sweep", "/seed"] {
             assert_eq!(Command::parse(c), None, "{c} must not be a command");
         }
     }

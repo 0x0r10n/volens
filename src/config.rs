@@ -247,6 +247,21 @@ pub struct SniperConfig {
     /// Switchable at runtime from Telegram.
     #[serde(default = "default_snipe_mode")]
     pub mode: String,
+    /// Seconds a `/export` key message stays in the chat before the bot deletes
+    /// it. Best-effort ONLY: deletion removes the message from view, but the
+    /// secret already reached Telegram's servers, push notifications and any
+    /// synced client. Treat an exported key as permanently exposed.
+    #[serde(default = "default_export_ttl")]
+    pub export_ttl_secs: u64,
+    /// Refuse to buy a token whose fully-diluted market cap (price x total
+    /// supply, in USD) is at or above this. 0 disables the check.
+    ///
+    /// A brand-new launch should be worth very little. A "new pool" that
+    /// already carries a large valuation is usually a migration of something
+    /// that has ALREADY run — buying it is buying the top, which is exactly how
+    /// a late entry turns into holding the bag when it dumps.
+    #[serde(default = "default_max_mcap")]
+    pub max_market_cap_usd: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -383,6 +398,8 @@ fn default_snipe_min_liq() -> f64 { 10.0 }
 fn default_slippage_bps() -> u16 { 300 }
 fn default_sell_slippage_bps() -> u16 { 500 }
 fn default_snipe_mode() -> String { "open".to_string() }
+fn default_export_ttl() -> u64 { 60 }
+fn default_max_mcap() -> f64 { 50_000.0 }
 fn default_recheck_interval() -> u64 { 120 }
 fn default_max_watch() -> u64 { 600 }
 fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
@@ -483,6 +500,8 @@ impl Default for SniperConfig {
             jupiter_base_url: default_jupiter_url(),
             sell_slippage_bps: default_sell_slippage_bps(),
             mode: default_snipe_mode(),
+            export_ttl_secs: default_export_ttl(),
+            max_market_cap_usd: default_max_mcap(),
             wallet_dir: default_wallet_dir(),
             alert_on_all_rehearsals: false,
         }

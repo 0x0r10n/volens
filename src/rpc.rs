@@ -410,6 +410,17 @@ impl RpcClient {
         base64::engine::general_purpose::STANDARD.decode(d).ok()
     }
 
+    /// Token `(name, symbol)` from the Metaplex metadata account, if it exists.
+    /// Enrichment only — a token with no metadata (or an unreadable one) simply
+    /// returns None and the caller falls back to the mint address. Costs one
+    /// getAccountInfo per call.
+    #[cfg(feature = "sniper")]
+    pub async fn token_metadata(&self, mint: &str) -> Option<(String, String)> {
+        let pda = metaplex_metadata_pda(mint)?;
+        let data = self.account_data(&pda).await?;
+        parse_metadata_name_symbol(&data)
+    }
+
     /// Authority/extension state of a mint. `None` if unreadable.
     pub async fn mint_info(&self, mint: &str) -> Option<MintInfo> {
         self.with_retries("getAccountInfo", mint, true, parse_mint_info)
@@ -497,6 +508,51 @@ fn parse_balance(resp: &serde_json::Value) -> Option<f64> {
 
 /// Extract mint authorities + risky extensions from a jsonParsed
 /// `getAccountInfo` response. Works for both spl-token and spl-token-2022.
+/// Derive the Metaplex Token Metadata PDA (base58) for a mint.
+/// Seeds: ["metadata", metadata_program, mint].
+#[cfg(feature = "sniper")]
+fn metaplex_metadata_pda(mint: &str) -> Option<String> {
+    use solana_pubkey::Pubkey;
+    use std::str::FromStr;
+    // Metaplex Token Metadata program.
+    let program = Pubkey::from_str("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s").ok()?;
+    let mint_pk = Pubkey::from_str(mint).ok()?;
+    let (pda, _) = Pubkey::find_program_address(
+        &[b"metadata", program.as_ref(), mint_pk.as_ref()],
+        &program,
+    );
+    Some(pda.to_string())
+}
+
+/// Parse `(name, symbol)` from a Metaplex Metadata account.
+/// Layout: key(1) + update_authority(32) + mint(32) then borsh strings
+/// name, symbol, uri. Names are null-padded to a fixed max, so trim.
+#[cfg(feature = "sniper")]
+fn parse_metadata_name_symbol(data: &[u8]) -> Option<(String, String)> {
+    fn read_string(data: &[u8], o: &mut usize) -> Option<String> {
+        let end = o.checked_add(4)?;
+        if end > data.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[*o..end].try_into().ok()?) as usize;
+        *o = end;
+        // Sanity bound: Metaplex caps name/symbol/uri well under this.
+        if len > 256 || o.checked_add(len)? > data.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&data[*o..*o + len]).into_owned();
+        *o += len;
+        Some(s.trim_end_matches('\0').trim().to_string())
+    }
+    let mut o = 1 + 32 + 32; // key + update_authority + mint
+    let name = read_string(data, &mut o)?;
+    let symbol = read_string(data, &mut o)?;
+    if name.is_empty() && symbol.is_empty() {
+        return None;
+    }
+    Some((name, symbol))
+}
+
 fn parse_mint_info(resp: &serde_json::Value) -> Option<MintInfo> {
     let parsed = resp.get("result")?.get("value")?.get("data")?.get("parsed")?;
     if parsed.get("type")?.as_str()? != "mint" {
@@ -825,5 +881,38 @@ mod tests {
 
         // A non-mint account must be None, not a bogus MintInfo.
         assert_eq!(client.mint_info("11111111111111111111111111111111").await, None);
+    }
+
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn parses_metaplex_name_and_symbol() {
+        fn borsh_str(s: &str, pad: usize) -> Vec<u8> {
+            // Metaplex stores fixed-max, null-padded strings; length counts pad.
+            let mut buf = s.as_bytes().to_vec();
+            buf.resize(pad, 0);
+            let mut out = (pad as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(&buf);
+            out
+        }
+        let mut data = vec![4u8]; // key
+        data.extend_from_slice(&[0u8; 32]); // update_authority
+        data.extend_from_slice(&[0u8; 32]); // mint
+        data.extend(borsh_str("Doge Killer", 32));
+        data.extend(borsh_str("DOGEK", 10));
+        let (name, symbol) = parse_metadata_name_symbol(&data).expect("parses");
+        assert_eq!(name, "Doge Killer", "trailing null padding trimmed");
+        assert_eq!(symbol, "DOGEK");
+    }
+
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn metadata_parse_rejects_truncated_and_empty() {
+        // Too short to hold the header.
+        assert_eq!(parse_metadata_name_symbol(&[0u8; 10]), None);
+        // A length that runs past the buffer must not panic or read OOB.
+        let mut data = vec![4u8];
+        data.extend_from_slice(&[0u8; 64]);
+        data.extend_from_slice(&9999u32.to_le_bytes()); // absurd name length
+        assert_eq!(parse_metadata_name_symbol(&data), None);
     }
 }

@@ -54,9 +54,9 @@ pub fn cost_basis_from_audit(audit_jsonl: &str) -> HashMap<String, CostBasis> {
             continue;
         };
 
-        // Skip exit records (`action:"sell"`): a sell's `confirmed:` outcome
-        // must never be counted as buy spend, or cost basis would double up.
-        if rec.get("action").and_then(|a| a.as_str()) == Some("sell") {
+        // Skip any tagged action (sell / withdraw): only buys have no `action`
+        // field, and a sell/withdraw `confirmed:` must never count as buy spend.
+        if rec.get("action").is_some() {
             continue;
         }
         if rec.get("mode").and_then(|m| m.as_str()) != Some("armed") {
