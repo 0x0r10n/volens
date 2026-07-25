@@ -938,13 +938,9 @@ impl Bot {
             // Deliberately no `info!`/audit call anywhere in this arm.
             Ok(secret) => (
                 format!(
-                    "🔑 <b>{name}</b> — private key (base58, Phantom-importable)\n\n\
-                     <code>{secret}</code>\n\n\
-                     <i>Tap to copy. This message self-deletes in {ttl}s. \
-                     Consider this wallet exposed from now on.</i>",
+                    "🔑 <b>{name}</b>\n\n<code>{secret}</code>",
                     name = escape_html(&name),
                     secret = escape_html(&secret),
-                    ttl = self.export_ttl_secs,
                 ),
                 true,
             ),
