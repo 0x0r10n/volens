@@ -1051,10 +1051,9 @@ impl Bot {
             let mut priced_any = false;
 
             for (mint, amount) in &holdings {
-                let short = short_mint(mint);
-                // Name the token so a position is recognizable at a glance; the
-                // shortened mint stays as the identifier (names are not unique
-                // and are trivially spoofed, so the mint remains the truth).
+                // Name the token so a position is recognizable at a glance, but
+                // keep the mint as the identifier — names are not unique and are
+                // trivially spoofed, so the mint stays the truth.
                 let named = rpc
                     .token_metadata(mint)
                     .await
@@ -1065,10 +1064,14 @@ impl Bot {
                         _ => String::new(),
                     })
                     .filter(|l| !l.is_empty());
-                let short = match &named {
-                    Some(label) => format!("{} · {}", escape_html(label), short),
-                    None => short,
+                let title = match &named {
+                    Some(label) => escape_html(label),
+                    None => short_mint(mint),
                 };
+                // The FULL mint in its own <code> block: Telegram copies the
+                // block's contents on tap, so a shortened form here would copy
+                // an unusable string. Own line, so the header stays readable.
+                let mint_line = format!("<code>{}</code>", escape_html(mint));
                 match basis.get(mint) {
                     Some(cb) => {
                         // Try to mark it: read both vaults now, mid-price it.
@@ -1081,9 +1084,11 @@ impl Bot {
                                 total_value += p.value;
                                 let sign = if p.abs >= 0.0 { "🟢 +" } else { "🔴 " };
                                 out.push_str(&format!(
-                                    "\n<b>{short}</b> — {amt:.2} tokens\n\
+                                    "\n<b>{title}</b> — {amt:.2} tokens\n\
+                                     {mint_line}\n\
                                      cost {cost:.4} → est {val:.4} SOL  ({sign}{abs:.4}, {pct:+.1}%)\n",
-                                    short = short,
+                                    title = title,
+                                    mint_line = mint_line,
                                     amt = amount,
                                     cost = p.cost,
                                     val = p.value,
@@ -1093,17 +1098,21 @@ impl Bot {
                                 ));
                             }
                             None => out.push_str(&format!(
-                                "\n<b>{short}</b> — {amt:.2} tokens\n\
+                                "\n<b>{title}</b> — {amt:.2} tokens\n\
+                                 {mint_line}\n\
                                  cost {cost:.4} SOL · <i>price unavailable</i>\n",
-                                short = short,
+                                title = title,
+                                mint_line = mint_line,
                                 amt = amount,
                                 cost = cb.sol_spent,
                             )),
                         }
                     }
                     None => out.push_str(&format!(
-                        "\n<b>{short}</b> — {amt:.2} tokens · <i>untracked (not bought by this bot)</i>\n",
-                        short = short,
+                        "\n<b>{title}</b> — {amt:.2} tokens · <i>untracked</i>\n\
+                         {mint_line}\n",
+                        title = title,
+                        mint_line = mint_line,
                         amt = amount,
                     )),
                 }
