@@ -291,7 +291,12 @@ track_for_secs = 86400
 # messages climbing the ladder.
 # 1.5 = +50%. Steps stay tight early, where a call is still actionable, and
 # widen later, where the difference between 47x and 50x is not news. Each rung
-# fires AT MOST ONCE, so the whole life of a token is bounded at 13 updates.
+# fires AT MOST ONCE.
+#
+# This list is a FLOOR, not a ceiling: above the last entry the sequence
+# continues automatically on a 1-2.5-5 progression per decade (250, 500, 1000,
+# 2500, ...). A fixed list would go silent on exactly the tokens worth talking
+# about — a 500x would stop reporting after 100x.
 update_multiples = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0]
 # Jupiter swap API root, used only for valuation quotes here.
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"

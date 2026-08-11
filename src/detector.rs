@@ -229,6 +229,7 @@ impl Detector {
             crate::signals::spawn_tracker(
                 self.signals.clone(),
                 self.alerter.clone(),
+                self.rpc.clone(),
                 self.cfg.tracked.clone(),
                 shutdown.clone(),
             );
@@ -713,6 +714,7 @@ impl Detector {
                     message_id,
                     reference_sol: reference.sol_spent,
                     reference_tokens_raw: reference.token_amount_raw,
+                    decimals: reference.decimals,
                     fdv_usd_at_signal: fdv_usd,
                     supply,
                     wallets: signal.buyer_addresses.clone(),
@@ -1216,10 +1218,7 @@ async fn market_at_signal(
     supply: Option<f64>,
     jupiter_url: &str,
 ) -> Option<crate::conviction::MarketSnapshot> {
-    let sol_usd = crate::jupiter::Jupiter::new(jupiter_url).sol_price_usd().await.ok()?;
-    if !(sol_usd.is_finite() && sol_usd > 0.0) {
-        return None;
-    }
+    let sol_usd = crate::jupiter::cached_sol_price_usd(jupiter_url).await?;
 
     let price_usd = (reference.token_amount > 0.0)
         .then(|| reference.sol_spent / reference.token_amount * sol_usd)

@@ -162,6 +162,42 @@ impl Jupiter {
 }
 
 #[cfg(test)]
+mod cache_tests {
+    use super::*;
+
+    /// The hardening that matters: once a price is cached, a dead endpoint
+    /// must not blank it. The previous behaviour returned `None` on any error,
+    /// which disabled the market-cap ceiling — a guard failing OPEN.
+    ///
+    ///   cargo test -- --ignored --nocapture live_sol_price_serves_stale
+    #[ignore = "hits the Jupiter API"]
+    #[tokio::test]
+    async fn live_sol_price_serves_stale_when_refresh_fails() {
+        // Warm the shared cache from the real endpoint.
+        let good = cached_sol_price_usd("https://lite-api.jup.ag/swap/v1")
+            .await
+            .expect("a live SOL price");
+        println!("live SOL price: ${good:.2}");
+        assert!((10.0..2000.0).contains(&good), "implausible price: {good}");
+
+        // Now ask through an endpoint that cannot answer. Inside the TTL the
+        // cached value is returned without any request at all.
+        let via_dead = cached_sol_price_usd("https://127.0.0.1:1/swap/v1").await;
+        assert_eq!(via_dead, Some(good), "a dead endpoint must not blank a warm cache");
+    }
+
+    /// A cold cache with a dead endpoint has nothing to serve, and must say so
+    /// rather than invent a number.
+    #[tokio::test]
+    async fn a_failed_refresh_never_fabricates_a_price() {
+        let v = cached_sol_price_usd("https://127.0.0.1:1/swap/v1").await;
+        // Either None (cold) or a real cached price (warmed by another test in
+        // this process) — never zero or negative.
+        assert!(v.is_none_or(|p| p > 0.0), "got {v:?}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -201,5 +237,55 @@ mod tests {
         assert_eq!(q.out_lamports(), None);
         assert_eq!(q.out_sol(), None);
         assert_eq!(q.price_impact_pct(), 0.0, "absent impact defaults to 0");
+    }
+}
+
+/// Process-wide SOL/USD, cached for five minutes, serving stale on failure.
+///
+/// # Why this is shared rather than per-caller
+///
+/// Two callers need it — the sniper's market-cap ceiling and the conviction
+/// alert's USD figures. Each previously had its own answer: the sniper cached
+/// but returned `None` on any error, and the conviction path re-quoted from
+/// scratch on every alert with no cache at all. That meant a single transient
+/// Jupiter failure blanked an entire alert's USD side, and a healthy process
+/// still made two independent round trips.
+///
+/// # Stale beats absent
+///
+/// SOL does not move enough in five minutes to change a market-cap ceiling or
+/// a displayed figure, but the difference between "$41.2K" and no line at all
+/// is total. On a failed refresh the last good price is served and the failure
+/// is logged; only a cold cache with a failing endpoint yields `None`.
+pub async fn cached_sol_price_usd(base_url: &str) -> Option<f64> {
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+
+    const TTL: Duration = Duration::from_secs(300);
+    static CACHE: OnceLock<Mutex<Option<(f64, Instant)>>> = OnceLock::new();
+    let cell = CACHE.get_or_init(|| Mutex::new(None));
+
+    // A poisoned lock would mean another task panicked mid-update; the cached
+    // price is still valid data, so recover rather than propagate.
+    let cached = cell.lock().unwrap_or_else(|p| p.into_inner()).to_owned();
+    if let Some((price, at)) = cached {
+        if at.elapsed() < TTL {
+            return Some(price);
+        }
+    }
+
+    match Jupiter::new(base_url).sol_price_usd().await {
+        Ok(p) if p.is_finite() && p > 0.0 => {
+            *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, Instant::now()));
+            Some(p)
+        }
+        Ok(bad) => {
+            tracing::warn!(price = bad, "nonsensical SOL price; keeping previous");
+            cached.map(|(p, _)| p)
+        }
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "SOL price refresh failed; serving cached");
+            cached.map(|(p, _)| p)
+        }
     }
 }

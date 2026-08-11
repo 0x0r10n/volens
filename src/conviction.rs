@@ -262,12 +262,12 @@ impl MarketSnapshot {
 
 /// Render a conviction signal as a Telegram HTML message.
 ///
-/// # Buyers are listed
+/// # Buyers are counted, not named
 ///
-/// Name and size per wallet, in SOL. Names are third-party labels of real
-/// traders, so they pass through `wallets::sanitize_name` at load time before
-/// they can reach a chat. Sizes stay in SOL because that is the unit the trade
-/// was placed in — a wallet chose to spend 25 SOL, not $1,900.
+/// No wallet names, no per-wallet sizes. The names are third-party labels of
+/// real traders, and publishing who bought what is a different act from
+/// publishing that smart money bought — the aggregate carries the signal
+/// without exposing anyone's book. `SM` is the count alone.
 ///
 /// # The mint is shown in FULL, not shortened
 ///
@@ -312,11 +312,6 @@ pub fn render_signal(
     s.push_str("🧠 <b>SMART MONEY DETECTED</b>\n");
     s.push_str(&format!("<b>{title}</b>\n"));
     s.push_str(&format!("<code>{}</code>\n\n", signal.mint));
-
-    for (name, sol) in &signal.buyers {
-        s.push_str(&format!("• {name} — {sol:.2} SOL\n"));
-    }
-    s.push('\n');
 
     s.push_str(&format!("SM: {}\n", signal.distinct_buyers));
     if let Some(mc) = market.and_then(|m| m.fdv_usd) {
@@ -759,19 +754,20 @@ mod render_tests {
         assert!(!out.to_lowercase().contains("tap to copy"));
     }
 
-    /// Buyers and their sizes are part of the call: who bought is the signal,
-    /// not just how many.
+    /// Individual traders and their sizes must not be published: the count
+    /// carries the signal without exposing anyone's book.
     #[test]
-    fn buyers_are_listed_with_sol_sizes() {
+    fn no_wallet_names_or_individual_sizes_are_published() {
         let meta = ("Credible".to_string(), "CRED".to_string());
         let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
 
         for name in ["Silver", "Ratwiz", "OGANT"] {
-            assert!(out.contains(name), "{name} missing from the alert:\n{out}");
+            assert!(!out.contains(name), "{name} leaked into the alert:\n{out}");
         }
-        // Sizes stay in SOL — the unit the trade was placed in.
-        assert!(out.contains("• OGANT — 25.29 SOL"), "got:\n{out}");
-        assert!(out.contains("• Ratwiz — 0.12 SOL"), "got:\n{out}");
+        assert!(!out.contains("25.29"), "individual size leaked:\n{out}");
+        // The aggregate survives.
+        assert!(out.contains("SM: 3"));
+        assert!(out.contains("SM Vol:"));
     }
 
     /// Times are local trading time, not UTC.

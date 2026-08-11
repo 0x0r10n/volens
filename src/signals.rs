@@ -55,6 +55,10 @@ pub struct SignalRecord {
     /// Reference trade — the basis for every later multiple.
     pub reference_sol: f64,
     pub reference_tokens_raw: u64,
+    /// Decimals of the token, so `reference_tokens_raw` can be converted to UI
+    /// units when re-pricing. Without it a live market cap cannot be computed.
+    #[serde(default)]
+    pub decimals: u32,
     /// FDV in USD at announce time, when it could be computed.
     #[serde(default)]
     pub fdv_usd_at_signal: Option<f64>,
@@ -196,7 +200,13 @@ impl SignalStore {
     /// Every tracked signal, best performer first. For `/calls`.
     pub fn ranked(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
         let mut out = self.active(now, max_age_secs);
-        out.sort_by(|a, b| b.last_multiple.total_cmp(&a.last_multiple));
+        // Highest multiple first. Ties break on recency rather than HashMap
+        // order, so the list is stable between calls instead of reshuffling.
+        out.sort_by(|a, b| {
+            b.last_multiple
+                .total_cmp(&a.last_multiple)
+                .then(b.first_seen_utc.cmp(&a.first_seen_utc))
+        });
         out
     }
 
@@ -208,6 +218,58 @@ impl SignalStore {
         let snapshot = rec.clone();
         drop(map);
         self.append(&snapshot);
+    }
+
+    /// Rewrite the file from current in-memory state.
+    ///
+    /// `mark_checked` fires for every signal on every sweep and is deliberately
+    /// not persisted per call. Without a periodic flush, though, a restart
+    /// reloads every record at `last_multiple = 1.0` with no check time — which
+    /// is exactly the "everything shows x1.0, nothing re-priced" symptom.
+    ///
+    /// Rewriting also COMPACTS: the append-only log accumulates one line per
+    /// update per signal, and only the last line for each mint is ever read.
+    pub fn persist_all(&self) {
+        if let Err(e) = self.persist_all_inner() {
+            tracing::warn!(error = %e, path = %self.path, "failed to persist signals");
+        }
+    }
+
+    fn persist_all_inner(&self) -> anyhow::Result<()> {
+        use std::io::Write;
+        let snapshot: Vec<SignalRecord> = self.lock().values().cloned().collect();
+        if let Some(parent) = std::path::Path::new(&self.path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).ok();
+            }
+        }
+        // Write-then-rename: a crash mid-write must not truncate the only
+        // record of every call's entry price.
+        let tmp = format!("{}.tmp", self.path);
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            for rec in &snapshot {
+                writeln!(f, "{}", serde_json::to_string(rec)?)?;
+            }
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Fill in decimals resolved after the fact.
+    pub fn set_decimals(&self, mint: &str, decimals: u32) {
+        if let Some(rec) = self.lock().get_mut(mint) {
+            rec.decimals = decimals;
+        }
+    }
+
+    /// Fill in a name/symbol resolved after the fact.
+    pub fn set_identity(&self, mint: &str, name: &str, symbol: &str) {
+        if let Some(rec) = self.lock().get_mut(mint) {
+            rec.name = name.to_string();
+            rec.symbol = symbol.to_string();
+        }
     }
 
     /// Drop signals older than `max_age_secs` from memory. The JSONL keeps the
@@ -253,15 +315,89 @@ impl SignalStore {
 /// Returns the HIGHEST cleared rung, not the next one: a token that goes
 /// straight from 1x to 12x should announce "12x", not crawl up posting 2x, 3x,
 /// 5x and 10x in sequence.
+///
+/// # The ladder does not end
+///
+/// Above the last configured rung the sequence CONTINUES, generated on a
+/// 1–2.5–5 progression per decade (…100, 250, 500, 1000, 2500…). A fixed list
+/// would mean the best outcome the bot can produce is also the one it stops
+/// reporting: a token that ran 500x would go silent after 100x, exactly when
+/// the updates are worth the most.
 pub fn next_rung(multiple: f64, already_reported: f64, ladder: &[f64]) -> Option<f64> {
     if !multiple.is_finite() || multiple <= 0.0 {
         return None;
     }
-    ladder
-        .iter()
-        .copied()
-        .filter(|r| multiple >= *r && *r > already_reported)
-        .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a: f64| a.max(r))))
+    let cleared = |acc: Option<f64>, r: f64| -> Option<f64> {
+        (multiple >= r && r > already_reported)
+            .then(|| acc.map_or(r, |a: f64| a.max(r)))
+            .or(acc)
+    };
+
+    let mut best = ladder.iter().copied().fold(None, cleared);
+    for r in rungs_above(ladder.iter().copied().fold(0.0, f64::max)) {
+        if r > multiple {
+            break;
+        }
+        best = cleared(best, r);
+    }
+    best
+}
+
+/// Rungs beyond the configured ladder, on a 1–2.5–5 progression per decade.
+///
+/// Bounded at 1e9: past that the "multiple" is far more likely a broken quote
+/// than a real position, and an unbounded generator would spin.
+fn rungs_above(top: f64) -> impl Iterator<Item = f64> {
+    const STEPS: [f64; 3] = [1.0, 2.5, 5.0];
+    let start = if top.is_finite() && top > 0.0 { top } else { 100.0 };
+    let mut decade = 10f64.powf(start.log10().floor());
+    let mut i = 0usize;
+    std::iter::from_fn(move || {
+        loop {
+            if decade > 1e9 {
+                return None;
+            }
+            let r = decade * STEPS[i % 3];
+            i += 1;
+            if i % 3 == 0 {
+                decade *= 10.0;
+            }
+            if r > start {
+                return Some(r);
+            }
+        }
+    })
+}
+
+/// Fully-diluted valuation right now, measured rather than extrapolated.
+///
+/// `sol_now` is what the reference token quantity fetches today, so the price
+/// per token follows directly; supply is re-read because it can change.
+async fn live_fdv_usd(
+    rpc: &crate::rpc::RpcClient,
+    rec: &SignalRecord,
+    sol_now: f64,
+    cfg: &crate::config::TrackedConfig,
+) -> Option<f64> {
+    // `decimals == 0` means UNKNOWN here, not "a zero-decimal token": records
+    // written before the field existed default to 0, and treating that as real
+    // makes `tokens_ui` enormous and the computed price ~0. Genuine 0-decimal
+    // tokens are rare and simply fall back to the scaled estimate, which is
+    // the safe direction to be wrong in.
+    if rec.decimals == 0 || rec.reference_tokens_raw == 0 {
+        return None;
+    }
+    let supply = rpc.token_supply(&rec.mint).await?;
+    if supply <= 0.0 {
+        return None;
+    }
+    let tokens_ui = rec.reference_tokens_raw as f64 / 10f64.powi(rec.decimals as i32);
+    if tokens_ui <= 0.0 {
+        return None;
+    }
+    let sol_usd = crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await?;
+    let fdv = (sol_now / tokens_ui) * supply * sol_usd;
+    fdv.is_finite().then_some(fdv)
 }
 
 /// Render a performance update. Threaded as a reply to the original call.
@@ -343,12 +479,20 @@ fn format_elapsed(secs: i64) -> String {
     }
 }
 
-/// `2.4x`, `12x` — drop the decimal once it stops carrying information.
+/// `x2.4`, `x12.6`, `x900` — TRUNCATED, never rounded up.
+///
+/// Rounding overstates: 12.6 displayed as `x13`, and worse, 99.7 as `x100` —
+/// claiming a milestone the token has not reached. A performance figure that
+/// flatters itself is not one you can act on, so the displayed value is always
+/// at or below the measured one.
 fn format_multiple(m: f64) -> String {
-    if m >= 10.0 {
-        format!("x{m:.0}")
+    if !m.is_finite() || m <= 0.0 {
+        return "x0".to_string();
+    }
+    if m >= 100.0 {
+        format!("x{}", m.trunc())
     } else {
-        format!("x{m:.1}")
+        format!("x{:.1}", (m * 10.0).trunc() / 10.0)
     }
 }
 
@@ -386,6 +530,7 @@ pub async fn quote_sol_value(
 pub fn spawn_tracker(
     store: std::sync::Arc<SignalStore>,
     alerter: std::sync::Arc<crate::alerts::Alerter>,
+    rpc: std::sync::Arc<crate::rpc::RpcClient>,
     cfg: crate::config::TrackedConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
@@ -405,17 +550,49 @@ pub fn spawn_tracker(
 
             let now = Utc::now();
             let retired = store.retire(now, max_age);
-            if retired > 0 {
-                tracing::debug!(retired, "retired signals past tracking window");
-            }
+            let batch = store.active(now, max_age);
+            // Counted and reported per sweep. Without this the tracker is
+            // invisible: a healthy sweep that crosses no rung logs nothing, so
+            // "no updates" and "not running" look identical from the outside.
+            let started = std::time::Instant::now();
+            let mut priced = 0usize;
+            let mut routeless = 0usize;
+            let mut best = 0.0f64;
+            tracing::info!(tracking = batch.len(), retired, "re-pricing signals");
 
-            for rec in store.active(now, max_age) {
+            let mut named = 0usize;
+            for rec in batch {
                 if *shutdown.borrow() {
                     return;
                 }
 
+                // Backfill an identity that was unresolvable at call time.
+                // Metadata can appear a few seconds AFTER the mint (and older
+                // records predate the Token-2022 lookup entirely), so a call
+                // announced as a bare mint gets its ticker on the next sweep
+                // instead of staying anonymous forever.
+                if rec.symbol.is_empty() && rec.name.is_empty() {
+                    if let Some(m) = rpc.token_meta(&rec.mint).await {
+                        if !m.name.is_empty() || !m.symbol.is_empty() {
+                            store.set_identity(&rec.mint, &m.name, &m.symbol);
+                            named += 1;
+                        }
+                    }
+                }
+                // Same backfill for decimals, which older records predate.
+                // Without it the live market cap stays unavailable for them
+                // forever and they silently keep using the scaled estimate.
+                if rec.decimals == 0 {
+                    if let Some(info) = rpc.mint_info(&rec.mint).await {
+                        if info.decimals > 0 {
+                            store.set_decimals(&rec.mint, info.decimals as u32);
+                        }
+                    }
+                }
+
                 let Some(sol_now) = quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await
                 else {
+                    routeless += 1;
                     tracing::debug!(mint = %rec.mint, "no route; skipping update");
                     continue;
                 };
@@ -424,6 +601,8 @@ pub fn spawn_tracker(
                 }
 
                 let multiple = sol_now / rec.reference_sol;
+                priced += 1;
+                best = best.max(multiple);
                 store.mark_checked(&rec.mint, multiple, now);
 
                 let Some(rung) = next_rung(multiple, rec.last_reported_multiple, &cfg.update_multiples)
@@ -431,11 +610,15 @@ pub fn spawn_tracker(
                     continue;
                 };
 
-                // FDV now scales with the multiple by construction: same token
-                // quantity, same supply, so the ratio carries straight through.
-                // Deriving it this way avoids a second supply read that could
-                // disagree with the one taken at signal time.
-                let fdv_now = rec.fdv_usd_at_signal.map(|f| f * multiple);
+                // MEASURED, not scaled. `fdv_at_signal * multiple` assumes
+                // supply is constant — but a token whose mint authority is
+                // still live can print more, and those are exactly the tokens
+                // worth being accurate about. Re-read supply and price it from
+                // the same quote that produced the multiple. Falls back to the
+                // scaled estimate only when a live read is unavailable.
+                let fdv_now = live_fdv_usd(&rpc, &rec, sol_now, &cfg)
+                    .await
+                    .or_else(|| rec.fdv_usd_at_signal.map(|f| f * multiple));
 
                 tracing::info!(
                     mint = %rec.mint,
@@ -450,7 +633,21 @@ pub fn spawn_tracker(
                 store.mark_reported(&rec.mint, rung);
 
                 tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-            }        }
+            }
+
+            // Flush AFTER the sweep so observed multiples and any backfilled
+            // tickers survive a restart.
+            store.persist_all();
+
+            tracing::info!(
+                priced,
+                routeless,
+                named,
+                best = format!("{best:.2}x"),
+                took_secs = started.elapsed().as_secs(),
+                "re-pricing sweep complete"
+            );
+        }
     });
 }
 
@@ -469,6 +666,7 @@ mod tests {
             message_id: Some(42),
             reference_sol: 1.0,
             reference_tokens_raw: 1_000_000,
+            decimals: 6,
             fdv_usd_at_signal: Some(41_200.0),
             supply: Some(1_000_000_000.0),
             wallets: vec!["W1".into(), "W2".into()],
@@ -560,6 +758,56 @@ mod tests {
 
     /// A token that peaks and falls back must not re-fire rungs on the way
     /// down, nor when it climbs back through ground it already reported.
+    /// A fixed ladder would go silent exactly when the updates matter most:
+    /// the best outcome the bot can produce would also be the one it stops
+    /// reporting.
+    #[test]
+    fn the_ladder_continues_past_its_last_configured_rung() {
+        let l = crate::config::TrackedConfig::default().update_multiples;
+        assert_eq!(next_rung(250.0, 100.0, &l), Some(250.0));
+        assert_eq!(next_rung(600.0, 250.0, &l), Some(500.0));
+        assert_eq!(next_rung(1_500.0, 500.0, &l), Some(1000.0));
+        assert_eq!(next_rung(10_000.0, 100.0, &l), Some(10_000.0));
+    }
+
+    /// A moonshot must not produce a message per rung it blew through.
+    #[test]
+    fn a_gap_far_past_the_ladder_reports_once() {
+        let l = crate::config::TrackedConfig::default().update_multiples;
+        let mut reported = 1.0;
+        let mut fired = Vec::new();
+        for m in [3.0, 900.0] {
+            if let Some(r) = next_rung(m, reported, &l) {
+                fired.push(r);
+                reported = r;
+            }
+        }
+        assert_eq!(fired, vec![3.0, 500.0], "one update per observation, not per rung");
+    }
+
+    /// Generated rungs must ascend and stay finite, or the loop that walks
+    /// them could spin.
+    #[test]
+    fn generated_rungs_ascend_and_terminate() {
+        let rungs: Vec<f64> = rungs_above(100.0).collect();
+        assert!(!rungs.is_empty());
+        assert_eq!(&rungs[..4], &[250.0, 500.0, 1000.0, 2500.0]);
+        for w in rungs.windows(2) {
+            assert!(w[1] > w[0], "must ascend: {:?}", &rungs[..8.min(rungs.len())]);
+        }
+        assert!(rungs.len() < 40, "must terminate, got {}", rungs.len());
+        assert!(rungs.last().unwrap().is_finite());
+    }
+
+    /// An absurd multiple from a broken quote must not walk the generator
+    /// forever.
+    #[test]
+    fn an_absurd_multiple_still_terminates() {
+        let l = crate::config::TrackedConfig::default().update_multiples;
+        let r = next_rung(1e18, 100.0, &l);
+        assert!(r.is_some_and(|v| v.is_finite() && v <= 1e10), "got {r:?}");
+    }
+
     #[test]
     fn a_retrace_produces_no_updates() {
         let ladder = crate::config::TrackedConfig::default().update_multiples;
@@ -677,6 +925,72 @@ mod tests {
         assert_eq!(store.len(), 0);
     }
 
+    /// The restart bug: observed multiples were held only in memory, so every
+    /// restart reloaded the whole book at x1.0 with no check time — which reads
+    /// as "nothing has ever been re-priced".
+    #[test]
+    fn observed_multiples_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("volens-persist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.jsonl");
+        let p = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = SignalStore::load(&p);
+        store.insert(rec("MINT_A"));
+        let at = Utc::now();
+        store.mark_checked("MINT_A", 3.7, at);
+        store.set_identity("MINT_A", "Cheesecoin", "CHEESE");
+        store.persist_all();
+
+        let reloaded = SignalStore::load(&p);
+        let r = &reloaded.active(Utc::now(), 86_400)[0];
+        assert_eq!(r.last_multiple, 3.7, "multiple must survive");
+        assert!(r.last_checked_utc.is_some(), "check time must survive");
+        assert_eq!(r.symbol, "CHEESE", "backfilled ticker must survive");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The append-only log grows one line per update per signal; only the last
+    /// line per mint is ever read. A flush must compact it.
+    #[test]
+    fn persist_all_compacts_the_log() {
+        let dir = std::env::temp_dir().join(format!("volens-compact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.jsonl");
+        let p = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = SignalStore::load(&p);
+        store.insert(rec("MINT_A"));
+        for m in [1.5, 2.0, 2.5, 3.0] {
+            store.mark_reported("MINT_A", m);
+        }
+        let before = std::fs::read_to_string(&p).unwrap().lines().count();
+        assert!(before > 1, "appends accumulate");
+
+        store.persist_all();
+        let after = std::fs::read_to_string(&p).unwrap().lines().count();
+        assert_eq!(after, 1, "one line per mint after a flush");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ties must not reshuffle between calls — a list that reorders itself
+    /// looks like the data changed when nothing did.
+    #[test]
+    fn ranking_is_highest_first_and_stable() {
+        let store = SignalStore::load("/nonexistent/volens-rank.jsonl");
+        let now = Utc::now();
+        for (mint, mult, age) in [("A", 1.0, 300), ("B", 4.2, 100), ("C", 1.0, 60), ("D", 2.1, 200)] {
+            let mut r = rec(mint);
+            r.last_multiple = mult;
+            r.first_seen_utc = now - chrono::Duration::seconds(age);
+            store.lock().insert(mint.to_string(), r);
+        }
+        let ranked: Vec<String> = store.ranked(now, 86_400).iter().map(|r| r.mint.clone()).collect();
+        assert_eq!(ranked, vec!["B", "D", "C", "A"], "multiple desc, then newest");
+    }
+
     #[test]
     fn retire_drops_only_the_old() {
         let store = SignalStore::load("/nonexistent/volens-test-signals.jsonl");
@@ -689,6 +1003,73 @@ mod tests {
         assert_eq!(store.retire(Utc::now(), 3600), 1);
         assert!(store.contains("FRESH"));
         assert!(!store.contains("OLD"));
+    }
+
+    /// Live proof that the MEASURED market cap agrees with the scaled estimate
+    /// on tokens whose supply has not changed — and reveals it when it has.
+    ///
+    ///   cargo test --features sniper -- --ignored --nocapture live_measured_fdv
+    #[ignore = "hits mainnet RPC + Jupiter; needs recorded signals"]
+    #[tokio::test]
+    async fn live_measured_fdv_vs_scaled_estimate() {
+        let _ = dotenvy::dotenv();
+        let Ok(url) = std::env::var("RPC_URL") else { return };
+        let store = SignalStore::load("conviction_signals.jsonl");
+        let recs = store.active(Utc::now(), 7 * 86_400);
+        if recs.is_empty() {
+            println!("no recorded signals");
+            return;
+        }
+        let rpc = crate::rpc::RpcClient::new(&crate::config::RpcConfig {
+            url,
+            commitment: "confirmed".into(),
+            initial_delay_ms: 0,
+            retries: 2,
+            retry_delay_ms: 200,
+            ws_url: String::new(),
+        });
+        let cfg = crate::config::TrackedConfig::default();
+        let jup = crate::jupiter::Jupiter::new(&cfg.jupiter_base_url);
+
+        // Backfill decimals exactly as the tracker does, so this exercises the
+        // MEASURED path rather than silently testing the fallback.
+        for rec in &recs {
+            if rec.decimals == 0 {
+                if let Some(info) = rpc.mint_info(&rec.mint).await {
+                    store.set_decimals(&rec.mint, info.decimals as u32);
+                }
+            }
+        }
+        let recs = store.active(Utc::now(), 7 * 86_400);
+
+        let mut compared = 0;
+        for rec in recs.iter().take(5) {
+            let Some(sol_now) = quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await
+            else {
+                continue;
+            };
+            let multiple = sol_now / rec.reference_sol;
+            let measured = live_fdv_usd(&rpc, rec, sol_now, &cfg).await;
+            let scaled = rec.fdv_usd_at_signal.map(|f| f * multiple);
+            let t = if rec.symbol.is_empty() { &rec.mint[..8] } else { &rec.symbol };
+            println!(
+                "{t:>10}  {}  measured={:?}  scaled={:?}",
+                format_multiple(multiple),
+                measured.map(|v| format!("{v:.0}")),
+                scaled.map(|v| format!("{v:.0}"))
+            );
+            if let (Some(m), Some(sc)) = (measured, scaled) {
+                compared += 1;
+                // They should agree closely: same quote, same supply. A large
+                // gap means supply MOVED since the call — which is the case
+                // the measured path exists to catch.
+                let drift = (m - sc).abs() / sc.max(1.0);
+                println!("            drift {:.1}%", drift * 100.0);
+                assert!(drift < 0.25, "measured and scaled disagree by {:.0}%", drift * 100.0);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        assert!(compared > 0, "no signal exercised the measured path");
     }
 
     /// Live proof of the pricing half: re-quote every signal actually recorded
@@ -782,9 +1163,33 @@ mod tests {
         assert!(!out.contains("→"), "no arrow without both ends:\n{out}");
     }
 
+    /// A performance figure must never flatter itself. Rounding turned 99.7
+    /// into "x100" — claiming a milestone the token had not reached.
     #[test]
-    fn large_multiples_drop_the_decimal() {
+    fn multiples_are_truncated_never_rounded_up() {
         assert_eq!(format_multiple(2.44), "x2.4");
-        assert_eq!(format_multiple(12.6), "x13");
+        assert_eq!(format_multiple(2.49), "x2.4", "must not round to 2.5");
+        assert_eq!(format_multiple(12.6), "x12.6", "real value, not x13");
+        assert_eq!(format_multiple(99.7), "x99.7", "must not claim x100");
+        assert_eq!(format_multiple(3.999), "x3.9");
+        assert_eq!(format_multiple(900.0), "x900");
+        assert_eq!(format_multiple(1234.9), "x1234");
+    }
+
+    #[test]
+    fn nonsense_multiples_render_safely() {
+        assert_eq!(format_multiple(f64::NAN), "x0");
+        assert_eq!(format_multiple(-2.0), "x0");
+        assert_eq!(format_multiple(0.0), "x0");
+    }
+
+    /// The displayed value must never exceed the measured one.
+    #[test]
+    fn displayed_never_exceeds_measured() {
+        for m in [1.05, 1.99, 2.349, 9.99, 10.04, 49.95, 99.99, 100.9, 5000.7] {
+            let shown: f64 = format_multiple(m).trim_start_matches('x').parse().unwrap();
+            assert!(shown <= m, "displayed {shown} > measured {m}");
+        }
     }
 }
+

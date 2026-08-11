@@ -1503,20 +1503,29 @@ impl Bot {
         // message at 4096 characters, which would cut the list mid-entry.
         const MAX: usize = 25;
         for c in calls.iter().take(MAX) {
-            let ticker = if !c.symbol.is_empty() {
-                format!("${}", c.symbol)
-            } else if !c.name.is_empty() {
-                c.name.clone()
-            } else {
-                crate::conviction::short_mint(&c.mint)
-            };
-            let age = format_window(now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64);
-            s.push_str(&format!(
-                "{}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n",
-                ticker,
-                format_multiple(c.last_multiple),
-                c.mint
-            ));
+            let age = format_window(
+                now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64,
+            );
+            // Header line carries the TICKER; the mint sits below in a code
+            // block. When no ticker is known the header is skipped entirely
+            // rather than repeating the mint on both lines.
+            match (c.symbol.as_str(), c.name.as_str()) {
+                ("", "") => s.push_str(&format!(
+                    "<b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
+                    format_multiple(c.last_multiple),
+                    c.mint
+                )),
+                ("", name) => s.push_str(&format!(
+                    "{name}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
+                    format_multiple(c.last_multiple),
+                    c.mint
+                )),
+                (sym, _) => s.push_str(&format!(
+                    "${sym}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
+                    format_multiple(c.last_multiple),
+                    c.mint
+                )),
+            }
         }
         if calls.len() > MAX {
             s.push_str(&format!("\n…and {} more\n", calls.len() - MAX));

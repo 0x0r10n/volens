@@ -333,7 +333,6 @@ pub struct Sniper {
     /// Cached (price_usd, fetched_at) for SOL. Refreshed on a TTL so the market
     /// cap check does not re-quote Jupiter on every pool.
     #[cfg(feature = "sniper")]
-    sol_price: Mutex<Option<(f64, std::time::Instant)>>,
     /// See `Tunable`. Behind its own lock; read once per decision.
     tunable: Mutex<Tunable>,
     rpc: Arc<RpcClient>,
@@ -428,7 +427,6 @@ impl Sniper {
             mode,
             state: Mutex::new(DailyState::default()),
             tunable: Mutex::new(tunable),
-            sol_price: Mutex::new(None),
             rpc,
             submitter,
             jito,
@@ -1028,31 +1026,15 @@ impl Sniper {
         }
     }
 
-    /// SOL price in USD, cached for 5 minutes.
+    /// SOL price in USD.
     ///
-    /// A stale-by-minutes SOL price is irrelevant to a market-cap ceiling (the
-    /// threshold is an order-of-magnitude filter), and re-quoting per pool would
-    /// add a Jupiter round trip to every trade decision.
+    /// Delegates to the shared cache in `jupiter`, which serves a stale price
+    /// on a failed refresh. This used to keep its own cache that returned
+    /// `None` on any error — so a single transient Jupiter failure disabled the
+    /// market-cap ceiling entirely, which is the guard failing OPEN.
     #[cfg(feature = "sniper")]
     async fn sol_price_usd(&self) -> Option<f64> {
-        const TTL: std::time::Duration = std::time::Duration::from_secs(300);
-        if let Some((price, at)) = *self.sol_price.lock().unwrap()
-            && at.elapsed() < TTL
-        {
-            return Some(price);
-        }
-        let jup = crate::jupiter::Jupiter::new(&self.cfg.jupiter_base_url);
-        match jup.sol_price_usd().await {
-            Ok(p) if p > 0.0 => {
-                *self.sol_price.lock().unwrap() = Some((p, std::time::Instant::now()));
-                Some(p)
-            }
-            Ok(_) => None,
-            Err(e) => {
-                warn!(error = %format!("{e:#}"), "could not fetch SOL price for market-cap check");
-                None
-            }
-        }
+        crate::jupiter::cached_sol_price_usd(&self.cfg.jupiter_base_url).await
     }
 
     /// Fully-diluted market cap of the launched token, in USD.
