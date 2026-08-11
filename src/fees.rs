@@ -204,9 +204,12 @@ impl Fees {
         self.network_sol + self.tip_sol + self.platform_sol
     }
 
+    /// Test-only: the running bot reads `total_sol` directly.
+    #[cfg(test)]
     pub fn is_zero(&self) -> bool {
         self.total_sol() <= 0.0
     }
+
 }
 
 /// Labels treated as inclusion priority rather than a trading fee.

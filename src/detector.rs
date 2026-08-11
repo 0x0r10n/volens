@@ -217,6 +217,9 @@ impl Detector {
             "starting detector"
         );
 
+        // One shared budget for every Jupiter caller in the process.
+        crate::jupiter::set_min_interval_ms(self.cfg.tracked.jupiter_min_interval_ms);
+
         self.check_rpc_health().await?;
 
         #[cfg(feature = "sniper")]

@@ -202,7 +202,13 @@ impl ConvictionTracker {
         })
     }
 
-    /// Distinct buyers currently inside the window, for `/conviction`.
+
+    /// Distinct buyers currently inside the window, and their combined SOL.
+    ///
+    /// Test-only: kept because it is how `sweep`'s memory reclamation and the
+    /// per-token accounting are verified, but nothing in the running bot reads
+    /// it — there is no `/conviction` command.
+    #[cfg(test)]
     pub fn active(&self, now: Instant) -> Vec<(String, usize, f64)> {
         let mut out: Vec<(String, usize, f64)> = self
             .tokens
@@ -222,6 +228,13 @@ impl ConvictionTracker {
         out
     }
 
+    /// Tokens currently held in the window. Test-only: proves `sweep` actually
+    /// reclaims, which is otherwise invisible.
+    #[cfg(test)]
+    pub fn tracked_tokens(&self) -> usize {
+        self.tokens.len()
+    }
+
     /// Drop tokens whose entries have all expired. Without this the map grows
     /// for every token any tracked wallet has ever touched.
     pub fn sweep(&mut self, now: Instant) {
@@ -234,9 +247,6 @@ impl ConvictionTracker {
         self.announced.retain(|_, at| now.duration_since(*at) < ttl);
     }
 
-    pub fn tracked_tokens(&self) -> usize {
-        self.tokens.len()
-    }
 }
 
 /// USD context for one token, resolved once per signal.

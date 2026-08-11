@@ -305,7 +305,18 @@ track_for_secs = 86400
 # about — a 500x would stop reporting after 100x.
 update_multiples = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0]
 # Jupiter swap API root, used only for valuation quotes here.
+#   free: https://lite-api.jup.ag/swap/v1   (~60 req/min)
+#   paid: https://api.jup.ag/swap/v1        (much higher, needs a key)
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
+# Minimum gap between Jupiter requests, PROCESS-WIDE. Three loops share this
+# budget: the re-pricing sweep, the outcome sampler, and the SOL price refresh.
+#
+# Per-loop pacing does NOT work here and was the cause of a live 429 storm: two
+# loops at 400ms are 300 req/min, and because a sleep-based gap makes the rate
+# depend on host latency, the same build floods from a fast VPS while behaving
+# on a slower box. 1200ms = 50 req/min, comfortably under the free tier.
+# Lower this only when pointing at the paid endpoint.
+jupiter_min_interval_ms = 1200
 
 # --- Outcome sampling (data for wallet scoring) ---
 # Records what happened to EVERY token a tracked wallet buys, not just the ones

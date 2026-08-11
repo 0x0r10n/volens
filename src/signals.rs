@@ -135,6 +135,7 @@ impl SignalStore {
         self.lock().len()
     }
 
+    #[cfg(test)]
     pub fn contains(&self, mint: &str) -> bool {
         self.lock().contains_key(mint)
     }
@@ -635,7 +636,6 @@ pub fn spawn_tracker(
             // hammers it — which is precisely what keeps a rate limit engaged.
             const ABORT_AFTER: usize = 8;
             let mut consecutive_fail = 0usize;
-            let pace = std::time::Duration::from_millis(400);
 
             for rec in batch {
                 if *shutdown.borrow() {
@@ -729,7 +729,9 @@ pub fn spawn_tracker(
                     tracing::debug!(mint = %rec.mint, "no route or quote failed");
                 }
 
-                tokio::time::sleep(pace).await;
+                // No sleep here: `jupiter::throttle` spaces every request
+                // process-wide, so a second sleep would only slow the sweep
+                // without bounding anything the throttle does not already.
             }
 
             // Flush AFTER the sweep so observed multiples and any backfilled

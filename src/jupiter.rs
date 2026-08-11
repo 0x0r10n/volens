@@ -75,6 +75,9 @@ impl Jupiter {
     }
 
     /// Get a route for `amount` (raw base units) of `input_mint` -> `output_mint`.
+    ///
+    /// Rate-limited process-wide before the request goes out — see
+    /// [`throttle`]. Every quote in the process shares one budget.
     pub async fn quote(
         &self,
         input_mint: &str,
@@ -82,6 +85,7 @@ impl Jupiter {
         amount: u64,
         slippage_bps: u16,
     ) -> Result<Quote> {
+        throttle().await;
         let url = format!("{}/quote", self.base_url);
         let amount_s = amount.to_string();
         let slip_s = slippage_bps.to_string();
@@ -300,5 +304,96 @@ pub async fn cached_sol_price_usd(base_url: &str) -> Option<f64> {
             tracing::warn!(error = %format!("{e:#}"), "SOL price refresh failed; serving cached");
             cached.map(|(p, _)| p)
         }
+    }
+}
+
+/// Minimum gap between Jupiter requests, in milliseconds.
+static MIN_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1200);
+
+/// Set the global request spacing. Called once at startup from config.
+pub fn set_min_interval_ms(ms: u64) {
+    MIN_INTERVAL_MS.store(ms.max(50), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide request spacing for the Jupiter API.
+///
+/// # Why this cannot live in the calling loops
+///
+/// There are three independent callers — the conviction re-pricing sweep, the
+/// outcome sampler, and the SOL price refresh. Each previously paced itself
+/// with its own `sleep`, which bounds nothing in aggregate: two loops at 400ms
+/// are 300 requests/minute against a free tier of roughly 60, and the answer is
+/// a 429 that makes every one of them fail.
+///
+/// It also has to be time-based, not sleep-based. A `sleep(400ms)` between
+/// iterations means the RATE depends on how long each request takes, so the
+/// same code is fine on a slow link and floods on a fast one — which is exactly
+/// why this surfaced on the VPS and never locally.
+///
+/// A single async mutex serialises callers and enforces the gap from the last
+/// request's start, so the combined rate is bounded no matter how many loops
+/// exist or how fast the host is.
+pub async fn throttle() {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    use tokio::sync::Mutex;
+
+    static LAST: std::sync::OnceLock<Mutex<Option<Instant>>> = std::sync::OnceLock::new();
+    let cell = LAST.get_or_init(|| Mutex::new(None));
+
+    // Held across the await deliberately: that is what serialises callers.
+    let mut last = cell.lock().await;
+    let gap = Duration::from_millis(MIN_INTERVAL_MS.load(Ordering::Relaxed));
+    if let Some(prev) = *last {
+        let elapsed = prev.elapsed();
+        if elapsed < gap {
+            tokio::time::sleep(gap - elapsed).await;
+        }
+    }
+    *last = Some(Instant::now());
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::*;
+
+    /// The gap must be enforced between request STARTS, independent of how
+    /// long each request takes — otherwise the same code floods on a fast
+    /// host and behaves on a slow one.
+    #[tokio::test]
+    async fn requests_are_spaced_by_at_least_the_interval() {
+        set_min_interval_ms(120);
+        let start = std::time::Instant::now();
+        for _ in 0..4 {
+            throttle().await;
+        }
+        // Four calls = three enforced gaps.
+        assert!(
+            start.elapsed() >= Duration::from_millis(350),
+            "spacing not enforced: {:?}",
+            start.elapsed()
+        );
+        set_min_interval_ms(1200);
+    }
+
+    /// Concurrent callers share ONE budget. Per-loop pacing cannot do this,
+    /// which is the whole reason the throttle is global.
+    #[tokio::test]
+    async fn concurrent_callers_share_one_budget() {
+        set_min_interval_ms(100);
+        let start = std::time::Instant::now();
+        let mut set = Vec::new();
+        for _ in 0..5 {
+            set.push(tokio::spawn(async { throttle().await }));
+        }
+        for h in set {
+            h.await.unwrap();
+        }
+        assert!(
+            start.elapsed() >= Duration::from_millis(380),
+            "concurrent callers bypassed the budget: {:?}",
+            start.elapsed()
+        );
+        set_min_interval_ms(1200);
     }
 }

@@ -103,6 +103,14 @@ pub struct TrackedConfig {
     /// Jupiter swap API root, used for valuation quotes.
     #[serde(default = "default_jupiter_url")]
     pub jupiter_base_url: String,
+    /// Minimum gap between Jupiter requests, PROCESS-WIDE, in milliseconds.
+    ///
+    /// Three loops share this budget. Per-loop pacing bounds nothing in
+    /// aggregate and, being sleep-based, makes the effective rate depend on
+    /// host latency — the same build floods from a fast VPS and behaves from a
+    /// slow one. 1200ms = 50 req/min, under the free tier's ~60.
+    #[serde(default = "default_jupiter_interval")]
+    pub jupiter_min_interval_ms: u64,
 
     // --- Outcome sampling (wallet scoring data) ---
     /// Record what happened to EVERY token a tracked wallet buys, not just the
@@ -147,6 +155,9 @@ fn default_sample_check() -> u64 {
 }
 fn default_signals_path() -> String {
     "conviction_signals.jsonl".to_string()
+}
+fn default_jupiter_interval() -> u64 {
+    1200
 }
 fn default_max_per_sweep() -> usize {
     120
@@ -193,6 +204,7 @@ impl Default for TrackedConfig {
             max_repriced_per_sweep: default_max_per_sweep(),
             update_multiples: default_update_multiples(),
             jupiter_base_url: default_jupiter_url(),
+            jupiter_min_interval_ms: default_jupiter_interval(),
             track_outcomes: false,
             outcome_horizons_secs: default_horizons(),
             outcomes_path: default_outcomes_path(),

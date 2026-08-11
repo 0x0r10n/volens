@@ -325,7 +325,8 @@ pub fn spawn_sampler(
                 });
                 store.mark_sampled(&token.mint, horizon, &horizons);
 
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                // Spacing is handled process-wide by `jupiter::throttle`,
+                // which the sampler shares with the re-pricing sweep.
             }
 
             store.persist_pending();
