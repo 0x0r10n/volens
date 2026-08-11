@@ -15,3 +15,7 @@ detected_pools.jsonl
 *.jsonl
 *.db
 *.sqlite
+
+# Curated smart-money wallet list. Not a secret in the key sense, but it is the
+# research the alpha signal is built on — committing it publishes it.
+tracked_wallets.json

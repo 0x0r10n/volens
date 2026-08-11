@@ -26,32 +26,50 @@ Pass an explicit config path as the first argument: `volens /path/config.toml`.
 ## Transaction source: gRPC or WebSocket
 
 volens needs one source. gRPC is preferred and used whenever configured;
-WebSocket is the automatic fallback so a **standard RPC plan works with no
-Geyser at all**.
+WebSocket exists so a **standard RPC plan works with no Geyser at all**.
 
-### A) Standard RPC plan (no Geyser) — e.g. $50 Helius developer
+Automatic fallback to WebSocket is controlled by `[grpc].fallback_to_websocket`
+and is **off** here — it is only safe when the provider's WebSocket actually
+accepts your key.
+
+### A) Geyser plan — the fast path (what this deployment runs)
 
 ```bash
 # .env
-GRPC_ENDPOINT=                                  # leave EMPTY
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=<your-key>
+GRPC_ENDPOINT=http://grpc.raze.bot:4512         # plaintext http, port 4512
+GRPC_X_TOKEN=<your-key>
+RPC_URL=https://rpc.raze.bot/?api-key=<your-key>
 ```
 
-That is the whole setup. volens derives the `wss://` URL from `RPC_URL`,
-subscribes with `logsSubscribe`, and fetches each candidate with
-`getTransaction`. All filters, alerts, dry-run and sniper functionality are
-identical — the source is invisible to everything downstream.
+The **scheme is not cosmetic**: TLS is applied from the URL scheme
+(`connect_geyser` in `src/detector.rs`). Putting `https://` on a plaintext
+endpoint fails as an opaque transport error that never mentions the scheme.
 
-### B) Geyser plan — the fast path
+`RPC_URL` is required alongside gRPC: it powers the liquidity and mint-safety
+filters, LP supply, market cap, the watcher, `/balance`, and dry-run
+simulation. One provider, no failover list — if it dies, volens fails loudly
+rather than degrading silently.
+
+> **Debugging note.** Every RPC-backed filter fails **closed**. An endpoint that
+> starts returning 429 therefore does not look like an outage — detections keep
+> flowing and nothing ever qualifies. Check the endpoint before the filters:
+> `curl -s -X POST "$RPC_URL" -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'`
+
+### B) Standard RPC plan (no Geyser)
 
 ```bash
-GRPC_ENDPOINT=https://mainnet.helius-rpc.com
-GRPC_X_TOKEN=<your-key>
-RPC_URL=https://mainnet.helius-rpc.com/?api-key=<your-key>
+GRPC_ENDPOINT=                                  # leave EMPTY
+RPC_URL=https://<provider>/?api-key=<your-key>
 ```
 
-`RPC_URL` is still wanted: it powers the liquidity and mint-safety filters, the
-watcher, `/balance`, and dry-run simulation.
+volens derives the `wss://` URL from `RPC_URL`, subscribes with
+`logsSubscribe`, and fetches each candidate with `getTransaction`. All filters,
+alerts, dry-run and sniper functionality are identical — the source is
+invisible to everything downstream.
+
+Note this requires a provider whose WebSocket accepts your key. Raze's does
+not (401), which is why `fallback_to_websocket = false` in `config.toml`.
+Verify with `cargo test -- --ignored live_ws_fallback_connects`.
 
 ### What WebSocket mode costs
 

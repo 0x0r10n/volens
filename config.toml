@@ -16,6 +16,10 @@
 # Measured end to end: 1.4-6s (avg 2.35s) behind the log event. Fine for
 # alerting; a real disadvantage against snipers running Geyser.
 #
+# PRIMARY source is Raze Geyser, set via GRPC_ENDPOINT in .env. Note it is
+# served as PLAINTEXT gRPC on a custom port (http://…:4512), not TLS on 443 —
+# `connect_geyser` applies TLS from the URL scheme, so the scheme must be right.
+#
 # Leave empty to run WebSocket-only on [rpc].url. Override with GRPC_ENDPOINT.
 endpoint = ""
 # Auth token — leave blank here and set GRPC_X_TOKEN in the environment.
@@ -27,7 +31,14 @@ backoff_max_secs = 30
 # Fall back to WebSocket when gRPC cannot connect. Set false to make a broken
 # gRPC endpoint a hard failure instead — correct if running seconds behind
 # silently would be worse for you than not running.
-fallback_to_websocket = true
+#
+# FALSE on the current provider (Raze): its WebSocket rejects the API key with
+# 401, so the fallback path cannot connect at all. Leaving this true would mean
+# a gRPC outage silently demotes the detector to a dead source — it keeps
+# running, logs nothing alarming, and detects nothing. A hard failure is
+# recoverable; a healthy-looking dead detector is not. Verify before flipping
+# back:  cargo test -- --ignored live_ws_fallback_connects
+fallback_to_websocket = false
 # Consecutive CONNECT failures before falling back. Not 1: a single blip should
 # not demote a healthy gRPC setup for the rest of the session. A session that
 # connected and later dropped is a normal reconnect and does not count.
@@ -38,8 +49,29 @@ max_failures_before_fallback = 3
 # Only emit pools paired against a recognized quote asset (WSOL/USDC).
 # Set false to see every pool creation, including exotic pairs.
 require_quote_pair = true
-# Enable/disable venues: raydium_v4 | raydium_cpmm | pumpswap
-programs = ["raydium_v4", "raydium_cpmm", "pumpswap"]
+# Enable/disable venues:
+#   raydium_v4 | raydium_cpmm | pumpswap | meteora_dbc | meteora_dlmm
+#
+# meteora_dbc = Meteora's launchpad (Dynamic Bonding Curve). It is the only
+# Meteora program that actually MINTS new tokens — DAMM v2 pool creation never
+# does (verified on mainnet), so it is not a launch signal and is not watched.
+# Watching DBC also catches GRADUATIONS (curve fills -> migrates to DAMM v2),
+# which are high signal: a graduated token drew real demand. ~1 launch/min and
+# ~1 graduation/min, on a program carrying ~9 tx/s (vs CP-AMM's ~100).
+#
+# DETECTION ONLY: DBC is a bonding curve and DAMM v2 uses position NFTs, so the
+# constant-product buy path refuses them. Alerts yes, auto-buy no.
+# meteora_dlmm = Meteora's bin-based (concentrated liquidity) AMM. Reserves are
+# readable directly, but note the liquidity number is the TOTAL across all bins,
+# including bins parked far from the current price — an upper bound on tradable
+# depth, so the liquidity filter is looser here than on a constant-product pool.
+#
+# NOT supported: Meteora DAMM v1. Its pools hold no tokens of their own; they
+# hold shares of SHARED lending vaults. One WSOL vault backs 57,000+ pools and
+# holds ~216,000 SOL, so a normal vault-balance read reports that figure for
+# EVERY DAMM v1 pool and every one of them would sail past the liquidity gate.
+# Reading it correctly needs a 3-call share computation this code does not do.
+programs = ["raydium_v4", "raydium_cpmm", "pumpswap", "meteora_dbc", "meteora_dlmm"]
 # Mints treated as the "quote" side (i.e. never the newly launched token).
 quote_mints = [
   "So11111111111111111111111111111111111111112", # WSOL
@@ -89,6 +121,16 @@ path = "detected_pools.jsonl"
 [rpc]
 # Standard JSON-RPC endpoint for post-detection enrichment, separate from the
 # gRPC stream. Setting env RPC_URL auto-enables the liquidity + safety filters.
+#
+# PRIMARY is Raze (https://rpc.raze.bot/?api-key=…), set via RPC_URL in .env —
+# the key must never be committed here. Auth is the `?api-key=` query param.
+#
+# This endpoint is load-bearing for far more than alerts: liquidity, mint
+# safety, LP supply and market cap all read through it, and the sniper fails
+# CLOSED on every one of them. A provider that starts returning 429 does not
+# announce itself — it degrades into "no pool ever qualifies". If detections
+# keep flowing but nothing passes the filters, check this endpoint FIRST:
+#   curl -s -X POST "$RPC_URL" -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
 url = ""
 # 'confirmed' is more reliable than 'processed' for freshly created accounts.
 commitment = "confirmed"
@@ -99,6 +141,9 @@ retry_delay_ms = 500
 # Explicit WebSocket URL. Empty derives it from `url` (https -> wss), which is
 # correct for Helius, Triton and QuickNode. Set only if your provider serves
 # WebSocket on a different host or path. Override: RPC_WS_URL.
+#
+# Unused here: deriving wss:// from the Raze RPC url gives a 401, and the
+# WebSocket fallback is off as a result. Only relevant if you move providers.
 ws_url = ""
 
 [liquidity]
@@ -183,6 +228,43 @@ require_freeze_authority_revoked = true
 # hooks, permanent delegate, non-transferable, default frozen state).
 reject_risky_extensions = true
 emit_on_unknown = true
+
+[tracked]
+# --- Smart-money tracking ---
+#
+# Watches a set of wallets and announces when SEVERAL of them buy the same
+# token inside a window. This is a second gRPC subscription on the same stream,
+# independent of pool detection.
+#
+# Measured on a live endpoint with 700 wallets: the subscription is accepted in
+# one request and carries ~861 tx/min — about 3% of the volume the program
+# stream already handles.
+#
+# Buys are detected from token-balance deltas in transaction metadata, NOT by
+# parsing swaps: `token balance up + SOL balance down = bought`. That is
+# venue-agnostic, so it catches Jupiter routes, aggregators and venues volens
+# does not support, and it cannot go stale when a DEX ships a new program.
+# It requires gRPC — the WebSocket fallback carries no balance metadata.
+enabled = true
+# Tracker export: a JSON array of {trackedWalletAddress, name}.
+wallets_path = "tracked_wallets.json"
+# Distinct wallets that must buy the same token inside `window_secs` before
+# anything is announced. ONE wallet buying is not a signal — 700 wallets going
+# about normal business generate ~861 tx/min, so a threshold of 1 would be pure
+# noise. Each additional distinct buyer re-announces with a higher count, but a
+# wallet already counted never re-triggers: scaling into a position is one
+# opinion, not two.
+conviction_threshold = 2
+window_secs = 600
+# Minimum SOL a wallet must spend for a buy to count. Not 0: every signer pays
+# a transaction fee, so zero would count any tracked wallet that merely signed
+# something.
+min_buy_sol = 0.05
+# Log EVERY tracked buy, including ones that never reach the threshold. This is
+# the raw material for scoring which wallets are actually worth following, and
+# it can only be collected going forward — never reconstructed later. Keep on.
+log_all_buys = true
+buys_path = "tracked_buys.jsonl"
 
 [log]
 # trace | debug | info | warn | error   (RUST_LOG overrides this entirely)

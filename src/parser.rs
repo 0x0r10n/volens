@@ -5,7 +5,10 @@
 //! `detector` so this module stays a pure, testable decode step.
 
 use crate::model::{
-    Dex, PUMPSWAP_CREATE_POOL_DISC, RAYDIUM_CPMM_INITIALIZE_DISC, RAYDIUM_V4_INITIALIZE2_TAG,
+    DBC_INIT_POOL_SPL_DISC, DBC_INIT_POOL_T22_DISC, DBC_MIGRATION_DAMM_V2_DISC,
+    DLMM_INIT_CUSTOM_LB_PAIR2_DISC, DLMM_INIT_CUSTOM_LB_PAIR_DISC, DLMM_INIT_LB_PAIR2_DISC,
+    DLMM_INIT_LB_PAIR_DISC, Dex,
+    PUMPSWAP_CREATE_POOL_DISC, RAYDIUM_CPMM_INITIALIZE_DISC, RAYDIUM_V4_INITIALIZE2_TAG,
 };
 use yellowstone_grpc_proto::prelude::{SubscribeUpdateTransactionInfo, TransactionStatusMeta};
 
@@ -20,7 +23,10 @@ pub struct ParsedPool {
     pub base_vault: String,
     /// Vault holding `quote_mint`.
     pub quote_vault: String,
-    pub lp_mint: String,
+    /// `None` on venues that have no LP mint at all (Meteora DBC / DAMM v2 use
+    /// a bonding curve / position NFTs). Absence is a fact about the venue, not
+    /// a parse failure.
+    pub lp_mint: Option<String>,
     /// Venue-dependent accounts a swap will need.
     pub swap_accounts: crate::model::SwapAccounts,
 }
@@ -159,7 +165,15 @@ fn decode_ix(
         return None;
     }
 
-    let layout = dex.layout();
+    // Layout depends on the INSTRUCTION, not just the venue: Meteora DBC emits
+    // launches and graduations from the same program with different account
+    // maps. Everything else has one creation instruction and one layout.
+    let layout = if dex == Dex::MeteoraDbc && data.len() >= 8 && data[..8] == DBC_MIGRATION_DAMM_V2_DISC
+    {
+        crate::model::DBC_MIGRATION_LAYOUT
+    } else {
+        dex.layout()
+    };
     if accounts.len() < layout.min_accounts {
         return None;
     }
@@ -176,7 +190,8 @@ fn decode_ix(
         quote_mint: account_at(layout.quote_mint)?,
         base_vault: account_at(layout.base_vault)?,
         quote_vault: account_at(layout.quote_vault)?,
-        lp_mint: account_at(layout.lp_mint)?,
+        // `None` for venues with no LP mint (Meteora): absent, not missing.
+        lp_mint: layout.lp_mint.and_then(&account_at),
         swap_accounts: crate::model::SwapAccounts {
             amm_config: layout.amm_config.and_then(&account_at),
             observation: layout.observation.and_then(&account_at),
@@ -194,6 +209,25 @@ fn matches_creation(dex: Dex, data: &[u8]) -> bool {
     match dex {
         // Borsh single-byte tag; `Initialize2` == 1.
         Dex::RaydiumV4 => data.first() == Some(&RAYDIUM_V4_INITIALIZE2_TAG),
+        // Discriminators not yet derived from real mainnet transactions.
+        // Returning false means these venues are simply not detected — far
+        // better than guessing a discriminator and mis-parsing pools.
+        Dex::MeteoraDammV2 => false,
+        Dex::MeteoraDlmm => {
+            data.len() >= 8
+                && (data[..8] == DLMM_INIT_LB_PAIR_DISC
+                    || data[..8] == DLMM_INIT_LB_PAIR2_DISC
+                    || data[..8] == DLMM_INIT_CUSTOM_LB_PAIR_DISC
+                    || data[..8] == DLMM_INIT_CUSTOM_LB_PAIR2_DISC)
+        }
+        // DBC: a new token launch (either mint flavour) or a graduation to
+        // DAMM v2. All three are "a tradable pool now exists".
+        Dex::MeteoraDbc => {
+            data.len() >= 8
+                && (data[..8] == DBC_INIT_POOL_SPL_DISC
+                    || data[..8] == DBC_INIT_POOL_T22_DISC
+                    || data[..8] == DBC_MIGRATION_DAMM_V2_DISC)
+        }
         Dex::RaydiumCpmm => data.len() >= 8 && data[..8] == RAYDIUM_CPMM_INITIALIZE_DISC,
         Dex::PumpSwap => data.len() >= 8 && data[..8] == PUMPSWAP_CREATE_POOL_DISC,
     }
@@ -233,6 +267,98 @@ mod tests {
     #[test]
     fn pumpswap_discriminator_is_correct() {
         assert_eq!(anchor_disc("create_pool"), PUMPSWAP_CREATE_POOL_DISC);
+    }
+
+    /// Meteora DBC. All three were also matched against real mainnet
+    /// transactions (signatures in the constants' doc comments) — this test
+    /// guards the constants from drifting.
+    #[test]
+    fn meteora_dbc_discriminators_are_correct() {
+        assert_eq!(
+            anchor_disc("initialize_virtual_pool_with_spl_token"),
+            DBC_INIT_POOL_SPL_DISC
+        );
+        assert_eq!(
+            anchor_disc("initialize_virtual_pool_with_token2022"),
+            DBC_INIT_POOL_T22_DISC
+        );
+        assert_eq!(anchor_disc("migration_damm_v2"), DBC_MIGRATION_DAMM_V2_DISC);
+    }
+
+    #[test]
+    fn meteora_dlmm_discriminators_are_correct() {
+        assert_eq!(anchor_disc("initialize_lb_pair"), DLMM_INIT_LB_PAIR_DISC);
+        assert_eq!(anchor_disc("initialize_lb_pair2"), DLMM_INIT_LB_PAIR2_DISC);
+        assert_eq!(
+            anchor_disc("initialize_customizable_permissionless_lb_pair"),
+            DLMM_INIT_CUSTOM_LB_PAIR_DISC
+        );
+        assert_eq!(
+            anchor_disc("initialize_customizable_permissionless_lb_pair2"),
+            DLMM_INIT_CUSTOM_LB_PAIR2_DISC
+        );
+    }
+
+    /// All four DLMM variants must be recognized by the WebSocket pre-filter,
+    /// and a swap must not be. A miss here silently disables DLMM detection.
+    #[test]
+    fn dlmm_log_names_match_mainnet() {
+        for name in [
+            "InitializeLbPair",
+            "InitializeLbPair2",
+            "InitializeCustomizablePermissionlessLbPair",
+            "InitializeCustomizablePermissionlessLbPair2",
+        ] {
+            assert!(
+                crate::ws::logs_suggest_creation(
+                    Dex::MeteoraDlmm,
+                    &[format!("Program log: Instruction: {name}")]
+                ),
+                "{name} must be recognized"
+            );
+        }
+        assert!(!crate::ws::logs_suggest_creation(
+            Dex::MeteoraDlmm,
+            &["Program log: Instruction: Swap2".to_string()]
+        ));
+    }
+
+    /// A launch and a graduation come from the SAME program with DIFFERENT
+    /// account maps. Picking the layout by venue alone would read the wrong
+    /// indices for one of them and report a nonsense pool.
+    #[test]
+    fn dbc_launch_and_migration_use_different_layouts() {
+        let launch = Dex::MeteoraDbc.layout();
+        let migration = crate::model::DBC_MIGRATION_LAYOUT;
+        assert_eq!((launch.pool, launch.base_mint, launch.quote_mint), (5, 3, 4));
+        assert_eq!((migration.pool, migration.base_mint, migration.quote_mint), (4, 13, 14));
+        assert_ne!(launch.base_vault, migration.base_vault);
+        // Neither has an LP mint: DBC is a bonding curve, DAMM v2 uses position
+        // NFTs. Verified on mainnet — do not "fix" this by inventing an index.
+        assert!(launch.lp_mint.is_none() && migration.lp_mint.is_none());
+    }
+
+    /// The WebSocket path only fetches a transaction if a log line matches, so a
+    /// wrong name here silently disables DBC detection entirely. These strings
+    /// were read off real mainnet transactions.
+    #[test]
+    fn dbc_log_names_match_mainnet() {
+        for name in [
+            "InitializeVirtualPoolWithSplToken",
+            "InitializeVirtualPoolWithToken2022",
+            "MigrationDammV2",
+        ] {
+            let line = format!("Program log: Instruction: {name}");
+            assert!(
+                crate::ws::logs_suggest_creation(Dex::MeteoraDbc, &[line.clone()]),
+                "{line} must be recognized"
+            );
+        }
+        // A swap on the same program must NOT trigger a fetch.
+        assert!(!crate::ws::logs_suggest_creation(
+            Dex::MeteoraDbc,
+            &["Program log: Instruction: Swap2".to_string()]
+        ));
     }
 
     #[test]
@@ -312,7 +438,7 @@ mod tests {
         // Vaults verified on-chain: each holds the mint at the paired index.
         assert_eq!(p.base_vault, "FW2eAuRM5wc7ANYNGJwRiS3KMPVj3P6wMmhHy9w2dYug");
         assert_eq!(p.quote_vault, "5pCXd5sDvaKvFYo1QtXQqiJEQcRHQdYxDceK7CMHmDYz");
-        assert_eq!(p.lp_mint, "CSkEnvFTBQUU5VxfNngK3kvmpCzacRtknpGcyj1uyM85");
+        assert_eq!(p.lp_mint.as_deref(), Some("CSkEnvFTBQUU5VxfNngK3kvmpCzacRtknpGcyj1uyM85"));
         // Accounts a later swap needs, from the same verified transaction.
         let sa = &p.swap_accounts;
         assert_eq!(sa.open_orders.as_deref(), Some("G7gL1j3XMhykfAfqN7KcPMUhGebrRyFu7TGy5KSysYgi"));
@@ -363,7 +489,7 @@ mod tests {
         assert_eq!(p.quote_mint, "8wUqUf6RgVVDNZgEvToa5H7ovTpkpWmAoMAw7Tvoe3kA");
         assert_eq!(p.base_vault, "AwNcrnAhstiij69TKdkZGmPe7eECnyLPJcDFBVQq95Qn");
         assert_eq!(p.quote_vault, "AYiMT3p5XVgakVmFmwxEACDCjoQTxKCK3mvvVLGVQBVu");
-        assert_eq!(p.lp_mint, "5HEmY4QV1NaYfNPVoMMf4LqcdorSAer49oRMrkBkJaNY");
+        assert_eq!(p.lp_mint.as_deref(), Some("5HEmY4QV1NaYfNPVoMMf4LqcdorSAer49oRMrkBkJaNY"));
         let sa = &p.swap_accounts;
         assert_eq!(sa.amm_config.as_deref(), Some("D4FPEruKEHrG5TenZ2mpDGEfu1iUvTiqBxvpU8HLBvC2"));
         assert_eq!(sa.observation.as_deref(), Some("HVhFfr5q114XMJtn4XzfMpB1UNWtvA1Mm4UpMhuA93Ys"));
@@ -411,7 +537,7 @@ mod tests {
         // Both vaults verified owned by the pool account itself.
         assert_eq!(p.base_vault, "8GC4CydqvsjVpZmALdvhUR5S1i3iHwJBdfCyNAvioXN1");
         assert_eq!(p.quote_vault, "41fHdK5y4LEXMehEcwkTk7jCcVx5A9TJykU6NPZEAGuK");
-        assert_eq!(p.lp_mint, "kJVxe4Ywe1PcZoVS9EemS3HFHybBZvy37CgV6a7zcLx");
+        assert_eq!(p.lp_mint.as_deref(), Some("kJVxe4Ywe1PcZoVS9EemS3HFHybBZvy37CgV6a7zcLx"));
         // Creation alone carries no pool_v2 — it lives in a sibling instruction.
         assert_eq!(p.swap_accounts.pool_v2, None);
         // PumpSwap's "amm_config" slot is its global_config.

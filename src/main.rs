@@ -8,6 +8,7 @@
 mod alerts;
 mod bot;
 mod config;
+mod conviction;
 mod dedup;
 mod detector;
 #[cfg(feature = "sniper")]
@@ -32,6 +33,7 @@ mod submit;
 mod swap;
 #[cfg(feature = "sniper")]
 mod tx;
+mod wallets;
 #[cfg(feature = "sniper")]
 mod walletstore;
 mod watcher;

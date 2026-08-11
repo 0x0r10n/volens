@@ -2263,7 +2263,7 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_captures_all_args_and_validates() {
+    fn withdraw_captures_all_args() {
         // The whole remainder after the command word is captured (amount + addr).
         assert_eq!(
             Command::parse("/withdraw 0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX"),
@@ -2271,7 +2271,13 @@ mod tests {
                 "0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX".into()
             )))
         );
+    }
 
+    /// `parse_withdraw_args` only exists in a sniper build — the default build
+    /// has no fund-moving code to parse arguments for.
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn withdraw_args_validate() {
         // Valid parse.
         let ok = parse_withdraw_args(Some("0.5 DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX"));
         assert_eq!(

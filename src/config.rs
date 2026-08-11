@@ -30,7 +30,70 @@ pub struct Config {
     #[serde(default)]
     pub sniper: SniperConfig,
     #[serde(default)]
+    pub tracked: TrackedConfig,
+    #[serde(default)]
     pub log: LogConfig,
+}
+
+/// Smart-money tracking: watch a set of wallets and alert when several of them
+/// buy the same token inside a window.
+///
+/// This is a SECOND gRPC subscription, independent of pool detection. Measured
+/// against 700 wallets on a live endpoint: ~861 tx/min, about 3% of the volume
+/// the program stream already carries.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrackedConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the tracker export (JSON array of `{trackedWalletAddress, name}`).
+    #[serde(default)]
+    pub wallets_path: String,
+    /// Distinct wallets that must buy the same token inside `window_secs`
+    /// before anything is announced. Below 2 every single buy is a "signal",
+    /// which defeats the purpose; the tracker clamps it.
+    #[serde(default = "default_conviction_threshold")]
+    pub conviction_threshold: usize,
+    #[serde(default = "default_conviction_window")]
+    pub window_secs: u64,
+    /// Minimum SOL a wallet must spend for the buy to count. Every signer pays
+    /// a transaction fee, so a threshold of zero would count any tracked wallet
+    /// that merely signed something as a buyer.
+    #[serde(default = "default_min_buy_sol")]
+    pub min_buy_sol: f64,
+    /// Append every tracked buy to `buys_path`, including ones that never reach
+    /// the threshold. This is the raw material for scoring which wallets are
+    /// actually worth following — keep it on.
+    #[serde(default = "default_true")]
+    pub log_all_buys: bool,
+    #[serde(default = "default_buys_path")]
+    pub buys_path: String,
+}
+
+fn default_conviction_threshold() -> usize {
+    2
+}
+fn default_conviction_window() -> u64 {
+    600
+}
+fn default_min_buy_sol() -> f64 {
+    0.05
+}
+fn default_buys_path() -> String {
+    "tracked_buys.jsonl".to_string()
+}
+
+impl Default for TrackedConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            wallets_path: String::new(),
+            conviction_threshold: default_conviction_threshold(),
+            window_secs: default_conviction_window(),
+            min_buy_sol: default_min_buy_sol(),
+            log_all_buys: true,
+            buys_path: default_buys_path(),
+        }
+    }
 }
 
 /// Standard JSON-RPC endpoint used for post-detection enrichment (liquidity and
@@ -558,6 +621,7 @@ impl Default for Config {
             safety: SafetyConfig::default(),
             watch: WatchConfig::default(),
             sniper: SniperConfig::default(),
+            tracked: TrackedConfig::default(),
             log: LogConfig::default(),
         }
     }
@@ -587,9 +651,18 @@ impl Config {
         if let Ok(v) = std::env::var("GRPC_ENDPOINT") { self.grpc.endpoint = v; }
         if let Ok(v) = std::env::var("GRPC_X_TOKEN") { self.grpc.x_token = v; }
         if let Ok(v) = std::env::var("GRPC_COMMITMENT") { self.grpc.commitment = v; }
+        // An EMPTY value is not a token. Treating it as one flips the enable
+        // flag and then fails validation with "telegram enabled but token
+        // missing" — which is exactly backwards from what the operator asked
+        // for by blanking it. Blank means "run without Telegram".
         if let Ok(v) = std::env::var("TELEGRAM_BOT_TOKEN") {
-            self.alerts.telegram_bot_token = v;
-            self.alerts.telegram_enabled = true;
+            if v.trim().is_empty() {
+                self.alerts.telegram_enabled = false;
+                self.alerts.commands_enabled = false;
+            } else {
+                self.alerts.telegram_bot_token = v;
+                self.alerts.telegram_enabled = true;
+            }
         }
         if let Ok(v) = std::env::var("TELEGRAM_CHAT_ID") { self.alerts.telegram_chat_id = v; }
         // Note: unlike TELEGRAM_BOT_TOKEN above, this does NOT flip
@@ -646,6 +719,26 @@ impl Config {
             anyhow::ensure!(
                 !self.rpc.url.is_empty(),
                 "liquidity/safety/watch need an RPC url ([rpc].url or env RPC_URL)"
+            );
+        }
+        if self.tracked.enabled {
+            anyhow::ensure!(
+                !self.tracked.wallets_path.trim().is_empty(),
+                "tracked.enabled = true but no wallets_path is set"
+            );
+            // Wallet tracking reads token-balance metadata from streamed
+            // transactions. The WebSocket fallback delivers only
+            // {signature, err, logs} — no balances — so there is nothing to
+            // diff. Failing here beats enabling a feature that silently
+            // reports zero buys forever.
+            anyhow::ensure!(
+                self.grpc.is_configured(),
+                "tracked.enabled = true requires gRPC (GRPC_ENDPOINT): the \
+                 WebSocket fallback carries no token-balance metadata to diff"
+            );
+            anyhow::ensure!(
+                self.tracked.window_secs > 0,
+                "tracked.window_secs must be > 0"
             );
         }
         if self.liquidity.enabled {

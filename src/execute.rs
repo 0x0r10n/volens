@@ -73,6 +73,13 @@ pub async fn build_buy(
             build_pumpswap(rpc, event, owner, token_mint, lamports_in, slippage_bps, unit_limit, priority_fee)
                 .await
         }
+        // Detection-only venues. The builder below assumes a constant-product
+        // pool priced by its reserve ratio; Meteora DLMM prices from the active
+        // bin instead, so any quote built here would be wrong. Refusing is the
+        // only correct behaviour — an approximate quote spends real money.
+        dex @ (Dex::MeteoraDammV2 | Dex::MeteoraDlmm | Dex::MeteoraDbc) => {
+            bail!("{} is detection-only — execution is not implemented for it", dex.label())
+        }
     }
 }
 

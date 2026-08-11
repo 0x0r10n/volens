@@ -180,6 +180,9 @@ pub fn is_swap(dex: Dex, data: &[u8]) -> bool {
         Dex::PumpSwap => {
             data.len() >= 8 && (data[..8] == PUMPSWAP_BUY_DISC || data[..8] == PUMPSWAP_SELL_DISC)
         }
+        // Swap discriminators not derived for these venues yet. `false` only
+        // means "not recognized as a swap"; it gates no spending.
+        Dex::MeteoraDammV2 | Dex::MeteoraDlmm | Dex::MeteoraDbc => false,
     }
 }
 

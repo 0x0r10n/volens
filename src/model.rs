@@ -18,6 +18,19 @@ pub const RAYDIUM_V4_PROGRAM: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1M
 pub const RAYDIUM_CPMM_PROGRAM: &str = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C";
 /// PumpSwap (Pump AMM).
 pub const PUMPSWAP_PROGRAM: &str = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+/// Meteora DAMM v2 (CP-AMM). Constant-product, so the existing quote math is
+/// the right shape for it — unlike DLMM, which is bin-based.
+pub const METEORA_DAMM_V2_PROGRAM: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+/// Meteora DBC (Dynamic Bonding Curve) — Meteora's launchpad. This is where new
+/// tokens are actually MINTED: `initialize_virtual_pool_with_*` creates the mint
+/// and two real SPL vaults in one instruction. (DAMM v2 pool creation, by
+/// contrast, never mints a token — verified across every sampled creation — so
+/// it is not a launch signal.) Also emits the graduation to DAMM v2.
+pub const METEORA_DBC_PROGRAM: &str = "dbcij3LWUppWqq96dh6gJWwBifmcGfLSB5D4DuSMaqN";
+/// Meteora DLMM (LB CLMM). Bin-based concentrated liquidity: price comes from
+/// the active bin, NOT from a reserve ratio, and there is no LP mint. Detection
+/// only — the constant-product quote path must never be used for it.
+pub const METEORA_DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Wrapped SOL mint — the canonical "quote" asset for most new pools.
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
@@ -40,6 +53,34 @@ pub const RAYDIUM_CPMM_INITIALIZE_DISC: [u8; 8] = [175, 175, 109, 31, 13, 152, 1
 /// = sha256("global:create_pool")[..8]. Verified by unit test.
 pub const PUMPSWAP_CREATE_POOL_DISC: [u8; 8] = [233, 146, 209, 142, 207, 104, 64, 188];
 
+/// Meteora DBC launch, classic SPL mint. sha256("global:\
+/// initialize_virtual_pool_with_spl_token")[..8]. Verified by unit test AND
+/// against mainnet tx 2WJXvS2x623aLoGgvLupBdzPkcwimPKsFkVxcGJTfJ1GyhAxmQNkKFYe5is7v74G5TbZNqDrXhmHkyCBMfdgTXL7.
+pub const DBC_INIT_POOL_SPL_DISC: [u8; 8] = [0x8c, 0x55, 0xd7, 0xb0, 0x66, 0x36, 0x68, 0x4f];
+/// Meteora DBC launch, Token-2022 mint. Same account layout at indices 0..=7 as
+/// the SPL variant, so one layout serves both. Verified against mainnet tx
+/// 66LvEhsHRiDEFZjoS2N7fyV5Rp3fSimBWEqvLWwL29Lj7mfjfDPZ7YTpZUfRyg4JfrU47p66KEaTfYYLD13ifMVc.
+pub const DBC_INIT_POOL_T22_DISC: [u8; 8] = [0xa9, 0x76, 0x33, 0x4e, 0x91, 0x6e, 0xdc, 0x9b];
+/// Meteora DBC graduation: the bonding curve fills and migrates to a DAMM v2
+/// pool. HIGH signal — a token that graduated has proven real demand. Emitted by
+/// the DBC program (not CP-AMM), so watching DBC alone catches launch AND
+/// graduation. Verified against mainnet tx
+/// 5TAQCfmz727hFKAs4c3ohfSNB6R66Q35ZwJ4c624JFbKKzTW7gjA3zHiBihqcJgFmrzKNgr9TeANLsEBhNymgq6D.
+pub const DBC_MIGRATION_DAMM_V2_DISC: [u8; 8] = [0x9c, 0xa9, 0xe6, 0x67, 0x35, 0xe4, 0x50, 0x40];
+
+/// Meteora DLMM pool creation — four variants, all live on mainnet. They share
+/// an IDENTICAL account layout at indices 0..=6 (verified across 29 creation
+/// transactions, 100% agreement), so one layout serves all four. Index 7 onward
+/// differs per variant and is deliberately not used.
+pub const DLMM_INIT_LB_PAIR_DISC: [u8; 8] = [0x2d, 0x9a, 0xed, 0xd2, 0xdd, 0x0f, 0xa6, 0x5c];
+/// The variant current launchpad/migration flows use, and the only one
+/// supporting Token-2022.
+pub const DLMM_INIT_LB_PAIR2_DISC: [u8; 8] = [0x49, 0x3b, 0x24, 0x78, 0xed, 0x53, 0x6c, 0xc6];
+pub const DLMM_INIT_CUSTOM_LB_PAIR_DISC: [u8; 8] =
+    [0x2e, 0x27, 0x29, 0x87, 0x6f, 0xb7, 0xc8, 0x40];
+pub const DLMM_INIT_CUSTOM_LB_PAIR2_DISC: [u8; 8] =
+    [0xf3, 0x49, 0x81, 0x7e, 0x33, 0x13, 0xf1, 0x6b];
+
 // ---------------------------------------------------------------------------
 // DEX identity + account layouts
 // ---------------------------------------------------------------------------
@@ -51,6 +92,11 @@ pub enum Dex {
     RaydiumV4,
     RaydiumCpmm,
     PumpSwap,
+    MeteoraDammV2,
+    MeteoraDlmm,
+    /// Meteora DBC — the launchpad where new tokens are minted, plus their
+    /// graduation to DAMM v2.
+    MeteoraDbc,
 }
 
 impl Dex {
@@ -59,6 +105,9 @@ impl Dex {
             Dex::RaydiumV4 => RAYDIUM_V4_PROGRAM,
             Dex::RaydiumCpmm => RAYDIUM_CPMM_PROGRAM,
             Dex::PumpSwap => PUMPSWAP_PROGRAM,
+            Dex::MeteoraDammV2 => METEORA_DAMM_V2_PROGRAM,
+            Dex::MeteoraDlmm => METEORA_DLMM_PROGRAM,
+            Dex::MeteoraDbc => METEORA_DBC_PROGRAM,
         }
     }
 
@@ -67,6 +116,9 @@ impl Dex {
             Dex::RaydiumV4 => "Raydium AMM v4",
             Dex::RaydiumCpmm => "Raydium CPMM",
             Dex::PumpSwap => "PumpSwap",
+            Dex::MeteoraDammV2 => "Meteora DAMM v2",
+            Dex::MeteoraDlmm => "Meteora DLMM",
+            Dex::MeteoraDbc => "Meteora DBC",
         }
     }
 
@@ -76,6 +128,9 @@ impl Dex {
             Dex::RaydiumV4 => "raydium_v4",
             Dex::RaydiumCpmm => "raydium_cpmm",
             Dex::PumpSwap => "pumpswap",
+            Dex::MeteoraDammV2 => "meteora_damm_v2",
+            Dex::MeteoraDlmm => "meteora_dlmm",
+            Dex::MeteoraDbc => "meteora_dbc",
         }
     }
 
@@ -84,14 +139,57 @@ impl Dex {
             "raydium_v4" => Some(Dex::RaydiumV4),
             "raydium_cpmm" => Some(Dex::RaydiumCpmm),
             "pumpswap" => Some(Dex::PumpSwap),
+            "meteora_damm_v2" | "meteora_damm2" => Some(Dex::MeteoraDammV2),
+            "meteora_dlmm" => Some(Dex::MeteoraDlmm),
+            "meteora_dbc" | "meteora" => Some(Dex::MeteoraDbc),
             _ => None,
         }
     }
 
-    pub fn all() -> [Dex; 3] {
-        [Dex::RaydiumV4, Dex::RaydiumCpmm, Dex::PumpSwap]
+    pub fn all() -> [Dex; 6] {
+        [
+            Dex::RaydiumV4,
+            Dex::RaydiumCpmm,
+            Dex::PumpSwap,
+            Dex::MeteoraDammV2,
+            Dex::MeteoraDlmm,
+            Dex::MeteoraDbc,
+        ]
+    }
+
+    /// Can the hand-built execution path trade this venue?
+    ///
+    /// FALSE means detection and alerts only. The buy path assumes a
+    /// constant-product pool priced by its reserve ratio; a venue that does not
+    /// work that way (DLMM prices from the active bin) would be mispriced by
+    /// every quote, so it must be refused rather than approximated.
+    pub fn is_tradable(self) -> bool {
+        match self {
+            Dex::RaydiumV4 | Dex::RaydiumCpmm | Dex::PumpSwap => true,
+            Dex::MeteoraDammV2 | Dex::MeteoraDlmm | Dex::MeteoraDbc => false,
+        }
     }
 }
+
+/// Account map for a Meteora DBC GRADUATION (`migration_damm_v2`): the bonding
+/// curve filled and a real DAMM v2 pool was created. Different shape from the
+/// launch instruction — the pool is the new DAMM v2 pool at index 4, and the
+/// mints/vaults sit much later. Base is A and quote is B here, unlike direct
+/// DAMM v2 creations which have no reliable ordering.
+pub const DBC_MIGRATION_LAYOUT: PoolAccountLayout = PoolAccountLayout {
+    pool: 4,
+    base_mint: 13,
+    quote_mint: 14,
+    base_vault: 15,
+    quote_vault: 16,
+    lp_mint: None,
+    amm_config: None,
+    observation: None,
+    open_orders: None,
+    target_orders: None,
+    market: None,
+    min_accounts: 26,
+};
 
 /// The account-index map for a pool-creation instruction, i.e. which entry in
 /// the instruction's `accounts` array holds each field we care about.
@@ -108,10 +206,12 @@ pub struct PoolAccountLayout {
     pub base_vault: usize,
     /// Vault holding the quote side. Verified to hold `quote_mint`.
     pub quote_vault: usize,
-    /// LP mint. Confirmed by cross-reference: in each verified creation tx a
-    /// token account holding this mint is owned by the pool creator (v4/CPMM),
-    /// and for PumpSwap the LP mint's own mint-authority is the pool itself.
-    pub lp_mint: usize,
+    /// LP mint, when the venue has one. `None` for venues that track liquidity
+    /// with position NFTs or a bonding curve instead (Meteora DBC / DAMM v2 /
+    /// DLMM) — verified on mainnet: their creation instructions reference no LP
+    /// mint at all. A `None` here means the LP-burn signal is simply unavailable
+    /// for that venue, which the watcher must treat as "unknown", not "unburnt".
+    pub lp_mint: Option<usize>,
     /// Accounts needed to later BUILD A SWAP against this pool. They are only
     /// available here — a swap cannot be constructed from the pool address
     /// alone. Indices come from the same verified creation layouts.
@@ -178,7 +278,7 @@ impl Dex {
                 quote_mint: 9,
                 base_vault: 10,
                 quote_vault: 11,
-                lp_mint: 7,
+                lp_mint: Some(7),
                 amm_config: Some(13),
                 observation: None,
                 open_orders: Some(6),
@@ -192,7 +292,7 @@ impl Dex {
                 quote_mint: 5,
                 base_vault: 10,
                 quote_vault: 11,
-                lp_mint: 6,
+                lp_mint: Some(6),
                 amm_config: Some(1),
                 observation: Some(13),
                 open_orders: None,
@@ -206,13 +306,82 @@ impl Dex {
                 quote_mint: 4,
                 base_vault: 9,
                 quote_vault: 10,
-                lp_mint: 5,
+                lp_mint: Some(5),
                 amm_config: Some(1), // global_config (index 2 is the CREATOR)
                 observation: None,
                 open_orders: None,
                 target_orders: None,
                 market: None,
                 min_accounts: 11,
+            },
+            // NOT YET VERIFIED against mainnet transactions. `min_accounts:
+            // usize::MAX` makes this layout impossible to match, so it cannot
+            // silently mis-parse a pool while the real indices are still being
+            // derived. Detection for these venues is separately gated off in
+            // `parser::is_pool_creation`.
+            // Meteora DBC LAUNCH (`initialize_virtual_pool_with_spl_token` /
+            // `_with_token2022`). Indices 0..=7 are IDENTICAL across both
+            // variants — the SPL form has 16 accounts and the Token-2022 form
+            // 14, differing only in trailing metadata accounts — so one layout
+            // serves both. Verified on mainnet: base_vault/quote_vault are real
+            // SPL token accounts owned by the DBC pool_authority, and the base
+            // mint is created in the same transaction.
+            //
+            // There is NO LP mint: liquidity lives in the bonding curve.
+            Dex::MeteoraDbc => PoolAccountLayout {
+                pool: 5,
+                base_mint: 3,
+                quote_mint: 4,
+                base_vault: 6,
+                quote_vault: 7,
+                lp_mint: None,
+                amm_config: None,
+                observation: None,
+                open_orders: None,
+                target_orders: None,
+                market: None,
+                min_accounts: 14,
+            },
+            // Meteora DLMM. Indices 0..=6 verified identical across all four
+            // creation variants. `reserve_x`/`reserve_y` are plain SPL token
+            // accounts owned by the pair PDA and dedicated to it, so a normal
+            // getTokenAccountBalance is a valid liquidity read — unlike DAMM v1,
+            // whose reserves live in shared, lending-deployed vaults.
+            //
+            // CAVEAT: the reserve is total liquidity across ALL bins, including
+            // bins far from the active price that are not tradable at spot. It
+            // is an upper bound on real depth, so the liquidity filter is
+            // looser here than on a constant-product venue.
+            //
+            // No LP mint: proven by exhaustively resolving every 32-byte window
+            // of a 904-byte LbPair account — the only mints present are X and Y.
+            Dex::MeteoraDlmm => PoolAccountLayout {
+                pool: 0,
+                base_mint: 2,
+                quote_mint: 3,
+                base_vault: 4,
+                quote_vault: 5,
+                lp_mint: None,
+                amm_config: None,
+                observation: None,
+                open_orders: None,
+                target_orders: None,
+                market: None,
+                min_accounts: 14,
+            },
+            Dex::MeteoraDammV2 => PoolAccountLayout {
+                pool: 0,
+                base_mint: 0,
+                quote_mint: 0,
+                base_vault: 0,
+                quote_vault: 0,
+                lp_mint: None,
+                amm_config: None,
+                observation: None,
+                open_orders: None,
+                target_orders: None,
+                market: None,
+                min_accounts: usize::MAX,
             },
         }
     }

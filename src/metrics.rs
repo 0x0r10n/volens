@@ -30,6 +30,10 @@ pub struct Metrics {
     pub lp_burned: AtomicU64,
     /// Follow-up found net buy inflow above the threshold — the volume signal.
     pub volume_confirmed: AtomicU64,
+    /// Buys by tracked ("smart money") wallets, before any conviction filter.
+    pub tracked_buys: AtomicU64,
+    /// Tokens that reached the conviction threshold and were announced.
+    pub conviction_signals: AtomicU64,
 }
 
 impl Metrics {
@@ -52,6 +56,8 @@ impl Metrics {
             rug_detected: self.rug_detected.load(Ordering::Relaxed),
             lp_burned: self.lp_burned.load(Ordering::Relaxed),
             volume_confirmed: self.volume_confirmed.load(Ordering::Relaxed),
+            tracked_buys: self.tracked_buys.load(Ordering::Relaxed),
+            conviction_signals: self.conviction_signals.load(Ordering::Relaxed),
         }
     }
 }
@@ -68,6 +74,8 @@ pub struct Snapshot {
     pub rug_detected: u64,
     pub lp_burned: u64,
     pub volume_confirmed: u64,
+    pub tracked_buys: u64,
+    pub conviction_signals: u64,
 }
 
 /// Spawn a task that logs a counter summary every `period`, plus deltas since
@@ -99,6 +107,8 @@ pub fn spawn_reporter(
                 rug_detected = cur.rug_detected,
                 lp_burned = cur.lp_burned,
                 volume_confirmed = cur.volume_confirmed,
+                tracked_buys = cur.tracked_buys,
+                conviction_signals = cur.conviction_signals,
                 tx_delta = cur.tx_seen.saturating_sub(prev.tx_seen),
                 detected_delta = cur.detected.saturating_sub(prev.detected),
                 "metrics"

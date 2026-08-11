@@ -96,6 +96,23 @@ pub fn logs_suggest_creation(dex: Dex, logs: &[String]) -> bool {
             .is_some_and(|r| r.starts_with("initialize2:") || r == "Instruction: Initialize2"),
         Dex::RaydiumCpmm => instruction_name(line) == Some("Initialize"),
         Dex::PumpSwap => instruction_name(line) == Some("CreatePool"),
+        // Log signature not yet confirmed on mainnet; nothing is pre-filtered
+        // in, so these venues stay dark until the real name is verified.
+        Dex::MeteoraDammV2 => false,
+        // Prefix match covers all four variants (…LbPair and …LbPair2). Two
+        // were read off real mainnet transactions; the other two follow the
+        // same Anchor PascalCase rule.
+        Dex::MeteoraDlmm => instruction_name(line).is_some_and(|n| {
+            n.starts_with("InitializeLbPair")
+                || n.starts_with("InitializeCustomizablePermissionlessLbPair")
+        }),
+        // Anchor logs the method name; all three DBC events are worth fetching.
+        Dex::MeteoraDbc => matches!(
+            instruction_name(line),
+            Some("InitializeVirtualPoolWithSplToken")
+                | Some("InitializeVirtualPoolWithToken2022")
+                | Some("MigrationDammV2")
+        ),
     })
 }
 
@@ -686,5 +703,34 @@ mod tests {
     fn conversion_rejects_malformed_input() {
         assert!(convert_transaction(&serde_json::json!({}), "sig").is_none());
         assert!(convert_transaction(&serde_json::json!({"slot":1}), "sig").is_none());
+    }
+
+    /// Live check that the WebSocket FALLBACK can actually connect on the
+    /// configured provider. Worth running whenever RPC_URL changes: the ws URL
+    /// is derived by scheme substitution, and a provider that serves JSON-RPC
+    /// happily may not accept the same credentials on an upgrade request. A
+    /// fallback that cannot connect is worse than none — the detector looks
+    /// healthy while detecting nothing.
+    ///
+    ///   cargo test -- --ignored --nocapture live_ws_fallback_connects
+    #[ignore = "hits the configured provider's WebSocket; needs RPC_URL"]
+    #[tokio::test]
+    async fn live_ws_fallback_connects() {
+        let _ = dotenvy::dotenv();
+        let rpc_url = std::env::var("RPC_URL").expect("RPC_URL");
+        let ws_url = std::env::var("RPC_WS_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| derive_ws_url(&rpc_url).expect("derive ws url"));
+
+        match tokio_tungstenite::connect_async(&ws_url).await {
+            Ok(_) => println!("websocket fallback OK"),
+            Err(e) => panic!(
+                "websocket fallback CANNOT connect: {e}\n\
+                 Set [grpc].fallback_to_websocket = false so a gRPC outage fails \
+                 loudly instead of silently demoting to a dead path, or set \
+                 RPC_WS_URL to the provider's real WebSocket endpoint."
+            ),
+        }
     }
 }

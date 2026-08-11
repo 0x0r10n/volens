@@ -4,23 +4,26 @@
 
 use crate::alerts::Alerter;
 use crate::config::Config;
+use crate::conviction::ConvictionTracker;
 use crate::dedup::Dedup;
 use crate::rpc::RpcClient;
 use crate::metrics::{self, Metrics};
 use crate::model::{Dex, PoolEvent};
 use crate::parser::{self, ParsedPool, TargetProgram};
 use crate::storage::Storage;
+use crate::wallets::{self, WalletBook};
 use crate::watcher;
 #[cfg(feature = "sniper")]
 use crate::sniper::Sniper;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
+use yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo;
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterTransactions, subscribe_update::UpdateOneof,
 };
@@ -37,6 +40,11 @@ fn redact(url: &str) -> String {
     format!("{host}/…")
 }
 
+/// Server-side filter labels. The provider echoes these back on each update so
+/// one stream can carry two independent subscriptions.
+const POOL_FILTER: &str = "pool_creations";
+const TRACKED_FILTER: &str = "tracked_wallets";
+
 pub struct Detector {
     cfg: Arc<Config>,
     alerter: Arc<Alerter>,
@@ -46,6 +54,12 @@ pub struct Detector {
     dedup: Dedup,
     metrics: Arc<Metrics>,
     rpc: Arc<RpcClient>,
+    /// Tracked "smart money" wallets. Empty when the feature is off, which is
+    /// also what suppresses the second subscription.
+    wallets: Arc<WalletBook>,
+    /// Guarded because buys arrive from the stream task and the window is
+    /// order-sensitive: two buys in the same slot must be counted in sequence.
+    conviction: Arc<Mutex<ConvictionTracker>>,
     #[cfg(feature = "sniper")]
     sniper: Arc<Sniper>,
 }
@@ -59,6 +73,27 @@ impl Detector {
         let rpc = Arc::new(RpcClient::new(&cfg.rpc));
         #[cfg(feature = "sniper")]
         let sniper = Arc::new(Sniper::new(cfg.sniper.clone(), rpc.clone(), &cfg.rpc)?);
+
+        // Load the tracked-wallet list up front so a bad path is a startup
+        // error, not a feature that silently never fires.
+        let wallets = if cfg.tracked.enabled {
+            let path = &cfg.tracked.wallets_path;
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading tracked wallets from {path}"))?;
+            let book = WalletBook::from_export_json(&raw)
+                .with_context(|| format!("parsing tracked wallets from {path}"))?;
+            anyhow::ensure!(!book.is_empty(), "{path} contained no usable addresses");
+            info!(wallets = book.len(), path = %path, "tracked wallets loaded");
+            book
+        } else {
+            WalletBook::default()
+        };
+
+        let conviction = ConvictionTracker::new(
+            Duration::from_secs(cfg.tracked.window_secs),
+            cfg.tracked.conviction_threshold,
+        );
+
         Ok(Self {
             cfg,
             alerter,
@@ -68,6 +103,8 @@ impl Detector {
             dedup,
             metrics: Arc::new(Metrics::default()),
             rpc,
+            wallets: Arc::new(wallets),
+            conviction: Arc::new(Mutex::new(conviction)),
             #[cfg(feature = "sniper")]
             sniper,
         })
@@ -342,15 +379,7 @@ impl Detector {
             Some(self.cfg.grpc.x_token.clone())
         };
 
-        let mut client = GeyserGrpcClient::build_from_shared(endpoint.clone())
-            .context("invalid gRPC endpoint")?
-            .x_token(token)
-            .context("invalid x-token")?
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .context("tls config")?
-            .connect()
-            .await
-            .with_context(|| format!("connecting to {endpoint}"))?;
+        let mut client = connect_geyser(&endpoint, token).await?;
 
         let request = self.build_request();
         // `_request_sink` must stay bound for the lifetime of this function:
@@ -371,6 +400,9 @@ impl Detector {
                         anyhow::bail!("stream ended");
                     };
                     let update = item.context("stream item error")?;
+                    // Which filter(s) matched. Captured before `update_oneof`
+                    // is moved out.
+                    let matched = update.filters.clone();
                     if let Some(UpdateOneof::Transaction(tx_update)) = update.update_oneof {
                         if let Some(tx_info) = tx_update.transaction.as_ref() {
                             // Skip vote txs and failed txs cheaply.
@@ -382,7 +414,22 @@ impl Detector {
                                     continue;
                                 }
                             }
-                            self.handle_transaction(tx_info, tx_update.slot).await;
+
+                            let tracked = matched.iter().any(|f| f == TRACKED_FILTER);
+                            let pools = matched.iter().any(|f| f == POOL_FILTER);
+
+                            // A transaction can match BOTH filters — a tracked
+                            // wallet buying into a pool it just created. Route
+                            // to each handler independently rather than picking
+                            // one. The `!tracked && !pools` arm covers a server
+                            // that does not label updates: without it an
+                            // unlabelled stream would be silently dropped.
+                            if pools || (!tracked && !pools) {
+                                self.handle_transaction(tx_info, tx_update.slot).await;
+                            }
+                            if tracked {
+                                self.handle_tracked(tx_info, tx_update.slot).await;
+                            }
                         }
                     }
                 }
@@ -402,7 +449,7 @@ impl Detector {
 
         let mut transactions = HashMap::new();
         transactions.insert(
-            "pool_creations".to_string(),
+            POOL_FILTER.to_string(),
             SubscribeRequestFilterTransactions {
                 vote: Some(false),
                 failed: Some(false),
@@ -413,6 +460,26 @@ impl Detector {
                 token_accounts: None,
             },
         );
+
+        // Second, independent filter on the SAME stream. Separate filter keys
+        // let the server label each update, so a transaction that is both a
+        // pool creation and a tracked-wallet buy arrives once per filter and is
+        // routed to both handlers rather than being classified as one or the
+        // other. Verified against a live endpoint at 700 addresses.
+        if !self.wallets.is_empty() {
+            transactions.insert(
+                TRACKED_FILTER.to_string(),
+                SubscribeRequestFilterTransactions {
+                    vote: Some(false),
+                    failed: Some(false),
+                    signature: None,
+                    account_include: self.wallets.addresses(),
+                    account_exclude: vec![],
+                    account_required: vec![],
+                    token_accounts: None,
+                },
+            );
+        }
 
         SubscribeRequest {
             accounts: HashMap::new(),
@@ -472,6 +539,92 @@ impl Detector {
             // gRPC stream and back-pressure the whole detector.
             self.spawn_finalize(event);
         }
+    }
+
+    /// Handle a transaction that touched a tracked wallet.
+    ///
+    /// Every buy is logged unconditionally — that log is the raw material for
+    /// scoring which wallets are actually worth following, and it can only be
+    /// collected forwards, never reconstructed later. Alerting is separate and
+    /// requires conviction.
+    async fn handle_tracked(&self, tx_info: &SubscribeUpdateTransactionInfo, slot: u64) {
+        let signature = parser::signature_b58(tx_info);
+        let buys = wallets::detect_buys(
+            tx_info,
+            &self.wallets,
+            self.cfg.tracked.min_buy_sol,
+            &signature,
+            slot,
+        );
+
+        for buy in buys {
+            self.metrics.incr(&self.metrics.tracked_buys);
+            debug!(
+                wallet = %buy.wallet_name,
+                mint = %buy.mint,
+                sol = buy.sol_spent,
+                "tracked buy"
+            );
+
+            if self.cfg.tracked.log_all_buys {
+                wallets::append_buy(&self.cfg.tracked.buys_path, &buy).await;
+            }
+
+            // Scoped so the lock is never held across an await. `record` is
+            // pure map work; the alert that may follow is network-bound.
+            let signal = {
+                let mut tracker = match self.conviction.lock() {
+                    Ok(t) => t,
+                    // A panic in another task poisoned the lock. The window is
+                    // rebuildable state, not something worth killing the
+                    // detector over.
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                tracker.record(
+                    &buy.mint,
+                    &buy.wallet,
+                    &buy.wallet_name,
+                    buy.sol_spent,
+                    Instant::now(),
+                )
+            };
+
+            if let Some(signal) = signal {
+                self.metrics.incr(&self.metrics.conviction_signals);
+                self.spawn_conviction_alert(signal);
+            }
+        }
+    }
+
+    /// Enrich a conviction signal and announce it.
+    ///
+    /// Enrichment is the same path pool detection uses — name/symbol plus mint
+    /// safety. Safety is reported rather than used to drop the alert: smart
+    /// money buying something with a live mint authority is itself worth
+    /// knowing, and in an alerts-only phase a silent drop teaches you nothing
+    /// about where the threshold belongs.
+    fn spawn_conviction_alert(&self, signal: crate::conviction::ConvictionSignal) {
+        let alerter = self.alerter.clone();
+        let rpc = self.rpc.clone();
+        let safety_enabled = self.cfg.safety.enabled;
+
+        tokio::spawn(async move {
+            // Metaplex PDA derivation needs the Solana crates, so a
+            // detector-only build reports the mint without a name rather than
+            // not building.
+            #[cfg(feature = "sniper")]
+            let meta = rpc.token_metadata(&signal.mint).await;
+            #[cfg(not(feature = "sniper"))]
+            let meta: Option<(String, String)> = None;
+
+            let mint_info = if safety_enabled {
+                rpc.mint_info(&signal.mint).await
+            } else {
+                None
+            };
+            let body = crate::conviction::render_signal(&signal, meta.as_ref(), mint_info.as_ref());
+            alerter.send_html(body).await;
+        });
     }
 
     /// Optionally read quote-side liquidity, apply the threshold, then emit.
@@ -722,7 +875,7 @@ pub fn classify_pool(
             base_vault: Some(p.base_vault.clone()),
             quote_vault: Some(p.quote_vault.clone()),
             swap_accounts: p.swap_accounts.clone(),
-            lp_mint: Some(p.lp_mint.clone()),
+            lp_mint: p.lp_mint.clone(),
             lp_supply_at_detection: None,
             token_name: None,
             token_symbol: None,
@@ -750,7 +903,7 @@ mod tests {
             quote_mint: quote_mint.into(),
             base_vault: "BASE_VAULT".into(),
             quote_vault: "QUOTE_VAULT".into(),
-            lp_mint: "LP_MINT".into(),
+            lp_mint: Some("LP_MINT".into()),
             swap_accounts: Default::default(),
         }
     }
@@ -817,6 +970,163 @@ mod tests {
         let ev = classify_pool(p, &quotes(), true, "sig", 1).unwrap();
         assert!(ev.new_token_mint.is_none());
     }
+
+    /// Live check that the configured Geyser endpoint actually connects,
+    /// authenticates, and delivers transactions. Run before trusting a new
+    /// provider — a silent fallback to WebSocket costs seconds per detection
+    /// and looks identical in the logs to a healthy run.
+    ///
+    ///   cargo test -- --ignored --nocapture live_grpc_connects
+    #[ignore = "hits a live Geyser endpoint; needs GRPC_ENDPOINT"]
+    #[tokio::test]
+    async fn live_grpc_connects() {
+        let _ = dotenvy::dotenv();
+        let endpoint = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
+        let token = std::env::var("GRPC_X_TOKEN").ok().filter(|t| !t.is_empty());
+        println!("endpoint: {}", redact(&endpoint));
+
+        let mut client = connect_geyser(&endpoint, token).await.expect("connect");
+
+        // Watch every enabled program so this also proves the filter is accepted.
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "probe".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: vec![Dex::RaydiumV4.program_id().to_string()],
+                ..Default::default()
+            },
+        );
+        let request = SubscribeRequest {
+            transactions,
+            commitment: Some(CommitmentLevel::Processed as i32),
+            ..Default::default()
+        };
+
+        let started = std::time::Instant::now();
+        let (_sink, mut stream) = client
+            .subscribe_with_request(Some(request))
+            .await
+            .expect("subscribe");
+        println!("subscribed in {:?}", started.elapsed());
+
+        // A live mainnet stream filtered to one busy program should produce
+        // traffic within seconds. Silence here means auth passed but the
+        // subscription is not actually delivering.
+        let mut seen = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while seen < 3 {
+            let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await else {
+                break;
+            };
+            let update = item.expect("stream item");
+            if let Some(UpdateOneof::Transaction(tx)) = update.update_oneof {
+                seen += 1;
+                println!("update {seen}: slot {}", tx.slot);
+            }
+        }
+        assert!(seen > 0, "connected but received no transactions in 20s");
+    }
+
+    /// Feasibility probe for smart-wallet tracking: can the provider accept a
+    /// large `account_include` filter, and what traffic does it produce?
+    ///
+    /// Both answers gate the design. If the provider caps the filter list we
+    /// need multiple subscriptions or client-side filtering; if 700 active
+    /// traders produce more traffic than the program stream, the wallet path
+    /// needs its own budget rather than sharing the detector's.
+    ///
+    ///   WALLETS=/path/to/wallets.txt \
+    ///     cargo test -- --ignored --nocapture live_grpc_wallet_filter_capacity
+    #[ignore = "hits a live Geyser endpoint; needs GRPC_ENDPOINT + WALLETS"]
+    #[tokio::test]
+    async fn live_grpc_wallet_filter_capacity() {
+        let _ = dotenvy::dotenv();
+        let endpoint = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
+        let token = std::env::var("GRPC_X_TOKEN").ok().filter(|t| !t.is_empty());
+        let path = std::env::var("WALLETS").expect("WALLETS=/path/to/wallets.txt");
+        let wallets: Vec<String> = std::fs::read_to_string(&path)
+            .expect("read wallet list")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+        println!("subscribing to {} wallets", wallets.len());
+
+        let mut client = connect_geyser(&endpoint, token).await.expect("connect");
+
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "wallets".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: wallets.clone(),
+                ..Default::default()
+            },
+        );
+        let request = SubscribeRequest {
+            transactions,
+            commitment: Some(CommitmentLevel::Processed as i32),
+            ..Default::default()
+        };
+
+        let (_sink, mut stream) = client
+            .subscribe_with_request(Some(request))
+            .await
+            .expect("subscribe REJECTED — provider caps the filter list");
+        println!("subscription ACCEPTED with {} addresses", wallets.len());
+
+        // Measure for 60s: how many wallet transactions per minute, and how
+        // many distinct wallets are actually active in that window.
+        let window = Duration::from_secs(60);
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + window;
+        let mut count = 0usize;
+        let mut first_at: Option<Duration> = None;
+
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let update = item.expect("stream item");
+            if let Some(UpdateOneof::Transaction(_)) = update.update_oneof {
+                count += 1;
+                first_at.get_or_insert_with(|| started.elapsed());
+            }
+        }
+
+        println!("--- {} wallet txs in {:?} ---", count, started.elapsed());
+        println!("first update after: {:?}", first_at);
+        println!("rate: {:.1} tx/min", count as f64 / started.elapsed().as_secs_f64() * 60.0);
+    }
+}
+
+/// Connect to a Geyser endpoint, applying TLS only when the URL asks for it.
+///
+/// Providers differ on transport: most terminate TLS (`https://host:443`), but
+/// some serve plaintext gRPC on a custom port (`http://host:4512`). Handing a
+/// TLS config to a plaintext endpoint makes tonic attempt a handshake the
+/// server never answers, and the failure surfaces as an opaque transport error
+/// with nothing pointing at the scheme — so the scheme decides, not a flag.
+async fn connect_geyser(
+    endpoint: &str,
+    token: Option<String>,
+) -> Result<GeyserGrpcClient> {
+    let mut builder = GeyserGrpcClient::build_from_shared(endpoint.to_string())
+        .context("invalid gRPC endpoint")?
+        .x_token(token)
+        .context("invalid x-token")?;
+
+    if endpoint.trim_start().starts_with("https://") {
+        builder = builder
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .context("tls config")?;
+    }
+
+    builder
+        .connect()
+        .await
+        .with_context(|| format!("connecting to {}", redact(endpoint)))
 }
 
 /// Log a one-line summary of which programs we watch. Small helper kept public
