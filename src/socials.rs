@@ -27,11 +27,17 @@ pub struct Socials {
     pub twitter: Option<String>,
     pub telegram: Option<String>,
     pub website: Option<String>,
+    /// Token image. Telegram fetches this URL itself when the alert is sent as
+    /// a photo, so it gets the same validation as every other link here.
+    pub image: Option<String>,
 }
 
 impl Socials {
     pub fn is_empty(&self) -> bool {
-        self.twitter.is_none() && self.telegram.is_none() && self.website.is_none()
+        self.twitter.is_none()
+            && self.telegram.is_none()
+            && self.website.is_none()
+            && self.image.is_none()
     }
 }
 
@@ -43,6 +49,8 @@ struct RawMetadata {
     telegram: String,
     #[serde(default)]
     website: String,
+    #[serde(default)]
+    image: String,
 }
 
 /// Fetch and validate a token's social links.
@@ -83,6 +91,7 @@ async fn fetch_inner(uri: &str) -> Option<Socials> {
         twitter: sanitize_url(&raw.twitter),
         telegram: sanitize_url(&raw.telegram),
         website: sanitize_url(&raw.website),
+        image: sanitize_url(&raw.image),
     };
     (!socials.is_empty()).then_some(socials)
 }
@@ -151,6 +160,8 @@ mod tests {
         assert!(Socials::default().is_empty());
         assert!(!Socials { twitter: Some("https://x.com/a".into()), ..Default::default() }
             .is_empty());
+        assert!(!Socials { image: Some("https://img/x.png".into()), ..Default::default() }
+            .is_empty());
     }
 
     /// A metadata document with blank fields yields nothing, not empty links.
@@ -162,6 +173,7 @@ mod tests {
             twitter: sanitize_url(&raw.twitter),
             telegram: sanitize_url(&raw.telegram),
             website: sanitize_url(&raw.website),
+            image: sanitize_url(&raw.image),
         };
         assert!(s.is_empty());
     }
@@ -191,5 +203,6 @@ mod tests {
         let s = fetch("https://md.sdfgsdfsdf.uk/metadata/XSlBuKP7").await;
         println!("{s:#?}");
         assert!(s.twitter.is_some(), "expected a twitter link");
+        assert!(s.image.is_some(), "expected an image url");
     }
 }

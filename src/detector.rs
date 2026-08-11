@@ -740,7 +740,11 @@ impl Detector {
                 socials.as_ref(),
                 tz,
             );
-            let message_id = alerter.send_html_returning_id(body, None).await;
+            // The image is decoration — `send_photo_html` falls back to a
+            // plain message if Telegram cannot fetch it, so a broken image
+            // never costs the call itself.
+            let image = socials.as_ref().and_then(|s| s.image.as_deref());
+            let message_id = alerter.send_photo_html(image, body, None).await;
 
             if track {
                 let (name, symbol) = meta.unwrap_or_default();

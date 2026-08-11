@@ -782,6 +782,7 @@ mod render_tests {
             twitter: Some("https://x.com/foo".into()),
             telegram: None,
             website: Some("https://example.com".into()),
+            image: None,
         };
         let out = render_signal(&signal(), None, None, Some(&market()), Some(&soc), 8);
         assert!(out.contains(r#"| <a href="https://x.com/foo">X</a>"#), "got:\n{out}");

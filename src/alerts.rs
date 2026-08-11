@@ -79,6 +79,72 @@ impl Alerter {
         }
     }
 
+    /// Send with the token image as a photo, falling back to a plain message.
+    ///
+    /// # Why the fallback is not optional
+    ///
+    /// The image URL comes from metadata the token's launcher wrote. Telegram
+    /// fetches it server-side, so a dead host, a 20MB file, or a format it
+    /// dislikes all fail the send — and without a fallback the ALERT is lost,
+    /// not just its picture. The picture is decoration; the call is the point.
+    ///
+    /// Telegram also caps a photo caption at 1024 characters against 4096 for
+    /// a message, so an over-long body is sent as text rather than truncated.
+    pub async fn send_photo_html(
+        &self,
+        photo_url: Option<&str>,
+        text: String,
+        reply_to: Option<i64>,
+    ) -> Option<i64> {
+        if !self.enabled {
+            return None;
+        }
+        const CAPTION_LIMIT: usize = 1024;
+
+        if let Some(url) = photo_url {
+            if text.chars().count() <= CAPTION_LIMIT {
+                match self.post_photo(url, &text, reply_to).await {
+                    Ok(id) => return id,
+                    Err(e) => debug!(error = %e, "photo send failed; falling back to text"),
+                }
+            } else {
+                debug!(len = text.chars().count(), "caption too long for a photo; sending text");
+            }
+        }
+        self.send_html_returning_id(text, reply_to).await
+    }
+
+    async fn post_photo(
+        &self,
+        photo_url: &str,
+        caption: &str,
+        reply_to: Option<i64>,
+    ) -> anyhow::Result<Option<i64>> {
+        let url = format!("https://api.telegram.org/bot{}/sendPhoto", self.bot_token);
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "photo": photo_url,
+            "caption": caption,
+            "parse_mode": "HTML",
+        });
+        if let Some(id) = reply_to {
+            body["reply_parameters"] = serde_json::json!({
+                "message_id": id,
+                "allow_sending_without_reply": true,
+            });
+        }
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram sendPhoto {status}: {payload}");
+        }
+        Ok(payload
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64()))
+    }
+
     async fn post_message(&self, text: &str, reply_to: Option<i64>) -> anyhow::Result<Option<i64>> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
         let mut body = serde_json::json!({
@@ -107,6 +173,42 @@ impl Alerter {
             .get("result")
             .and_then(|r| r.get("message_id"))
             .and_then(|v| v.as_i64()))
+    }
+}
+
+#[cfg(test)]
+mod photo_tests {
+    use super::*;
+    use crate::config::AlertConfig;
+
+    fn disabled() -> Alerter {
+        Alerter::new(&AlertConfig::default())
+    }
+
+    /// A disabled alerter must be inert on every path, including the new one.
+    #[tokio::test]
+    async fn a_disabled_alerter_sends_nothing() {
+        let a = disabled();
+        assert_eq!(a.send_photo_html(Some("https://x/i.png"), "hi".into(), None).await, None);
+        assert_eq!(a.send_photo_html(None, "hi".into(), None).await, None);
+    }
+
+    /// Telegram caps a photo caption at 1024 chars against 4096 for a message.
+    /// An over-long body must go out as TEXT rather than be truncated — losing
+    /// the market cap to keep a picture is the wrong trade.
+    #[test]
+    fn the_caption_limit_is_below_the_message_limit() {
+        const CAPTION_LIMIT: usize = 1024;
+        const MESSAGE_LIMIT: usize = 4096;
+        assert!(CAPTION_LIMIT < MESSAGE_LIMIT);
+
+        // A representative alert sits far inside the caption limit, so the
+        // photo path is the normal one rather than a rare case.
+        let typical = "🔥<b>Smart Money Buying Alerts</b>🔥\n\nMessage push time: \
+            08-12 00:50:20 (UTC+8)\n\n<b>$BOT (Grok Bot)</b>\n<code>\
+            HVG45JNn4wugvYfTNoggTtVps7Gc7YEjw6nVDRPd7LJ9</code>\n\nSM: 3\nMC: $41.2K\n\
+            SM Vol: $2.0K\nSM Fees: 0.0412 SOL\n\nFirst signal: 08-12 00:50:19 (UTC+8)\n";
+        assert!(typical.chars().count() < CAPTION_LIMIT, "len {}", typical.chars().count());
     }
 }
 

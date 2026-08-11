@@ -100,9 +100,22 @@ impl Jupiter {
             .await
             .context("jupiter quote request")?;
         let status = resp.status();
-        let raw: Value = resp.json().await.context("jupiter quote: bad JSON")?;
-        if !status.is_success() || raw.get("error").is_some() {
-            bail!("jupiter quote failed ({status}): {raw}");
+        // Read the body as TEXT first. Parsing JSON before checking the status
+        // turns a 429 (whose body is plain text) into "bad JSON: expected value
+        // at line 1 column 1" — which hides the status code and makes a rate
+        // limit look like a parser bug. The same blind spot cost a day on a
+        // 429ing RPC provider.
+        let body = resp.text().await.context("jupiter quote: unreadable body")?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(120).collect();
+            bail!("jupiter quote HTTP {status}: {snippet}");
+        }
+        let raw: Value = serde_json::from_str(&body).map_err(|e| {
+            let snippet: String = body.chars().take(120).collect();
+            anyhow::anyhow!("jupiter quote: non-JSON body ({e}): {snippet}")
+        })?;
+        if raw.get("error").is_some() {
+            bail!("jupiter quote failed: {raw}");
         }
         if raw.get("outAmount").is_none() {
             bail!("jupiter quote: no route found for this token: {raw}");

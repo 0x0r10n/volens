@@ -619,46 +619,58 @@ pub fn spawn_tracker(
             tracing::info!(tracking = batch.len(), total, retired, "re-pricing signals");
 
             let mut named = 0usize;
+
+            // The SOL rate is fetched ONCE per sweep, not per record. Per
+            // record it produced dozens of identical failures per second when
+            // the endpoint was unhappy, because a failed fetch caches nothing
+            // and every record retried it.
+            let sweep_rate = if batch.iter().any(|r| r.sol_usd_at_signal.is_none()) {
+                crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await
+            } else {
+                None
+            };
+
+            // Consecutive failures abort the sweep. A provider that is
+            // refusing us will refuse the next 119 too, and continuing only
+            // hammers it — which is precisely what keeps a rate limit engaged.
+            const ABORT_AFTER: usize = 8;
+            let mut consecutive_fail = 0usize;
+            let pace = std::time::Duration::from_millis(400);
+
             for rec in batch {
                 if *shutdown.borrow() {
                     return;
                 }
+                if consecutive_fail >= ABORT_AFTER {
+                    tracing::warn!(
+                        consecutive_fail,
+                        "aborting sweep: the quote endpoint is failing repeatedly. \
+                         Continuing would only hammer it — retrying next sweep."
+                    );
+                    break;
+                }
 
                 // Backfill an identity that was unresolvable at call time.
-                // Metadata can appear a few seconds AFTER the mint (and older
-                // records predate the Token-2022 lookup entirely), so a call
-                // announced as a bare mint gets its ticker on the next sweep
-                // instead of staying anonymous forever.
+                // Metadata can appear seconds AFTER the mint, and older records
+                // predate the Token-2022 lookup entirely, so a call announced
+                // as a bare mint gets its ticker here rather than never.
                 let name_is_really_the_mint =
                     rec.name == crate::conviction::short_mint(&rec.mint);
                 if rec.symbol.is_empty() || name_is_really_the_mint {
                     if let Some(m) = rpc.token_meta(&rec.mint).await {
-                        let name = crate::wallets::sanitize_token_label(&m.name)
-                            .unwrap_or_default();
-                        let symbol = crate::wallets::sanitize_token_label(&m.symbol)
-                            .unwrap_or_default();
+                        let name =
+                            crate::wallets::sanitize_token_label(&m.name).unwrap_or_default();
+                        let symbol =
+                            crate::wallets::sanitize_token_label(&m.symbol).unwrap_or_default();
                         if !name.is_empty() || !symbol.is_empty() {
                             store.set_identity(&rec.mint, &name, &symbol);
                             named += 1;
                         }
                     }
                 }
-                // The USD basis is captured once, at the call. If the SOL
-                // price happened to be unavailable in that instant the record
-                // has no USD figures for its whole life — which is exactly the
-                // "MC: unavailable" seen hours later. Recover it: the SOL side
-                // of the reference trade is exact, so only the rate is missing.
-                if rec.sol_usd_at_signal.is_none() {
-                    if let Some(rate) =
-                        crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await
-                    {
-                        store.set_sol_rate(&rec.mint, rate);
-                    }
+                if let (Some(rate), true) = (sweep_rate, rec.sol_usd_at_signal.is_none()) {
+                    store.set_sol_rate(&rec.mint, rate);
                 }
-
-                // Same backfill for decimals, which older records predate.
-                // Without it the live market cap stays unavailable for them
-                // forever and they silently keep using the scaled estimate.
                 if rec.decimals == 0 {
                     if let Some(info) = rpc.mint_info(&rec.mint).await {
                         if info.decimals > 0 {
@@ -667,49 +679,57 @@ pub fn spawn_tracker(
                     }
                 }
 
-                let Some(sol_now) = quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await
-                else {
+                let quoted =
+                    quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await;
+
+                // Pacing is applied on EVERY iteration, including failures.
+                // Putting it after an early `continue` meant a failing endpoint
+                // got hammered with no delay at all: 120 quotes in one second,
+                // which is a feedback loop that sustains its own rate limit.
+                if let Some(sol_now) = quoted {
+                    consecutive_fail = 0;
+                    priced += 1;
+                    if rec.reference_sol > 0.0 {
+                        let multiple = sol_now / rec.reference_sol;
+                        best = best.max(multiple);
+                        store.mark_checked(&rec.mint, multiple, now);
+
+                        if let Some(rung) = next_rung(
+                            multiple,
+                            rec.last_reported_multiple,
+                            &cfg.update_multiples,
+                        ) {
+                            // MEASURED, not scaled: `fdv_at_signal * multiple`
+                            // assumes constant supply, which is wrong for
+                            // exactly the tokens with a live mint authority.
+                            let fdv_now = live_fdv_usd(&rpc, &rec, sol_now, &cfg)
+                                .await
+                                .or_else(|| rec.fdv_usd_at_signal.map(|f| f * multiple));
+
+                            tracing::info!(
+                                mint = %rec.mint,
+                                multiple = format!("{multiple:.2}"),
+                                rung,
+                                "conviction signal update"
+                            );
+                            let body = render_update(
+                                &rec,
+                                multiple,
+                                fdv_now,
+                                now,
+                                cfg.display_utc_offset_hours,
+                            );
+                            alerter.send_html_returning_id(body, rec.message_id).await;
+                            store.mark_reported(&rec.mint, rung);
+                        }
+                    }
+                } else {
+                    consecutive_fail += 1;
                     routeless += 1;
-                    tracing::debug!(mint = %rec.mint, "no route; skipping update");
-                    continue;
-                };
-                if rec.reference_sol <= 0.0 {
-                    continue;
+                    tracing::debug!(mint = %rec.mint, "no route or quote failed");
                 }
 
-                let multiple = sol_now / rec.reference_sol;
-                priced += 1;
-                best = best.max(multiple);
-                store.mark_checked(&rec.mint, multiple, now);
-
-                let Some(rung) = next_rung(multiple, rec.last_reported_multiple, &cfg.update_multiples)
-                else {
-                    continue;
-                };
-
-                // MEASURED, not scaled. `fdv_at_signal * multiple` assumes
-                // supply is constant — but a token whose mint authority is
-                // still live can print more, and those are exactly the tokens
-                // worth being accurate about. Re-read supply and price it from
-                // the same quote that produced the multiple. Falls back to the
-                // scaled estimate only when a live read is unavailable.
-                let fdv_now = live_fdv_usd(&rpc, &rec, sol_now, &cfg)
-                    .await
-                    .or_else(|| rec.fdv_usd_at_signal.map(|f| f * multiple));
-
-                tracing::info!(
-                    mint = %rec.mint,
-                    multiple = format!("{multiple:.2}"),
-                    rung,
-                    "conviction signal update"
-                );
-                let body = render_update(&rec, multiple, fdv_now, now, cfg.display_utc_offset_hours);
-                alerter
-                    .send_html_returning_id(body, rec.message_id)
-                    .await;
-                store.mark_reported(&rec.mint, rung);
-
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                tokio::time::sleep(pace).await;
             }
 
             // Flush AFTER the sweep so observed multiples and any backfilled

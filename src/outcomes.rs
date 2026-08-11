@@ -259,10 +259,23 @@ pub fn spawn_sampler(
 
             let started = std::time::Instant::now();
             let (mut routed, mut dead) = (0usize, 0usize);
+            // A run of failures means the quote endpoint is refusing us, not
+            // that every token rugged at once. Stop rather than spend the whole
+            // batch on it — and, critically, do not mark those horizons
+            // sampled, or a provider outage would be recorded as a rug.
+            const ABORT_AFTER: usize = 8;
+            let mut consecutive_fail = 0usize;
 
             for (token, horizon) in batch {
                 if *shutdown.borrow() {
                     return;
+                }
+                if consecutive_fail >= ABORT_AFTER {
+                    tracing::warn!(
+                        consecutive_fail,
+                        "aborting outcome sweep: quote endpoint failing repeatedly"
+                    );
+                    break;
                 }
 
                 let sol_value = crate::signals::quote_sol_value(
@@ -274,11 +287,13 @@ pub fn spawn_sampler(
 
                 let (value, ok) = match sol_value {
                     Some(v) => {
+                        consecutive_fail = 0;
                         routed += 1;
                         (v, true)
                     }
                     // Unsellable IS the outcome — recorded, never skipped.
                     None => {
+                        consecutive_fail += 1;
                         dead += 1;
                         (0.0, false)
                     }
