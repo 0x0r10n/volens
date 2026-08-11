@@ -20,6 +20,15 @@ pub struct RpcClient {
     initial_delay: Duration,
 }
 
+/// On-chain token metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenMeta {
+    pub name: String,
+    pub symbol: String,
+    /// Off-chain JSON holding image + socials, when the token declares one.
+    pub uri: Option<String>,
+}
+
 /// Authority + extension state of an SPL mint. This is the rug-risk surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MintInfo {
@@ -410,10 +419,78 @@ impl RpcClient {
         base64::engine::general_purpose::STANDARD.decode(d).ok()
     }
 
-    /// Token `(name, symbol)` from the Metaplex metadata account, if it exists.
-    /// Enrichment only — a token with no metadata (or an unreadable one) simply
-    /// returns None and the caller falls back to the mint address. Costs one
-    /// getAccountInfo per call.
+    /// Token `(name, symbol)`, from wherever this mint actually keeps it.
+    ///
+    /// There are TWO places, and checking only one is how a token ends up
+    /// nameless:
+    ///
+    /// * **Token-2022** mints can embed metadata in the mint account itself via
+    ///   the `tokenMetadata` extension. No PDA, no second account.
+    /// * **Classic SPL** mints use a separate Metaplex metadata PDA.
+    ///
+    /// The extension is tried first because it needs no PDA derivation — which
+    /// means it also works in a build without the Solana crates, where the
+    /// Metaplex path is unavailable entirely.
+    pub async fn token_name_symbol(&self, mint: &str) -> Option<(String, String)> {
+        let m = self.token_meta(mint).await?;
+        Some((m.name, m.symbol))
+    }
+
+    /// Full on-chain token metadata, including the off-chain `uri` that holds
+    /// the socials.
+    pub async fn token_meta(&self, mint: &str) -> Option<TokenMeta> {
+        if let Some(found) = self.token_2022_metadata(mint).await {
+            return Some(found);
+        }
+        #[cfg(feature = "sniper")]
+        {
+            let pda = metaplex_metadata_pda(mint)?;
+            let data = self.account_data(&pda).await?;
+            let (name, symbol) = parse_metadata_name_symbol(&data)?;
+            // The Metaplex layout stores `uri` directly after `symbol`; the
+            // existing parser stops at symbol, so the uri is read separately.
+            return Some(TokenMeta { name, symbol, uri: parse_metadata_uri(&data) });
+        }
+        #[cfg(not(feature = "sniper"))]
+        None
+    }
+
+    /// Metadata carried on the mint account by the Token-2022 `tokenMetadata`
+    /// extension. `None` for classic SPL mints, which have no extensions.
+    pub async fn token_2022_metadata(&self, mint: &str) -> Option<TokenMeta> {
+        let body = json!({
+            "jsonrpc":"2.0","id":1,"method":"getAccountInfo",
+            "params":[mint, {"encoding":"jsonParsed","commitment": self.commitment}],
+        });
+        let resp: serde_json::Value = self
+            .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
+        let extensions = resp
+            .pointer("/result/value/data/parsed/info/extensions")?
+            .as_array()?;
+
+        for ext in extensions {
+            if ext.get("extension")?.as_str()? != "tokenMetadata" {
+                continue;
+            }
+            let state = ext.get("state")?;
+            let name = state.get("name")?.as_str()?.trim().to_string();
+            let symbol = state.get("symbol")?.as_str()?.trim().to_string();
+            // An extension present but blank is not a name.
+            if name.is_empty() && symbol.is_empty() {
+                return None;
+            }
+            let uri = state
+                .get("uri")
+                .and_then(|v| v.as_str())
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty());
+            return Some(TokenMeta { name, symbol, uri });
+        }
+        None
+    }
+
+    /// Token `(name, symbol)` from the Metaplex metadata account only.
+    /// Prefer [`Self::token_name_symbol`], which also covers Token-2022.
     #[cfg(feature = "sniper")]
     pub async fn token_metadata(&self, mint: &str) -> Option<(String, String)> {
         let pda = metaplex_metadata_pda(mint)?;
@@ -572,6 +649,39 @@ fn parse_metadata_name_symbol(data: &[u8]) -> Option<(String, String)> {
     Some((name, symbol))
 }
 
+/// The `uri` field of a Metaplex metadata account — it follows name and symbol
+/// in the same borsh string layout, so it is reached by skipping both.
+#[cfg(feature = "sniper")]
+fn parse_metadata_uri(data: &[u8]) -> Option<String> {
+    fn skip_string(data: &[u8], o: &mut usize) -> Option<()> {
+        let end = o.checked_add(4)?;
+        if end > data.len() {
+            return None;
+        }
+        let len = u32::from_le_bytes(data[*o..end].try_into().ok()?) as usize;
+        *o = end.checked_add(len)?;
+        (*o <= data.len()).then_some(())
+    }
+    let mut o = 1 + 32 + 32;
+    skip_string(data, &mut o)?; // name
+    skip_string(data, &mut o)?; // symbol
+
+    let end = o.checked_add(4)?;
+    if end > data.len() {
+        return None;
+    }
+    let len = u32::from_le_bytes(data[o..end].try_into().ok()?) as usize;
+    o = end;
+    if len > 256 || o.checked_add(len)? > data.len() {
+        return None;
+    }
+    let uri = String::from_utf8_lossy(&data[o..o + len])
+        .trim_end_matches('\0')
+        .trim()
+        .to_string();
+    (!uri.is_empty()).then_some(uri)
+}
+
 fn parse_mint_info(resp: &serde_json::Value) -> Option<MintInfo> {
     let parsed = resp.get("result")?.get("value")?.get("data")?.get("parsed")?;
     if parsed.get("type")?.as_str()? != "mint" {
@@ -597,6 +707,42 @@ fn parse_mint_info(resp: &serde_json::Value) -> Option<MintInfo> {
     }
 
     Some(MintInfo { mint_authority, freeze_authority, decimals, risky_extensions })
+}
+
+#[cfg(test)]
+mod live_meta_tests {
+    use super::*;
+
+    /// Live check that the Token-2022 metadata path works. This is the bug the
+    /// path exists for: CHEESECOIN keeps its name in the mint's `tokenMetadata`
+    /// extension, has no Metaplex PDA, and rendered as a bare mint until this
+    /// lookup was added.
+    ///
+    ///   cargo test -- --ignored --nocapture live_token_2022_metadata
+    #[ignore = "hits mainnet RPC; needs RPC_URL"]
+    #[tokio::test]
+    async fn live_token_2022_metadata() {
+        let _ = dotenvy::dotenv();
+        let url = std::env::var("RPC_URL").expect("RPC_URL");
+        let cfg = crate::config::RpcConfig {
+            url,
+            commitment: "confirmed".into(),
+            initial_delay_ms: 0,
+            retries: 2,
+            retry_delay_ms: 200,
+            ws_url: String::new(),
+        };
+        let rpc = RpcClient::new(&cfg);
+
+        let m = rpc
+            .token_meta("ER8j7VtBhK7BcnZd849u2ndKEcnMmvvtHsmsLD9JZ9LJ")
+            .await
+            .expect("Token-2022 metadata must resolve");
+        println!("{m:#?}");
+        assert_eq!(m.symbol, "CHEESE");
+        assert_eq!(m.name, "CHEESECOIN");
+        assert!(m.uri.is_some(), "uri carries the socials");
+    }
 }
 
 #[cfg(test)]

@@ -62,12 +62,11 @@ pub struct SignalRecord {
     pub supply: Option<f64>,
     pub wallets: Vec<String>,
     pub total_sol: f64,
-    /// Smart-money volume in USD at announce time. Stored rather than
-    /// recomputed: an update converting with a LATER SOL/USD rate would show a
-    /// different "Vol" for the same buys, which reads as the number moving when
-    /// only the yardstick did.
+    /// SOL/USD as of the call. Volume is converted with THIS rate forever, so
+    /// a change in "SM Vol" always means more buying — never a move in the
+    /// yardstick.
     #[serde(default)]
-    pub total_usd: Option<f64>,
+    pub sol_usd_at_signal: Option<f64>,
     /// Fees paid across every tracked buy of this token, including buys that
     /// arrived AFTER the call. Grows over the tracking window, which is what
     /// makes it worth repeating in an update.
@@ -76,6 +75,14 @@ pub struct SignalRecord {
     /// Highest ladder rung already announced. Starts at 1.0 (nothing reported).
     #[serde(default = "one")]
     pub last_reported_multiple: f64,
+    /// Most recent observed multiple, refreshed on every re-pricing sweep even
+    /// when no rung fires. Stored so `/calls` can answer instantly instead of
+    /// issuing a live quote per tracked signal.
+    #[serde(default = "one")]
+    pub last_multiple: f64,
+    /// When `last_multiple` was measured, so a stale figure can say so.
+    #[serde(default)]
+    pub last_checked_utc: Option<DateTime<Utc>>,
 }
 
 fn one() -> f64 {
@@ -150,17 +157,47 @@ impl SignalStore {
             .collect()
     }
 
-    /// Fold a later buy's fees into an already-announced token.
+    /// Fold a later buy into an already-announced token.
+    ///
+    /// A called token keeps being bought even though it has stopped being
+    /// announced. Without this, every figure except market cap would be frozen
+    /// at the moment of the call, and an update would repeat stale numbers
+    /// beside a live one.
     ///
     /// Not persisted per call: this fires on every tracked buy, and appending a
     /// JSONL line each time would grow the file without bound for an active
-    /// token. The next `mark_reported` writes the accumulated total, and a
-    /// restart losing a partial sum costs a slightly low fee figure, not
-    /// correctness.
-    pub fn add_fees(&self, mint: &str, sol: f64) {
-        if let Some(rec) = self.lock().get_mut(mint) {
-            rec.total_fees_sol += sol;
+    /// token. The next `mark_reported` writes the accumulated totals, and a
+    /// restart losing a partial sum costs slightly low figures, not correctness.
+    pub fn add_buy(&self, mint: &str, wallet: &str, sol: f64, fees: f64) {
+        let mut map = self.lock();
+        let Some(rec) = map.get_mut(mint) else { return };
+        rec.total_sol += sol;
+        rec.total_fees_sol += fees;
+        // Distinct by ADDRESS. Display names repeat (several are just a
+        // shortened address), so counting by name would undercount buyers.
+        if !rec.wallets.iter().any(|w| w == wallet) {
+            rec.wallets.push(wallet.to_string());
         }
+    }
+
+    /// Record the latest observed multiple. Called on every sweep, including
+    /// the vast majority that announce nothing.
+    ///
+    /// Deliberately NOT persisted per call: this fires every few minutes for
+    /// every tracked signal, and a JSONL line each time would bloat the file.
+    /// A restart loses only the freshness of a number recomputed next sweep.
+    pub fn mark_checked(&self, mint: &str, multiple: f64, at: DateTime<Utc>) {
+        if let Some(rec) = self.lock().get_mut(mint) {
+            rec.last_multiple = multiple;
+            rec.last_checked_utc = Some(at);
+        }
+    }
+
+    /// Every tracked signal, best performer first. For `/calls`.
+    pub fn ranked(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
+        let mut out = self.active(now, max_age_secs);
+        out.sort_by(|a, b| b.last_multiple.total_cmp(&a.last_multiple));
+        out
     }
 
     /// Raise the highest-reported rung after an update is posted.
@@ -266,15 +303,25 @@ pub fn render_update(
         )),
     }
 
-    if let Some(vol) = rec.total_usd {
-        s.push_str(&format!("Vol: {}\n", crate::conviction::format_usd(vol)));
+    // Recomputed from the CURRENT running total at the call's own SOL/USD
+    // rate: a change here always means more buying, never a move in FX.
+    s.push_str(&format!("SM: {}\n", rec.wallets.len()));
+    match rec.sol_usd_at_signal {
+        Some(rate) if rate > 0.0 => s.push_str(&format!(
+            "SM Vol: {}\n",
+            crate::conviction::format_usd(rec.total_sol * rate)
+        )),
+        _ => s.push_str(&format!(
+            "SM Vol: {}\n",
+            crate::conviction::format_sol(rec.total_sol)
+        )),
     }
     // Includes buys that landed AFTER the call — the token kept being bought
     // even though it stopped being announced, so this is a live number rather
     // than a copy of the one in the original message.
     if rec.total_fees_sol > 0.0 {
         s.push_str(&format!(
-            "Fees: {}\n",
+            "SM Fees: {}\n",
             crate::conviction::format_sol(rec.total_fees_sol)
         ));
     }
@@ -377,6 +424,8 @@ pub fn spawn_tracker(
                 }
 
                 let multiple = sol_now / rec.reference_sol;
+                store.mark_checked(&rec.mint, multiple, now);
+
                 let Some(rung) = next_rung(multiple, rec.last_reported_multiple, &cfg.update_multiples)
                 else {
                     continue;
@@ -424,8 +473,10 @@ mod tests {
             supply: Some(1_000_000_000.0),
             wallets: vec!["W1".into(), "W2".into()],
             total_sol: 3.5,
-            total_usd: Some(262.5),
+            sol_usd_at_signal: Some(75.0),
             total_fees_sol: 0.042,
+            last_multiple: 1.0,
+            last_checked_utc: None,
             last_reported_multiple: 1.0,
         }
     }
@@ -473,6 +524,72 @@ mod tests {
         assert_eq!(next_rung(2.0, 1.0, &[]), None);
     }
 
+    /// The behaviour the operator actually cares about: a token climbing over
+    /// time produces one update per rung, in order, with none repeated and none
+    /// skipped-then-missed. Simulated against the SHIPPING ladder rather than a
+    /// test-local one, so a config change that breaks the sequence fails here.
+    #[test]
+    fn a_climbing_token_fires_each_rung_once_in_order() {
+        let ladder = crate::config::TrackedConfig::default().update_multiples;
+        // A plausible run: drifts up, crosses 1.5x, stalls, then legs up.
+        let path = [
+            1.02, 1.31, 1.49, // nothing yet
+            1.52, 1.61, 1.88, // 1.5x
+            2.04, 2.31, // 2x
+            2.55, // 2.5x
+            2.9, 3.4, // 3x
+            3.9, 4.2,  // 4x
+            12.0, // gaps past 5, 7.5, 10 -> reports 10x only
+        ];
+
+        let mut reported = 1.0;
+        let mut fired = Vec::new();
+        for m in path {
+            if let Some(rung) = next_rung(m, reported, &ladder) {
+                fired.push(rung);
+                reported = rung;
+            }
+        }
+
+        assert_eq!(
+            fired,
+            vec![1.5, 2.0, 2.5, 3.0, 4.0, 10.0],
+            "each rung once, in order; a gap reports only the highest cleared"
+        );
+    }
+
+    /// A token that peaks and falls back must not re-fire rungs on the way
+    /// down, nor when it climbs back through ground it already reported.
+    #[test]
+    fn a_retrace_produces_no_updates() {
+        let ladder = crate::config::TrackedConfig::default().update_multiples;
+        let mut reported = 1.0;
+        let mut fired = 0;
+        for m in [1.6, 2.1, 1.4, 0.7, 1.9, 2.05] {
+            if let Some(rung) = next_rung(m, reported, &ladder) {
+                fired += 1;
+                reported = rung;
+            }
+        }
+        assert_eq!(fired, 2, "only the 1.5x and 2x crossings, never a repeat");
+    }
+
+    /// Every rung in the shipping ladder must be reachable — a duplicate or an
+    /// out-of-order entry would silently make one unreportable.
+    #[test]
+    fn shipping_ladder_is_sorted_and_unique() {
+        let ladder = crate::config::TrackedConfig::default().update_multiples;
+        assert!(ladder.len() >= 5);
+        assert!(ladder[0] > 1.0, "a rung at or below 1x would fire on any call");
+        for w in ladder.windows(2) {
+            assert!(w[1] > w[0], "ladder must ascend strictly: {:?}", ladder);
+        }
+        // Each rung is individually reachable from a fresh signal.
+        for &r in &ladder {
+            assert_eq!(next_rung(r, 1.0, &ladder), Some(r), "rung {r} unreachable");
+        }
+    }
+
     #[test]
     fn store_roundtrips_through_disk() {
         let dir = std::env::temp_dir().join(format!("volens-sig-{}", std::process::id()));
@@ -517,6 +634,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The reported bug: market cap moved in updates while volume, buyer count
+    /// and fees stayed frozen at the values from the original call.
+    #[test]
+    fn later_buys_move_volume_buyers_and_fees() {
+        let dir = std::env::temp_dir().join(format!("volens-acc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("acc.jsonl");
+        let p = path.to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&path);
+
+        let store = SignalStore::load(&p);
+        let mut r = rec("MINT_A");
+        r.total_sol = 3.5;
+        r.total_fees_sol = 0.042;
+        r.wallets = vec!["W1".into(), "W2".into(), "W3".into()];
+        store.insert(r);
+
+        // A fourth wallet buys after the call.
+        store.add_buy("MINT_A", "W4", 2.0, 0.008);
+        // …and W2 buys again: volume and fees grow, the buyer count does not.
+        store.add_buy("MINT_A", "W2", 1.0, 0.004);
+
+        let after = &store.active(Utc::now(), 86_400)[0];
+        assert!((after.total_sol - 6.5).abs() < 1e-9, "volume: {}", after.total_sol);
+        assert!((after.total_fees_sol - 0.054).abs() < 1e-9, "fees: {}", after.total_fees_sol);
+        assert_eq!(after.wallets.len(), 4, "a repeat buyer must not raise the count");
+
+        // And the rendered update carries the NEW figures, not the old ones.
+        let out = render_update(after, 2.0, Some(80_000.0), Utc::now(), 8);
+        assert!(out.contains("SM: 4"), "got:\n{out}");
+        assert!(out.contains("SM Vol: $488"), "6.5 SOL x $75:\n{out}");
+        assert!(out.contains("SM Fees: 0.0540 SOL"), "got:\n{out}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An untracked mint must not create a phantom record.
+    #[test]
+    fn add_buy_on_an_unknown_mint_is_a_no_op() {
+        let store = SignalStore::load("/nonexistent/volens-noop.jsonl");
+        store.add_buy("NEVER_CALLED", "W1", 5.0, 0.01);
+        assert_eq!(store.len(), 0);
+    }
+
     #[test]
     fn retire_drops_only_the_old() {
         let store = SignalStore::load("/nonexistent/volens-test-signals.jsonl");
@@ -531,6 +691,54 @@ mod tests {
         assert!(!store.contains("OLD"));
     }
 
+    /// Live proof of the pricing half: re-quote every signal actually recorded
+    /// on this machine and report the multiple. The rung logic is unit-tested
+    /// above; this is the part that can only be verified against a real router.
+    ///
+    ///   cargo test -- --ignored --nocapture live_reprice_recorded_signals
+    #[ignore = "hits the Jupiter API; needs recorded signals"]
+    #[tokio::test]
+    async fn live_reprice_recorded_signals() {
+        let path = std::env::var("SIGNALS_PATH")
+            .unwrap_or_else(|_| "conviction_signals.jsonl".to_string());
+        let store = SignalStore::load(&path);
+        let recs = store.active(Utc::now(), 7 * 86_400);
+        if recs.is_empty() {
+            println!("no recorded signals at {path}; nothing to re-price");
+            return;
+        }
+
+        let cfg = crate::config::TrackedConfig::default();
+        let jup = crate::jupiter::Jupiter::new(&cfg.jupiter_base_url);
+        let mut priced = 0;
+        let mut routeless = 0;
+
+        for rec in recs.iter().take(10) {
+            let ticker = if rec.symbol.is_empty() { &rec.mint[..8] } else { &rec.symbol };
+            match quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await {
+                Some(now_sol) if rec.reference_sol > 0.0 => {
+                    let m = now_sol / rec.reference_sol;
+                    let rung = next_rung(m, rec.last_reported_multiple, &cfg.update_multiples);
+                    println!(
+                        "{ticker:>10}  paid {:.4} SOL -> worth {now_sol:.4} SOL  = {}  rung={rung:?}",
+                        rec.reference_sol,
+                        format_multiple(m)
+                    );
+                    priced += 1;
+                }
+                _ => {
+                    // The normal shape of a rug: no route out.
+                    println!("{ticker:>10}  no route (unsellable or dead)");
+                    routeless += 1;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+
+        println!("\npriced {priced}, routeless {routeless}");
+        assert!(priced + routeless > 0);
+    }
+
     #[test]
     fn update_renders_both_fdv_ends() {
         let out = render_update(&rec("M"), 2.4, Some(98_900.0), Utc::now(), 8);
@@ -538,7 +746,8 @@ mod tests {
 
         assert!(out.contains("🚀 <b>$CRED x2.4</b> 🚀"), "got:\n{out}");
         assert!(out.contains("💵 MC: $41.2K → $98.9K in"), "got:\n{out}");
-        assert!(out.contains("Vol: $262"), "got:\n{out}");
+        assert!(out.contains("SM Vol: $262"), "got:\n{out}");
+        assert!(out.contains("SM: 2"), "buyer count must be current:\n{out}");
         assert!(out.contains("(UTC+8)"));
     }
 
@@ -551,7 +760,7 @@ mod tests {
         assert!(!out.contains("MINT"), "mint repeated:\n{out}");
         assert!(!out.contains("W1"), "wallets repeated:\n{out}");
         assert!(!out.contains("First signal"), "redundant in a reply:\n{out}");
-        assert!(out.lines().count() <= 6, "too many lines:\n{out}");
+        assert!(out.lines().count() <= 7, "too many lines:\n{out}");
     }
 
     /// Elapsed time is coarse on purpose: "in 2m" is the useful fact, and

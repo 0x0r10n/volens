@@ -30,6 +30,7 @@ mod rpc;
 #[cfg(feature = "sniper")]
 mod sniper;
 mod signals;
+mod socials;
 mod storage;
 #[cfg(feature = "sniper")]
 mod submit;
@@ -120,7 +121,12 @@ async fn main() -> Result<()> {
             detector.metrics(),
             cfg.sniper.kill_switch_file.clone(),
         )?
-        .with_rpc(detector.rpc());
+        .with_rpc(detector.rpc())
+        .with_signals(
+            detector.signals(),
+            cfg.tracked.track_for_secs,
+            cfg.tracked.display_utc_offset_hours,
+        );
         #[cfg(feature = "sniper")]
         let bot = bot
             .with_wallet_store(store.clone())

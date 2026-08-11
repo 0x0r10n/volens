@@ -72,6 +72,10 @@ pub struct ConvictionSignal {
     pub total_sol: f64,
     /// `(name, sol)` oldest first — the order they arrived.
     pub buyers: Vec<(String, f64)>,
+    /// Buyer ADDRESSES, for counting. Names are display labels and can repeat
+    /// across wallets (several are just a shortened address), so counting
+    /// distinct buyers by name would undercount.
+    pub buyer_addresses: Vec<String>,
     /// Seconds between the first and latest buy. Small values mean the
     /// convergence was tight, which is the stronger version of the signal.
     pub spread_secs: u64,
@@ -191,6 +195,7 @@ impl ConvictionTracker {
             distinct_buyers: entries.len(),
             total_sol: entries.iter().map(|b| b.sol).sum(),
             buyers: entries.iter().map(|b| (b.name.clone(), b.sol)).collect(),
+            buyer_addresses: entries.iter().map(|b| b.wallet.clone()).collect(),
             spread_secs: now.duration_since(oldest.0).as_secs(),
             first_seen_utc: oldest.1,
             total_fees_sol: entries.iter().map(|b| b.fees).sum(),
@@ -257,13 +262,12 @@ impl MarketSnapshot {
 
 /// Render a conviction signal as a Telegram HTML message.
 ///
-/// # Deliberately sparse
+/// # Buyers are listed
 ///
-/// No wallet names, no per-wallet amounts. Two reasons beyond brevity: the
-/// names are third-party labels of real traders and publishing who bought what
-/// is a different act from publishing that smart money bought, and a list of
-/// names buries the three numbers that actually drive a decision. `SM` is the
-/// count alone.
+/// Name and size per wallet, in SOL. Names are third-party labels of real
+/// traders, so they pass through `wallets::sanitize_name` at load time before
+/// they can reach a chat. Sizes stay in SOL because that is the unit the trade
+/// was placed in — a wallet chose to spend 25 SOL, not $1,900.
 ///
 /// # The mint is shown in FULL, not shortened
 ///
@@ -284,19 +288,22 @@ pub fn render_signal(
     meta: Option<&(String, String)>,
     mint_info: Option<&crate::rpc::MintInfo>,
     market: Option<&MarketSnapshot>,
+    socials: Option<&crate::socials::Socials>,
     tz_offset_hours: i32,
 ) -> String {
-    let (name, symbol) = match meta {
-        Some((n, sym)) if !n.is_empty() => (html_escape(n), html_escape(sym)),
-        _ => (short_mint(&signal.mint), String::new()),
-    };
-    let title = if symbol.is_empty() {
-        format!("${name}")
-    } else {
-        format!("${name} (${symbol})")
+    // The `$` prefix is a TICKER sigil, so it is only ever applied to a real
+    // symbol. When metadata is missing, prefixing the shortened mint produces
+    // `$ER8j7V…9JZ9LJ`, which reads as a ticker and is not one — worse than
+    // saying nothing, because it looks like an answer.
+    let title = match meta {
+        Some((n, sym)) if !sym.is_empty() => {
+            format!("${} ({})", html_escape(sym), html_escape(n))
+        }
+        Some((n, _)) if !n.is_empty() => html_escape(n),
+        _ => short_mint(&signal.mint),
     };
 
-    let mut s = String::from("<b>Smart Money Buying Alerts</b>\n\n");
+    let mut s = String::from("🔥<b>Smart Money Buying Alerts</b>🔥\n\n");
     s.push_str(&format!(
         "Message push time: {}\n\n",
         stamp(Utc::now(), tz_offset_hours)
@@ -306,17 +313,24 @@ pub fn render_signal(
     s.push_str(&format!("<b>{title}</b>\n"));
     s.push_str(&format!("<code>{}</code>\n\n", signal.mint));
 
+    for (name, sol) in &signal.buyers {
+        s.push_str(&format!("• {name} — {sol:.2} SOL\n"));
+    }
+    s.push('\n');
+
     s.push_str(&format!("SM: {}\n", signal.distinct_buyers));
     if let Some(mc) = market.and_then(|m| m.fdv_usd) {
         s.push_str(&format!("MC: {}\n", format_usd(mc)));
     }
-    s.push_str(&format!("Vol: {}\n", money(signal.total_sol, market)));
+    // "SM" prefixes make the scope explicit: this is what the tracked wallets
+    // spent, not the token's market-wide volume or lifetime fees.
+    s.push_str(&format!("SM Vol: {}\n", money(signal.total_sol, market)));
     // Fees stay in SOL even though everything above is USD. They are a cost of
     // execution, and execution is priced in SOL — a tip is chosen in lamports,
     // not dollars. Converting it would obscure the number the trader actually
     // set.
     if signal.total_fees_sol > 0.0 {
-        s.push_str(&format!("Fees: {}\n", format_sol(signal.total_fees_sol)));
+        s.push_str(&format!("SM Fees: {}\n", format_sol(signal.total_fees_sol)));
     }
 
     // Safety stays an annotation, and only when it has something to say. A
@@ -333,6 +347,19 @@ pub fn render_signal(
         "\n<a href=\"https://dexscreener.com/solana/{}\">Chart</a>",
         signal.mint
     ));
+    // Socials sit on the same line as the chart, separated by pipes, so a
+    // token with three links does not add three lines to every alert.
+    if let Some(soc) = socials {
+        if let Some(u) = &soc.twitter {
+            s.push_str(&format!(" | <a href=\"{u}\">X</a>"));
+        }
+        if let Some(u) = &soc.telegram {
+            s.push_str(&format!(" | <a href=\"{u}\">TG</a>"));
+        }
+        if let Some(u) = &soc.website {
+            s.push_str(&format!(" | <a href=\"{u}\">Web</a>"));
+        }
+    }
     s
 }
 
@@ -710,6 +737,7 @@ mod render_tests {
                 ("OGANT".into(), 25.288),
             ],
             spread_secs: 143,
+            buyer_addresses: vec!["W1".into(), "W2".into(), "W3".into()],
             total_fees_sol: 0.0412,
             first_seen_utc: DateTime::from_timestamp(1_786_326_266, 0).unwrap(),
         }
@@ -718,11 +746,11 @@ mod render_tests {
     #[test]
     fn renders_a_readable_alert() {
         let meta = ("Credible".to_string(), "CRED".to_string());
-        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), 8);
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
         println!("\n--- initial alert ---\n{out}\n");
 
         assert!(out.contains("🧠 <b>SMART MONEY DETECTED</b>"));
-        assert!(out.contains("$Credible ($CRED)"));
+        assert!(out.contains("$CRED (Credible)"), "ticker first, name in parens:\n{out}");
         assert!(out.contains("SM: 3"));
         assert!(out.contains("MC: $41.2K"));
         assert!(out.contains("Vol: $2.0K"));
@@ -731,29 +759,29 @@ mod render_tests {
         assert!(!out.to_lowercase().contains("tap to copy"));
     }
 
-    /// The spam this format exists to remove: individual traders and their
-    /// sizes must not appear.
+    /// Buyers and their sizes are part of the call: who bought is the signal,
+    /// not just how many.
     #[test]
-    fn no_wallet_names_or_individual_amounts_are_published() {
+    fn buyers_are_listed_with_sol_sizes() {
         let meta = ("Credible".to_string(), "CRED".to_string());
-        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), 8);
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
 
         for name in ["Silver", "Ratwiz", "OGANT"] {
-            assert!(!out.contains(name), "{name} leaked into the alert:\n{out}");
+            assert!(out.contains(name), "{name} missing from the alert:\n{out}");
         }
-        // The per-buy figures are gone; only the aggregate survives.
-        assert!(!out.contains("$74"), "individual size leaked:\n{out}");
-        assert!(!out.contains("25.29"), "individual size leaked:\n{out}");
+        // Sizes stay in SOL — the unit the trade was placed in.
+        assert!(out.contains("• OGANT — 25.29 SOL"), "got:\n{out}");
+        assert!(out.contains("• Ratwiz — 0.12 SOL"), "got:\n{out}");
     }
 
     /// Times are local trading time, not UTC.
     #[test]
     fn timestamps_render_in_the_configured_offset() {
-        let out = render_signal(&signal(), None, None, Some(&market()), 8);
+        let out = render_signal(&signal(), None, None, Some(&market()), None, 8);
         assert!(out.contains("(UTC+8)"), "got:\n{out}");
         assert!(out.contains("First signal:"));
 
-        let west = render_signal(&signal(), None, None, Some(&market()), -5);
+        let west = render_signal(&signal(), None, None, Some(&market()), None, -5);
         assert!(west.contains("(UTC-5)"), "got:\n{west}");
     }
 
@@ -767,7 +795,7 @@ mod render_tests {
             decimals: 6,
             risky_extensions: vec![],
         };
-        let out = render_signal(&signal(), None, Some(&clean), Some(&market()), 8);
+        let out = render_signal(&signal(), None, Some(&clean), Some(&market()), None, 8);
         assert!(!out.contains("⚠️"), "a clean mint must not add a line:\n{out}");
 
         let risky = MintInfo {
@@ -776,20 +804,52 @@ mod render_tests {
             decimals: 6,
             risky_extensions: vec![],
         };
-        let out = render_signal(&signal(), None, Some(&risky), Some(&market()), 8);
+        let out = render_signal(&signal(), None, Some(&risky), Some(&market()), None, 8);
         assert!(out.contains("⚠️"), "a live authority must be flagged:\n{out}");
     }
 
+    /// The `$` sigil marks a TICKER. Without metadata there is no ticker, and
+    /// prefixing the shortened mint produced `$ER8j7V…9JZ9LJ` — which reads as
+    /// a ticker, is not one, and is worse than saying nothing because it looks
+    /// like an answer.
     #[test]
-    fn a_nameless_token_still_renders() {
-        let out = render_signal(&signal(), None, None, Some(&market()), 8);
-        assert!(out.contains("$8Ky9Bm…W1abcd"), "got:\n{out}");
+    fn a_nameless_token_shows_the_mint_without_a_ticker_sigil() {
+        let out = render_signal(&signal(), None, None, Some(&market()), None, 8);
+        assert!(out.contains("8Ky9Bm…W1abcd"), "got:\n{out}");
+        assert!(!out.contains("$8Ky9Bm"), "a mint must not wear a $ sigil:\n{out}");
+    }
+
+    /// A token with a name but no symbol shows the name, still unsigiled.
+    #[test]
+    fn a_symbolless_token_shows_its_name() {
+        let meta = ("Cheesecoin".to_string(), String::new());
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
+        assert!(out.contains("Cheesecoin"), "got:\n{out}");
+        assert!(!out.contains("$Cheesecoin"), "no symbol means no ticker:\n{out}");
+    }
+
+    /// Socials render inline with the chart link, and only when present.
+    #[test]
+    fn socials_render_beside_the_chart_link() {
+        let none = render_signal(&signal(), None, None, Some(&market()), None, 8);
+        assert!(none.contains(">Chart</a>"));
+        assert!(!none.contains(">X</a>"), "no socials means no pipes:\n{none}");
+
+        let soc = crate::socials::Socials {
+            twitter: Some("https://x.com/foo".into()),
+            telegram: None,
+            website: Some("https://example.com".into()),
+        };
+        let out = render_signal(&signal(), None, None, Some(&market()), Some(&soc), 8);
+        assert!(out.contains(r#"| <a href="https://x.com/foo">X</a>"#), "got:\n{out}");
+        assert!(out.contains(r#"| <a href="https://example.com">Web</a>"#), "got:\n{out}");
+        assert!(!out.contains(">TG</a>"), "absent link must not render:\n{out}");
     }
 
     /// A missing SOL/USD rate must not blank the volume figure.
     #[test]
     fn without_a_rate_it_falls_back_to_sol_rather_than_dropping_figures() {
-        let out = render_signal(&signal(), None, None, None, 8);
+        let out = render_signal(&signal(), None, None, None, None, 8);
         assert!(out.contains("Vol: 26.39 SOL"), "got:\n{out}");
         assert!(!out.contains("MC:"), "no rate means no market cap to claim");
     }
@@ -798,14 +858,14 @@ mod render_tests {
     #[test]
     fn a_zero_rate_is_treated_as_unknown() {
         let broken = MarketSnapshot { sol_usd: 0.0, price_usd: None, fdv_usd: None };
-        let out = render_signal(&signal(), None, None, Some(&broken), 8);
+        let out = render_signal(&signal(), None, None, Some(&broken), None, 8);
         assert!(out.contains("26.39 SOL"), "got:\n{out}");
     }
 
     #[test]
     fn token_name_from_chain_is_escaped() {
         let evil = ("<b>PUMP</b>".to_string(), "X".to_string());
-        let out = render_signal(&signal(), Some(&evil), None, Some(&market()), 8);
+        let out = render_signal(&signal(), Some(&evil), None, Some(&market()), None, 8);
         assert!(out.contains("&lt;b&gt;PUMP&lt;/b&gt;"));
         assert!(!out.contains("<b>PUMP</b>"));
     }

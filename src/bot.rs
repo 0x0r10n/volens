@@ -65,6 +65,11 @@ pub struct Bot {
     /// For `/balance`. Absent means the command reports "not configured"
     /// rather than a misleading zero.
     rpc: Option<Arc<crate::rpc::RpcClient>>,
+    /// Announced smart-money calls, for `/calls`. `None` disables the command.
+    signals: Option<Arc<crate::signals::SignalStore>>,
+    /// How long a call stays tracked — bounds what `/calls` lists.
+    track_for_secs: u64,
+    tz_offset_hours: i32,
     /// Local wallet store for `/new-wallet`, `/wallets`, `/use`. `None` disables
     /// those commands (reports not configured).
     #[cfg(feature = "sniper")]
@@ -128,6 +133,9 @@ impl Bot {
             started: Instant::now(),
             offset: 0,
             rpc: None,
+            signals: None,
+            track_for_secs: 86_400,
+            tz_offset_hours: 0,
             #[cfg(feature = "sniper")]
             store: None,
             #[cfg(feature = "sniper")]
@@ -137,6 +145,19 @@ impl Bot {
             #[cfg(feature = "sniper")]
             export_ttl_secs: 60,
         })
+    }
+
+    /// Attach the announced-signal store, enabling `/calls`.
+    pub fn with_signals(
+        mut self,
+        signals: Arc<crate::signals::SignalStore>,
+        track_for_secs: u64,
+        tz_offset_hours: i32,
+    ) -> Self {
+        self.signals = Some(signals);
+        self.track_for_secs = track_for_secs;
+        self.tz_offset_hours = tz_offset_hours;
+        self
     }
 
     /// Path to the sniper audit log, enabling `/positions` cost basis + PnL.
@@ -578,6 +599,7 @@ impl Bot {
             Command::Balance => self.render_balance().await,
             Command::Deposit => self.render_deposit(),
             Command::Positions => self.render_positions().await,
+            Command::Calls => self.render_calls(),
             Command::Settings => self.render_settings(),
             Command::NewWallet(name) => self.render_new_wallet(name.as_deref()),
             Command::Wallets => self.render_wallets().await,
@@ -1444,6 +1466,74 @@ impl Bot {
         }
     }
 
+    /// Performance of announced smart-money calls, best first.
+    ///
+    /// Answers from stored state rather than live quotes: the performance
+    /// tracker re-prices every signal on its own schedule and records the
+    /// result, so this is instant. Issuing a quote per call here would take
+    /// seconds and risk rate-limiting the tracker that produces the updates.
+    /// The cost is that figures are as fresh as the last sweep, which the
+    /// header states rather than hides.
+    ///
+    /// The mint is rendered in FULL inside a code block. Telegram copies a code
+    /// block's literal contents, so a shortened mint would copy a truncated
+    /// string that is not a valid address — the tap would appear to work and
+    /// silently yield something unusable.
+    fn render_calls(&self) -> String {
+        let Some(signals) = self.signals.as_ref() else {
+            return "<b>Calls</b>\n\nSmart-money tracking is not enabled.".to_string();
+        };
+
+        let now = chrono::Utc::now();
+        let calls = signals.ranked(now, self.track_for_secs as i64);
+        if calls.is_empty() {
+            return format!(
+                "<b>Calls</b>\n\nNo calls in the last {}.",
+                format_window(self.track_for_secs)
+            );
+        }
+
+        let runners = calls.iter().filter(|c| c.last_multiple >= 2.0).count();
+        let mut s = format!(
+            "🔥 <b>Calls</b> — {} tracked, {runners} at 2x+\n\n",
+            calls.len()
+        );
+
+        // Bounded: a day of calls can run to dozens and Telegram truncates a
+        // message at 4096 characters, which would cut the list mid-entry.
+        const MAX: usize = 25;
+        for c in calls.iter().take(MAX) {
+            let ticker = if !c.symbol.is_empty() {
+                format!("${}", c.symbol)
+            } else if !c.name.is_empty() {
+                c.name.clone()
+            } else {
+                crate::conviction::short_mint(&c.mint)
+            };
+            let age = format_window(now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64);
+            s.push_str(&format!(
+                "{}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n",
+                ticker,
+                format_multiple(c.last_multiple),
+                c.mint
+            ));
+        }
+        if calls.len() > MAX {
+            s.push_str(&format!("\n…and {} more\n", calls.len() - MAX));
+        }
+
+        match calls.iter().filter_map(|c| c.last_checked_utc).max() {
+            Some(t) => s.push_str(&format!(
+                "\nPrices as of {}",
+                crate::conviction::stamp(t, self.tz_offset_hours)
+            )),
+            // Distinct from a stale price: nothing has been re-priced at all
+            // yet, so every multiple shown is still the 1.0 it was born with.
+            None => s.push_str("\n<i>Not yet re-priced — multiples are provisional.</i>"),
+        }
+        s
+    }
+
     /// List stored wallets with addresses and (if RPC available) balances,
     /// marking the active one. Addresses only — never key material.
     async fn render_wallets(&self) -> String {
@@ -1575,6 +1665,7 @@ impl Bot {
          commands.\n\n\
          <b>Buttons:</b> Status · Settings · Balance · Positions · Wallets · \
          New wallet · Metrics · Halt.\n\n\
+         <code>/calls</code> — how announced smart-money calls have performed.\n\n\
          <b>Typed (take a value):</b>\n\
          • <code>/use name</code> — pick the active wallet (applies on restart)\n\
          • <code>/size 0.01</code> — set the trade size (SOL)\n\
@@ -1747,6 +1838,7 @@ impl Bot {
                 {"command": "deposit", "description": "show the wallet address to send funds to"},
                 {"command": "withdraw", "description": "send SOL out: /withdraw 0.5 <address> (armed only)"},
                 {"command": "positions", "description": "token positions + PnL"},
+                {"command": "calls", "description": "smart-money calls and how they performed"},
                 {"command": "wallets", "description": "list wallets, mark active"},
                 {"command": "new_wallet", "description": "create a wallet to fund (optional name)"},
                 {"command": "use", "description": "pick active wallet: /use name"},
@@ -1802,6 +1894,24 @@ impl DeleteHandle {
             Err(e) => warn!(error = %e, "COULD NOT DELETE key message — delete it manually"),
         }
     }
+}
+
+/// `2m`, `3h`, `1d4h` — coarse age for a call list.
+fn format_window(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3600),
+        s => {
+            let (d, h) = (s / 86_400, (s % 86_400) / 3600);
+            if h == 0 { format!("{d}d") } else { format!("{d}d{h}h") }
+        }
+    }
+}
+
+/// `x2.4`, `x13` — matches the alert vocabulary.
+fn format_multiple(m: f64) -> String {
+    if m >= 10.0 { format!("x{m:.0}") } else { format!("x{m:.1}") }
 }
 
 /// Parse `<amount_SOL> <address>` from a `/withdraw`. Ok((sol, address)) or a
@@ -1897,6 +2007,8 @@ enum Command {
     Balance,
     Deposit,
     Positions,
+    /// Performance of announced smart-money calls.
+    Calls,
     Settings,
     NewWallet(Option<String>),
     Wallets,
@@ -1932,6 +2044,7 @@ impl Command {
             "balance" => Command::Balance,
             "deposit" | "receive" | "fund" => Command::Deposit,
             "positions" | "pnl" | "pos" => Command::Positions,
+            "calls" | "signals" | "sm" => Command::Calls,
             "settings" | "config" | "params" => Command::Settings,
             "new-wallet" | "newwallet" | "new_wallet" | "genwallet" => Command::NewWallet(arg),
             "wallets" | "list" => Command::Wallets,
@@ -1957,6 +2070,7 @@ impl Command {
             Command::Balance => "balance",
             Command::Deposit => "deposit",
             Command::Positions => "positions",
+            Command::Calls => "calls",
             Command::Settings => "settings",
             Command::NewWallet(_) => "new-wallet",
             Command::Wallets => "wallets",

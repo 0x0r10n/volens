@@ -180,6 +180,11 @@ impl Detector {
         }
     }
 
+    /// Announced calls, for the command bot's `/calls`.
+    pub fn signals(&self) -> Arc<crate::signals::SignalStore> {
+        self.signals.clone()
+    }
+
     /// Shared RPC client, for the command bot's `/balance`.
     pub fn rpc(&self) -> Arc<RpcClient> {
         self.rpc.clone()
@@ -615,11 +620,11 @@ impl Detector {
             };
 
             // A token stops announcing once called, but its buys keep
-            // arriving. Folding them in means an update reports fees as they
-            // stand now, not a frozen copy of the call.
-            if buy.fees_sol > 0.0 {
-                self.signals.add_fees(&buy.mint, buy.fees_sol);
-            }
+            // arriving. Folding them in means an update reports volume, buyers
+            // and fees as they stand NOW — otherwise every figure except market
+            // cap would be frozen at the moment of the call.
+            self.signals
+                .add_buy(&buy.mint, &buy.wallet, buy.sol_spent, buy.fees_sol);
 
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
@@ -652,13 +657,24 @@ impl Detector {
         let tz = self.cfg.tracked.display_utc_offset_hours;
 
         tokio::spawn(async move {
-            // Metaplex PDA derivation needs the Solana crates, so a
-            // detector-only build reports the mint without a name rather than
-            // not building.
-            #[cfg(feature = "sniper")]
-            let meta = rpc.token_metadata(&signal.mint).await;
-            #[cfg(not(feature = "sniper"))]
-            let meta: Option<(String, String)> = None;
+            // Covers BOTH metadata homes — the Token-2022 extension on the
+            // mint and the classic Metaplex PDA. Checking only Metaplex is why
+            // Token-2022 launches were rendering as a bare mint.
+            let meta_full = rpc.token_meta(&signal.mint).await;
+            let meta = meta_full
+                .as_ref()
+                .map(|m| (m.name.clone(), m.symbol.clone()));
+
+            // Socials live in an off-chain JSON the launcher controls, so this
+            // is one extra hostile-input fetch. It only runs on a call, never
+            // on the hot path.
+            let socials = match meta_full.as_ref().and_then(|m| m.uri.as_deref()) {
+                Some(uri) => {
+                    let s = crate::socials::fetch(uri).await;
+                    (!s.is_empty()).then_some(s)
+                }
+                None => None,
+            };
 
             let mint_info = if safety_enabled {
                 rpc.mint_info(&signal.mint).await
@@ -682,6 +698,7 @@ impl Detector {
                 meta.as_ref(),
                 mint_info.as_ref(),
                 market.as_ref(),
+                socials.as_ref(),
                 tz,
             );
             let message_id = alerter.send_html_returning_id(body, None).await;
@@ -698,11 +715,13 @@ impl Detector {
                     reference_tokens_raw: reference.token_amount_raw,
                     fdv_usd_at_signal: fdv_usd,
                     supply,
-                    wallets: signal.buyers.iter().map(|(n, _)| n.clone()).collect(),
+                    wallets: signal.buyer_addresses.clone(),
                     total_sol: signal.total_sol,
                     total_fees_sol: signal.total_fees_sol,
-                    total_usd: market.map(|m| m.usd(signal.total_sol)),
+                    sol_usd_at_signal: market.map(|m| m.sol_usd),
                     last_reported_multiple: 1.0,
+                    last_multiple: 1.0,
+                    last_checked_utc: None,
                 });
             }
         });
@@ -803,11 +822,11 @@ impl Detector {
 
             // Resolve the token NAME from on-chain metadata. Only here, after
             // the pool has passed every filter, so we never pay for a name on a
-            // pool we drop. One getAccountInfo; a token with no metadata just
-            // stays nameless. Sniper-only: PDA derivation needs the Solana crates.
-            #[cfg(feature = "sniper")]
+            // pool we drop. Checks both homes — the Token-2022 extension on the
+            // mint and the Metaplex PDA — because a growing share of launches
+            // are Token-2022 and carry no PDA at all.
             if let Some(mint) = event.new_token_mint.clone() {
-                if let Some((name, symbol)) = rpc.token_metadata(&mint).await {
+                if let Some((name, symbol)) = rpc.token_name_symbol(&mint).await {
                     event.token_name = (!name.is_empty()).then_some(name);
                     event.token_symbol = (!symbol.is_empty()).then_some(symbol);
                 }

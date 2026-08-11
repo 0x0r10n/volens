@@ -289,7 +289,10 @@ track_for_secs = 86400
 # forever on a token drifting upward, or is set so high you never hear about a
 # 3x. A token that gaps straight to 12x announces the 10x rung once, not four
 # messages climbing the ladder.
-update_multiples = [2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
+# 1.5 = +50%. Steps stay tight early, where a call is still actionable, and
+# widen later, where the difference between 47x and 50x is not news. Each rung
+# fires AT MOST ONCE, so the whole life of a token is bounded at 13 updates.
+update_multiples = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0]
 # Jupiter swap API root, used only for valuation quotes here.
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
 # Timezone for rendered timestamps. Alerts are read by people in one place at a
