@@ -28,7 +28,24 @@
 //! Every entry point takes `now`. A tracker that called `Instant::now()`
 //! internally could only be tested by sleeping, so the window logic — the part
 //! most likely to be wrong — would go untested.
+//!
+//! # Two clocks, deliberately
+//!
+//! Windowing uses [`Instant`] (monotonic) and display uses [`DateTime<Utc>`]
+//! (wall clock). They are not interchangeable: an NTP correction can move the
+//! wall clock backwards, which would make a buy appear to arrive before one
+//! recorded earlier and corrupt the window. A monotonic clock cannot be
+//! rendered as a timestamp, so both are carried.
+//!
+//! # Performance tracking
+//!
+//! A signal is only half the story; how it performed lives in [`crate::signals`].
+//! The entry price is **captured at announce time and never re-derived** — a
+//! later read returns the price now, not the price then, so it is unrecoverable
+//! after the fact. `Detector::spawn_conviction_alert` persists the triggering
+//! buy as the reference trade for that reason.
 
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -37,8 +54,12 @@ use std::time::{Duration, Instant};
 struct Buyer {
     wallet: String,
     name: String,
+    /// Monotonic — drives the window.
     at: Instant,
+    /// Wall clock — drives the rendered timestamp only.
+    at_utc: DateTime<Utc>,
     sol: f64,
+    fees: f64,
 }
 
 /// Emitted when a new distinct wallet pushes a token to or past the threshold.
@@ -54,6 +75,14 @@ pub struct ConvictionSignal {
     /// Seconds between the first and latest buy. Small values mean the
     /// convergence was tight, which is the stronger version of the signal.
     pub spread_secs: u64,
+    /// When the FIRST tracked buy of this token landed, in UTC. Not the time
+    /// the threshold was crossed — the point is how long the accumulation has
+    /// been running, which is what tells you whether you are early.
+    pub first_seen_utc: DateTime<Utc>,
+    /// Fees paid across the buys that produced this signal — network, tips and
+    /// platform. NOT the token's all-time trading fees: volens sees 700
+    /// wallets, not the whole market.
+    pub total_fees_sol: f64,
 }
 
 /// Tracks recent tracked-wallet buys per token.
@@ -65,40 +94,63 @@ pub struct ConvictionTracker {
     window: Duration,
     threshold: usize,
     tokens: HashMap<String, Vec<Buyer>>,
+    /// Tokens already announced, and when. A token fires ONCE: further buyers
+    /// arriving after the threshold are not new information, they are the same
+    /// call getting louder, and re-posting them is what makes a channel
+    /// unreadable. Entries expire so a token that goes quiet for a day and
+    /// genuinely re-accumulates can call again.
+    announced: HashMap<String, Instant>,
+    announce_ttl: Duration,
     /// Full sweeps are O(tokens); doing one per buy would be wasteful at 861
     /// tx/min. Sweep when the map has grown instead.
     sweep_at: usize,
 }
 
 impl ConvictionTracker {
-    pub fn new(window: Duration, threshold: usize) -> Self {
+    pub fn new(window: Duration, threshold: usize, announce_ttl: Duration) -> Self {
         Self {
             window,
             // A threshold below 2 makes every single buy a "signal", which is
             // the noise this module exists to remove.
             threshold: threshold.max(2),
             tokens: HashMap::new(),
+            announced: HashMap::new(),
+            announce_ttl,
             sweep_at: 512,
         }
     }
 
-    /// Record a buy. Returns a signal only when this buy is from a wallet not
-    /// already counted for this token AND the distinct count is at or above the
-    /// threshold.
+    /// Record a buy. Returns a signal only on the buy that FIRST takes a token
+    /// to the threshold, and only once per token per `announce_ttl`.
     ///
-    /// Returning `None` for a repeat buy by an already-counted wallet is the
-    /// deliberate part: it stops one wallet scaling into a position from
-    /// re-alerting the same token indefinitely.
+    /// Two separate suppressions, both deliberate:
+    ///
+    /// * a wallet already counted for this token never counts twice — scaling
+    ///   into a position is one opinion, not two;
+    /// * a token already announced never announces again — the 4th and 5th
+    ///   buyer are the same call getting louder, not a new one.
     pub fn record(
         &mut self,
         mint: &str,
         wallet: &str,
         name: &str,
         sol: f64,
+        fees: f64,
         now: Instant,
+        now_utc: DateTime<Utc>,
     ) -> Option<ConvictionSignal> {
         if self.tokens.len() > self.sweep_at {
             self.sweep(now);
+        }
+
+        // Already called. Keep recording buys so the window stays accurate,
+        // but say nothing.
+        let ttl = self.announce_ttl;
+        if let Some(at) = self.announced.get(mint) {
+            if now.duration_since(*at) < ttl {
+                return None;
+            }
+            self.announced.remove(mint);
         }
 
         let window = self.window;
@@ -114,20 +166,34 @@ impl ConvictionTracker {
             wallet: wallet.to_string(),
             name: name.to_string(),
             at: now,
+            at_utc: now_utc,
             sol,
+            fees,
         });
 
         if entries.len() < self.threshold {
             return None;
         }
 
-        let oldest = entries.iter().map(|b| b.at).min().unwrap_or(now);
+        // The oldest entry by the MONOTONIC clock, then read its wall-clock
+        // stamp. Picking the minimum `at_utc` directly would let a backwards
+        // clock correction nominate the wrong buy as "first".
+        let oldest = entries
+            .iter()
+            .min_by_key(|b| b.at)
+            .map(|b| (b.at, b.at_utc))
+            .unwrap_or((now, now_utc));
+
+        self.announced.insert(mint.to_string(), now);
+
         Some(ConvictionSignal {
             mint: mint.to_string(),
             distinct_buyers: entries.len(),
             total_sol: entries.iter().map(|b| b.sol).sum(),
             buyers: entries.iter().map(|b| (b.name.clone(), b.sol)).collect(),
-            spread_secs: now.duration_since(oldest).as_secs(),
+            spread_secs: now.duration_since(oldest.0).as_secs(),
+            first_seen_utc: oldest.1,
+            total_fees_sol: entries.iter().map(|b| b.fees).sum(),
         })
     }
 
@@ -159,6 +225,8 @@ impl ConvictionTracker {
             buyers.retain(|b| now.duration_since(b.at) < window);
             !buyers.is_empty()
         });
+        let ttl = self.announce_ttl;
+        self.announced.retain(|_, at| now.duration_since(*at) < ttl);
     }
 
     pub fn tracked_tokens(&self) -> usize {
@@ -166,69 +234,222 @@ impl ConvictionTracker {
     }
 }
 
+/// USD context for one token, resolved once per signal.
+///
+/// Every figure in an alert is converted with the SAME `sol_usd` rate. Fetching
+/// it per line would let two numbers in one message disagree — a total that
+/// does not match the sum of its parts reads as a bug even when both rates were
+/// individually correct.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MarketSnapshot {
+    pub sol_usd: f64,
+    /// USD per token, from the reference fill.
+    pub price_usd: Option<f64>,
+    /// Fully-diluted valuation in USD.
+    pub fdv_usd: Option<f64>,
+}
+
+impl MarketSnapshot {
+    pub fn usd(&self, sol: f64) -> f64 {
+        sol * self.sol_usd
+    }
+}
+
 /// Render a conviction signal as a Telegram HTML message.
 ///
-/// Buyer names are already sanitized at load time (`wallets::sanitize_name`),
-/// so they are safe to interpolate here. The mint goes in a `<code>` block
-/// because Telegram copies a code block's literal contents on tap.
+/// # Deliberately sparse
+///
+/// No wallet names, no per-wallet amounts. Two reasons beyond brevity: the
+/// names are third-party labels of real traders and publishing who bought what
+/// is a different act from publishing that smart money bought, and a list of
+/// names buries the three numbers that actually drive a decision. `SM` is the
+/// count alone.
+///
+/// # The mint is shown in FULL, not shortened
+///
+/// Telegram copies a `<code>` block's **literal contents**. A shortened
+/// `8Ky9Bm…abcd` would therefore copy a truncated string that is not a valid
+/// address — the tap appears to work and silently yields something useless.
+/// No markup displays short text while copying a longer value, so the full
+/// mint is rendered. It needs no caption: a code block is self-evidently
+/// tappable.
+///
+/// # Denomination
+///
+/// Money is USD. SOL is a moving yardstick, so a size in SOL is not comparable
+/// across alerts. When the rate is unknown the figure falls back to SOL rather
+/// than vanishing, and the unit is always labelled.
 pub fn render_signal(
     signal: &ConvictionSignal,
     meta: Option<&(String, String)>,
     mint_info: Option<&crate::rpc::MintInfo>,
+    market: Option<&MarketSnapshot>,
+    tz_offset_hours: i32,
 ) -> String {
-    let mut s = String::new();
-
-    let title = match meta {
-        Some((name, symbol)) if !name.is_empty() => {
-            format!("{} ({})", html_escape(name), html_escape(symbol))
-        }
-        _ => "Unknown token".to_string(),
+    let (name, symbol) = match meta {
+        Some((n, sym)) if !n.is_empty() => (html_escape(n), html_escape(sym)),
+        _ => (short_mint(&signal.mint), String::new()),
+    };
+    let title = if symbol.is_empty() {
+        format!("${name}")
+    } else {
+        format!("${name} (${symbol})")
     };
 
+    let mut s = String::from("<b>Smart Money Buying Alerts</b>\n\n");
     s.push_str(&format!(
-        "🧠 <b>SMART MONEY</b> — {} wallets\n<b>{}</b>\n",
-        signal.distinct_buyers, title
+        "Message push time: {}\n\n",
+        stamp(Utc::now(), tz_offset_hours)
     ));
+
+    s.push_str("🧠 <b>SMART MONEY DETECTED</b>\n");
+    s.push_str(&format!("<b>{title}</b>\n"));
     s.push_str(&format!("<code>{}</code>\n\n", signal.mint));
 
-    for (name, sol) in &signal.buyers {
-        s.push_str(&format!("• {name} — {sol:.2} SOL\n"));
+    s.push_str(&format!("SM: {}\n", signal.distinct_buyers));
+    if let Some(mc) = market.and_then(|m| m.fdv_usd) {
+        s.push_str(&format!("MC: {}\n", format_usd(mc)));
+    }
+    s.push_str(&format!("Vol: {}\n", money(signal.total_sol, market)));
+    // Fees stay in SOL even though everything above is USD. They are a cost of
+    // execution, and execution is priced in SOL — a tip is chosen in lamports,
+    // not dollars. Converting it would obscure the number the trader actually
+    // set.
+    if signal.total_fees_sol > 0.0 {
+        s.push_str(&format!("Fees: {}\n", format_sol(signal.total_fees_sol)));
+    }
+
+    // Safety stays an annotation, and only when it has something to say. A
+    // "clean" line on every alert is noise; a risk flag is not.
+    if let Some(warning) = risk_flag(mint_info) {
+        s.push_str(&format!("{warning}\n"));
     }
 
     s.push_str(&format!(
-        "\n<b>{:.2} SOL</b> total, within {}\n",
-        signal.total_sol,
-        format_spread(signal.spread_secs)
+        "\nFirst signal: {}\n",
+        stamp(signal.first_seen_utc, tz_offset_hours)
     ));
-
-    // Safety is advisory here, not a gate. An explicit "unverified" is kept
-    // distinct from "clean": failing to read a mint is not evidence of safety.
-    match mint_info {
-        Some(info) => {
-            let mut flags = Vec::new();
-            if info.mint_authority.is_some() {
-                flags.push("mint authority LIVE");
-            }
-            if info.freeze_authority.is_some() {
-                flags.push("freeze authority LIVE");
-            }
-            if !info.risky_extensions.is_empty() {
-                flags.push("risky extensions");
-            }
-            if flags.is_empty() {
-                s.push_str("✅ mint clean\n");
-            } else {
-                s.push_str(&format!("⚠️ <b>{}</b>\n", flags.join(", ")));
-            }
-        }
-        None => s.push_str("❓ mint safety unverified\n"),
-    }
-
     s.push_str(&format!(
-        "\n<a href=\"https://dexscreener.com/solana/{}\">chart</a>",
+        "\n<a href=\"https://dexscreener.com/solana/{}\">Chart</a>",
         signal.mint
     ));
     s
+}
+
+/// `08-11 15:58:38 (UTC+8)` — local trading time, not UTC.
+pub fn stamp(t: DateTime<Utc>, offset_hours: i32) -> String {
+    let sign = if offset_hours < 0 { "-" } else { "+" };
+    let offset = chrono::FixedOffset::east_opt(offset_hours * 3600)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("utc"));
+    format!(
+        "{} (UTC{sign}{})",
+        t.with_timezone(&offset).format("%m-%d %H:%M:%S"),
+        offset_hours.abs()
+    )
+}
+
+/// `8Ky9Bm…W1abcd`, for a token with no on-chain name.
+pub fn short_mint(mint: &str) -> String {
+    if mint.len() <= 12 {
+        return mint.to_string();
+    }
+    format!("{}…{}", &mint[..6], &mint[mint.len() - 6..])
+}
+
+/// A one-line risk warning, or `None` when there is nothing to warn about.
+///
+/// Returns `None` for BOTH a clean mint and an unreadable one, because neither
+/// is a warning — but they are not the same thing, and the caller must not
+/// treat silence as a safety claim.
+fn risk_flag(mint_info: Option<&crate::rpc::MintInfo>) -> Option<String> {
+    let info = mint_info?;
+    let mut flags = Vec::new();
+    if info.mint_authority.is_some() {
+        flags.push("mint authority live");
+    }
+    if info.freeze_authority.is_some() {
+        flags.push("freeze authority live");
+    }
+    if !info.risky_extensions.is_empty() {
+        flags.push("risky extensions");
+    }
+    (!flags.is_empty()).then(|| format!("⚠️ {}", flags.join(", ")))
+}
+
+/// SOL with precision that survives small numbers. A tip of 0.0004 SOL must
+/// not render as `0.00 SOL`.
+pub fn format_sol(v: f64) -> String {
+    if v >= 1.0 {
+        format!("{v:.2} SOL")
+    } else if v >= 0.001 {
+        format!("{v:.4} SOL")
+    } else {
+        format!("{v:.6} SOL")
+    }
+}
+
+/// A SOL amount rendered in USD, falling back to SOL when no rate is known.
+fn money(sol: f64, market: Option<&MarketSnapshot>) -> String {
+    match market {
+        Some(m) if m.sol_usd > 0.0 => format_usd(m.usd(sol)),
+        _ => format!("{sol:.2} SOL"),
+    }
+}
+
+/// Token prices span many orders of magnitude, so a fixed precision is wrong at
+/// one end or the other: `$0.00` for a memecoin, `$1.00000000` for a major.
+/// Precision follows the magnitude, and anything below a billionth falls back
+/// to scientific rather than printing a wall of zeros.
+pub fn format_price_usd(p: f64) -> String {
+    match p.abs() {
+        v if v == 0.0 => "$0".to_string(),
+        v if v >= 1.0 => format!("${p:.4}"),
+        v if v >= 0.01 => format!("${p:.5}"),
+        v if v >= 1e-9 => {
+            // Enough decimals to keep four significant figures, then drop the
+            // trailing zeros that padding leaves behind — `$0.00006120` reads
+            // as more precision than `$0.0000612` and there is none.
+            let places = (-v.log10().floor() as i32 + 3).clamp(2, 18) as usize;
+            let s = format!("{p:.places$}");
+            format!("${}", s.trim_end_matches('0').trim_end_matches('.'))
+        }
+        _ => format!("${p:.3e}"),
+    }
+}
+
+/// Format a USD figure the way a call channel reads it: `$41.2K`, `$1.8M`.
+pub fn format_usd(v: f64) -> String {
+    match v {
+        v if v >= 1_000_000_000.0 => format!("${:.2}B", v / 1_000_000_000.0),
+        v if v >= 1_000_000.0 => format!("${:.2}M", v / 1_000_000.0),
+        v if v >= 1_000.0 => format!("${:.1}K", v / 1_000.0),
+        v => format!("${v:.0}"),
+    }
+}
+
+/// One-line mint verdict. Three distinct states, never collapsed to two:
+/// a mint that could not be read is NOT the same as a mint that read clean.
+fn mint_status(mint_info: Option<&crate::rpc::MintInfo>) -> String {
+    let Some(info) = mint_info else {
+        return "❓ unverified".to_string();
+    };
+
+    let mut flags = Vec::new();
+    if info.mint_authority.is_some() {
+        flags.push("mint authority LIVE");
+    }
+    if info.freeze_authority.is_some() {
+        flags.push("freeze authority LIVE");
+    }
+    if !info.risky_extensions.is_empty() {
+        flags.push("risky extensions");
+    }
+
+    if flags.is_empty() {
+        "✅ clean".to_string()
+    } else {
+        format!("⚠️ risky — {}", flags.join(", "))
+    }
 }
 
 fn format_spread(secs: u64) -> String {
@@ -250,22 +471,28 @@ mod tests {
     const MINT: &str = "TokenMint111111111111111111111111111111111";
 
     fn tracker() -> ConvictionTracker {
-        ConvictionTracker::new(Duration::from_secs(600), 2)
+        ConvictionTracker::new(Duration::from_secs(600), 2, Duration::from_secs(86_400))
+    }
+
+    /// Fixed wall clock. The window is driven by the injected `Instant`, so the
+    /// UTC stamp is free to be constant except where a test asserts on it.
+    fn utc() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_786_326_266, 0).unwrap()
     }
 
     #[test]
     fn one_buyer_is_silent() {
         let mut t = tracker();
-        assert!(t.record(MINT, "W1", "Alice", 1.0, Instant::now()).is_none());
+        assert!(t.record(MINT, "W1", "Alice", 1.0, 0.01, Instant::now(), utc()).is_none());
     }
 
     #[test]
     fn second_distinct_buyer_signals() {
         let mut t = tracker();
         let now = Instant::now();
-        assert!(t.record(MINT, "W1", "Alice", 1.0, now).is_none());
+        assert!(t.record(MINT, "W1", "Alice", 1.0, 0.01, now, utc()).is_none());
 
-        let s = t.record(MINT, "W2", "Bob", 2.5, now + Duration::from_secs(60)).unwrap();
+        let s = t.record(MINT, "W2", "Bob", 2.5, 0.01, now + Duration::from_secs(60), utc()).unwrap();
         assert_eq!(s.distinct_buyers, 2);
         assert!((s.total_sol - 3.5).abs() < 1e-9);
         assert_eq!(s.spread_secs, 60);
@@ -281,20 +508,62 @@ mod tests {
         for i in 0..10 {
             let at = now + Duration::from_secs(i * 5);
             assert!(
-                t.record(MINT, "W1", "Alice", 1.0, at).is_none(),
+                t.record(MINT, "W1", "Alice", 1.0, 0.01, at, utc()).is_none(),
                 "buy {i} from the same wallet must not signal"
             );
         }
     }
 
+    /// A token calls ONCE. The 3rd and 4th buyer are the same call getting
+    /// louder, not a new one — re-posting them is what makes a channel
+    /// unreadable.
     #[test]
-    fn escalates_on_each_new_distinct_buyer() {
+    fn a_token_announces_once_no_matter_how_many_more_buy() {
         let mut t = tracker();
         let now = Instant::now();
-        t.record(MINT, "W1", "A", 1.0, now);
-        assert_eq!(t.record(MINT, "W2", "B", 1.0, now).unwrap().distinct_buyers, 2);
-        assert_eq!(t.record(MINT, "W3", "C", 1.0, now).unwrap().distinct_buyers, 3);
-        assert_eq!(t.record(MINT, "W4", "D", 1.0, now).unwrap().distinct_buyers, 4);
+        t.record(MINT, "W1", "A", 1.0, 0.01, now, utc());
+        assert!(t.record(MINT, "W2", "B", 1.0, 0.01, now, utc()).is_some(), "first crossing fires");
+
+        for (i, w) in ["W3", "W4", "W5", "W6"].iter().enumerate() {
+            let at = now + Duration::from_secs(30 * (i as u64 + 1));
+            assert!(
+                t.record(MINT, w, "X", 1.0, 0.01, at, utc()).is_none(),
+                "{w} must not re-announce an already-called token"
+            );
+        }
+    }
+
+    /// Fees are summed across the buyers in the window, not taken from the
+    /// last one.
+    #[test]
+    fn fees_accumulate_across_buyers() {
+        let mut t = tracker();
+        let now = Instant::now();
+        t.record(MINT, "W1", "A", 1.0, 0.011, now, utc());
+        let s = t.record(MINT, "W2", "B", 1.0, 0.004, now, utc()).unwrap();
+        assert!((s.total_fees_sol - 0.015).abs() < 1e-9, "got {}", s.total_fees_sol);
+    }
+
+    /// After the suppression expires, genuine fresh accumulation may call
+    /// again — otherwise a token that runs twice in a week is only ever
+    /// reported once.
+    #[test]
+    fn a_token_can_call_again_once_the_suppression_expires() {
+        let mut t = ConvictionTracker::new(
+            Duration::from_secs(600),
+            2,
+            Duration::from_secs(3600),
+        );
+        let now = Instant::now();
+        t.record(MINT, "W1", "A", 1.0, 0.01, now, utc());
+        assert!(t.record(MINT, "W2", "B", 1.0, 0.01, now, utc()).is_some());
+
+        let later = now + Duration::from_secs(3700);
+        t.record(MINT, "W1", "A", 1.0, 0.01, later, utc());
+        assert!(
+            t.record(MINT, "W2", "B", 1.0, 0.01, later, utc()).is_some(),
+            "suppression must lapse, not be permanent"
+        );
     }
 
     /// Buys outside the window are not convergence — they are two unrelated
@@ -303,12 +572,12 @@ mod tests {
     fn buys_outside_the_window_do_not_combine() {
         let mut t = tracker();
         let now = Instant::now();
-        assert!(t.record(MINT, "W1", "Alice", 1.0, now).is_none());
+        assert!(t.record(MINT, "W1", "Alice", 1.0, 0.01, now, utc()).is_none());
 
         // 11 minutes later: the first buy has aged out, so this is buyer #1.
         let late = now + Duration::from_secs(660);
         assert!(
-            t.record(MINT, "W2", "Bob", 1.0, late).is_none(),
+            t.record(MINT, "W2", "Bob", 1.0, 0.01, late, utc()).is_none(),
             "expired entry must not count toward the threshold"
         );
     }
@@ -317,46 +586,86 @@ mod tests {
     fn a_wallet_can_count_again_after_its_entry_expires() {
         let mut t = tracker();
         let now = Instant::now();
-        t.record(MINT, "W1", "Alice", 1.0, now);
+        t.record(MINT, "W1", "Alice", 1.0, 0.01, now, utc());
         let late = now + Duration::from_secs(700);
-        assert!(t.record(MINT, "W1", "Alice", 1.0, late).is_none());
-        assert!(t.record(MINT, "W2", "Bob", 1.0, late).is_some());
+        assert!(t.record(MINT, "W1", "Alice", 1.0, 0.01, late, utc()).is_none());
+        assert!(t.record(MINT, "W2", "Bob", 1.0, 0.01, late, utc()).is_some());
+    }
+
+    /// The stamp must be the FIRST buy, not the moment the threshold was
+    /// crossed. Those differ by however long the accumulation ran, which is
+    /// exactly the number that tells you whether you are early.
+    #[test]
+    fn first_seen_is_the_first_buy_not_the_threshold_crossing() {
+        let mut t = tracker();
+        let now = Instant::now();
+        let first_utc = DateTime::from_timestamp(1_786_326_000, 0).unwrap();
+        let later_utc = DateTime::from_timestamp(1_786_326_180, 0).unwrap();
+
+        t.record(MINT, "W1", "Alice", 1.0, 0.01, now, first_utc);
+        let s = t
+            .record(MINT, "W2", "Bob", 1.0, 0.01, now + Duration::from_secs(180), later_utc)
+            .unwrap();
+
+        assert_eq!(s.first_seen_utc, first_utc, "must report the earliest buy");
+        assert_eq!(s.spread_secs, 180);
+    }
+
+    /// A backwards wall-clock correction (NTP) must not change which buy is
+    /// considered first — the monotonic clock decides.
+    #[test]
+    fn backwards_clock_correction_does_not_reorder_first_seen() {
+        let mut t = tracker();
+        let now = Instant::now();
+        let first_utc = DateTime::from_timestamp(1_786_326_000, 0).unwrap();
+        // Second buy arrives LATER monotonically but stamps EARLIER in UTC.
+        let skewed_utc = DateTime::from_timestamp(1_786_325_000, 0).unwrap();
+
+        t.record(MINT, "W1", "Alice", 1.0, 0.01, now, first_utc);
+        let s = t
+            .record(MINT, "W2", "Bob", 1.0, 0.01, now + Duration::from_secs(60), skewed_utc)
+            .unwrap();
+
+        assert_eq!(
+            s.first_seen_utc, first_utc,
+            "monotonic order wins; a skewed stamp must not become 'first'"
+        );
     }
 
     #[test]
     fn different_tokens_are_independent() {
         let mut t = tracker();
         let now = Instant::now();
-        assert!(t.record("MINT_A", "W1", "A", 1.0, now).is_none());
+        assert!(t.record("MINT_A", "W1", "A", 1.0, 0.01, now, utc()).is_none());
         assert!(
-            t.record("MINT_B", "W2", "B", 1.0, now).is_none(),
+            t.record("MINT_B", "W2", "B", 1.0, 0.01, now, utc()).is_none(),
             "buyers of a different token must not combine"
         );
     }
 
     #[test]
     fn threshold_below_two_is_clamped() {
-        let mut t = ConvictionTracker::new(Duration::from_secs(600), 0);
+        let mut t = ConvictionTracker::new(Duration::from_secs(600), 0, Duration::from_secs(86_400));
         let now = Instant::now();
-        assert!(t.record(MINT, "W1", "A", 1.0, now).is_none(), "1 buyer is never a signal");
-        assert!(t.record(MINT, "W2", "B", 1.0, now).is_some());
+        assert!(t.record(MINT, "W1", "A", 1.0, 0.01, now, utc()).is_none(), "1 buyer is never a signal");
+        assert!(t.record(MINT, "W2", "B", 1.0, 0.01, now, utc()).is_some());
     }
 
     #[test]
     fn higher_threshold_waits() {
-        let mut t = ConvictionTracker::new(Duration::from_secs(600), 3);
+        let mut t = ConvictionTracker::new(Duration::from_secs(600), 3, Duration::from_secs(86_400));
         let now = Instant::now();
-        assert!(t.record(MINT, "W1", "A", 1.0, now).is_none());
-        assert!(t.record(MINT, "W2", "B", 1.0, now).is_none());
-        assert!(t.record(MINT, "W3", "C", 1.0, now).is_some());
+        assert!(t.record(MINT, "W1", "A", 1.0, 0.01, now, utc()).is_none());
+        assert!(t.record(MINT, "W2", "B", 1.0, 0.01, now, utc()).is_none());
+        assert!(t.record(MINT, "W3", "C", 1.0, 0.01, now, utc()).is_some());
     }
 
     #[test]
     fn sweep_drops_expired_tokens() {
         let mut t = tracker();
         let now = Instant::now();
-        t.record("MINT_A", "W1", "A", 1.0, now);
-        t.record("MINT_B", "W2", "B", 1.0, now);
+        t.record("MINT_A", "W1", "A", 1.0, 0.01, now, utc());
+        t.record("MINT_B", "W2", "B", 1.0, 0.01, now, utc());
         assert_eq!(t.tracked_tokens(), 2);
 
         t.sweep(now + Duration::from_secs(700));
@@ -367,9 +676,9 @@ mod tests {
     fn active_ranks_by_distinct_buyers() {
         let mut t = tracker();
         let now = Instant::now();
-        t.record("MINT_A", "W1", "A", 1.0, now);
-        t.record("MINT_B", "W1", "A", 5.0, now);
-        t.record("MINT_B", "W2", "B", 5.0, now);
+        t.record("MINT_A", "W1", "A", 1.0, 0.01, now, utc());
+        t.record("MINT_B", "W1", "A", 5.0, 0.01, now, utc());
+        t.record("MINT_B", "W2", "B", 5.0, 0.01, now, utc());
 
         let active = t.active(now);
         assert_eq!(active[0].0, "MINT_B");
@@ -382,6 +691,14 @@ mod tests {
 mod render_tests {
     use super::*;
 
+    fn market() -> MarketSnapshot {
+        MarketSnapshot {
+            sol_usd: 75.0,
+            price_usd: Some(0.0000612),
+            fdv_usd: Some(41_200.0),
+        }
+    }
+
     fn signal() -> ConvictionSignal {
         ConvictionSignal {
             mint: "8Ky9Bm6zSAtXeS3dA3UuVqZKqFqL2yPmXn4tRcW1abcd".into(),
@@ -393,38 +710,102 @@ mod render_tests {
                 ("OGANT".into(), 25.288),
             ],
             spread_secs: 143,
+            total_fees_sol: 0.0412,
+            first_seen_utc: DateTime::from_timestamp(1_786_326_266, 0).unwrap(),
         }
     }
 
     #[test]
     fn renders_a_readable_alert() {
         let meta = ("Credible".to_string(), "CRED".to_string());
-        let out = render_signal(&signal(), Some(&meta), None);
-        println!("\n--- unverified mint ---\n{out}\n");
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), 8);
+        println!("\n--- initial alert ---\n{out}\n");
 
-        assert!(out.contains("SMART MONEY"));
-        assert!(out.contains("Credible (CRED)"));
-        assert!(out.contains("OGANT — 25.29 SOL"));
-        assert!(out.contains("2m23s"));
-        // Mint in a code block so Telegram copies it on tap.
+        assert!(out.contains("🧠 <b>SMART MONEY DETECTED</b>"));
+        assert!(out.contains("$Credible ($CRED)"));
+        assert!(out.contains("SM: 3"));
+        assert!(out.contains("MC: $41.2K"));
+        assert!(out.contains("Vol: $2.0K"));
+        // Mint in a code block, with no caption telling you to tap it.
         assert!(out.contains("<code>8Ky9Bm6zSAtXeS3dA3UuVqZKqFqL2yPmXn4tRcW1abcd</code>"));
-        // Unreadable safety must never render as clean.
-        assert!(out.contains("unverified"));
-        assert!(!out.contains("mint clean"));
+        assert!(!out.to_lowercase().contains("tap to copy"));
+    }
+
+    /// The spam this format exists to remove: individual traders and their
+    /// sizes must not appear.
+    #[test]
+    fn no_wallet_names_or_individual_amounts_are_published() {
+        let meta = ("Credible".to_string(), "CRED".to_string());
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), 8);
+
+        for name in ["Silver", "Ratwiz", "OGANT"] {
+            assert!(!out.contains(name), "{name} leaked into the alert:\n{out}");
+        }
+        // The per-buy figures are gone; only the aggregate survives.
+        assert!(!out.contains("$74"), "individual size leaked:\n{out}");
+        assert!(!out.contains("25.29"), "individual size leaked:\n{out}");
+    }
+
+    /// Times are local trading time, not UTC.
+    #[test]
+    fn timestamps_render_in_the_configured_offset() {
+        let out = render_signal(&signal(), None, None, Some(&market()), 8);
+        assert!(out.contains("(UTC+8)"), "got:\n{out}");
+        assert!(out.contains("First signal:"));
+
+        let west = render_signal(&signal(), None, None, Some(&market()), -5);
+        assert!(west.contains("(UTC-5)"), "got:\n{west}");
+    }
+
+    /// A clean mint says nothing; only a risk is worth a line.
+    #[test]
+    fn safety_appears_only_when_there_is_a_risk() {
+        use crate::rpc::MintInfo;
+        let clean = MintInfo {
+            mint_authority: None,
+            freeze_authority: None,
+            decimals: 6,
+            risky_extensions: vec![],
+        };
+        let out = render_signal(&signal(), None, Some(&clean), Some(&market()), 8);
+        assert!(!out.contains("⚠️"), "a clean mint must not add a line:\n{out}");
+
+        let risky = MintInfo {
+            mint_authority: Some("Auth".into()),
+            freeze_authority: None,
+            decimals: 6,
+            risky_extensions: vec![],
+        };
+        let out = render_signal(&signal(), None, Some(&risky), Some(&market()), 8);
+        assert!(out.contains("⚠️"), "a live authority must be flagged:\n{out}");
     }
 
     #[test]
     fn a_nameless_token_still_renders() {
-        let out = render_signal(&signal(), None, None);
-        assert!(out.contains("Unknown token"));
+        let out = render_signal(&signal(), None, None, Some(&market()), 8);
+        assert!(out.contains("$8Ky9Bm…W1abcd"), "got:\n{out}");
     }
 
-    /// A token name is attacker-controlled on-chain data and goes into an HTML
-    /// message body. It must be escaped, not trusted.
+    /// A missing SOL/USD rate must not blank the volume figure.
+    #[test]
+    fn without_a_rate_it_falls_back_to_sol_rather_than_dropping_figures() {
+        let out = render_signal(&signal(), None, None, None, 8);
+        assert!(out.contains("Vol: 26.39 SOL"), "got:\n{out}");
+        assert!(!out.contains("MC:"), "no rate means no market cap to claim");
+    }
+
+    /// A zero rate is a broken rate, not free tokens.
+    #[test]
+    fn a_zero_rate_is_treated_as_unknown() {
+        let broken = MarketSnapshot { sol_usd: 0.0, price_usd: None, fdv_usd: None };
+        let out = render_signal(&signal(), None, None, Some(&broken), 8);
+        assert!(out.contains("26.39 SOL"), "got:\n{out}");
+    }
+
     #[test]
     fn token_name_from_chain_is_escaped() {
         let evil = ("<b>PUMP</b>".to_string(), "X".to_string());
-        let out = render_signal(&signal(), Some(&evil), None);
+        let out = render_signal(&signal(), Some(&evil), None, Some(&market()), 8);
         assert!(out.contains("&lt;b&gt;PUMP&lt;/b&gt;"));
         assert!(!out.contains("<b>PUMP</b>"));
     }

@@ -60,6 +60,9 @@ pub struct Detector {
     /// Guarded because buys arrive from the stream task and the window is
     /// order-sensitive: two buys in the same slot must be counted in sequence.
     conviction: Arc<Mutex<ConvictionTracker>>,
+    /// Announced signals, for performance updates. Always constructed so the
+    /// field is not feature-shaped; it stays empty when tracking is off.
+    signals: Arc<crate::signals::SignalStore>,
     #[cfg(feature = "sniper")]
     sniper: Arc<Sniper>,
 }
@@ -89,9 +92,13 @@ impl Detector {
             WalletBook::default()
         };
 
+        let cfg_signals_path = cfg.tracked.signals_path.clone();
         let conviction = ConvictionTracker::new(
             Duration::from_secs(cfg.tracked.window_secs),
             cfg.tracked.conviction_threshold,
+            // A token calls once, then stays quiet for as long as it is being
+            // tracked for performance — re-calling a live position is noise.
+            Duration::from_secs(cfg.tracked.track_for_secs),
         );
 
         Ok(Self {
@@ -105,6 +112,7 @@ impl Detector {
             rpc,
             wallets: Arc::new(wallets),
             conviction: Arc::new(Mutex::new(conviction)),
+            signals: Arc::new(crate::signals::SignalStore::load(&cfg_signals_path)),
             #[cfg(feature = "sniper")]
             sniper,
         })
@@ -205,6 +213,21 @@ impl Detector {
             Duration::from_secs(60),
             shutdown.clone(),
         );
+
+        if self.cfg.tracked.enabled && self.cfg.tracked.track_performance {
+            info!(
+                tracking = self.signals.len(),
+                every_secs = self.cfg.tracked.update_check_secs,
+                rungs = ?self.cfg.tracked.update_multiples,
+                "conviction performance tracking enabled"
+            );
+            crate::signals::spawn_tracker(
+                self.signals.clone(),
+                self.alerter.clone(),
+                self.cfg.tracked.clone(),
+                shutdown.clone(),
+            );
+        }
 
         let min = Duration::from_secs(self.cfg.grpc.backoff_min_secs.max(1));
         let max = Duration::from_secs(self.cfg.grpc.backoff_max_secs.max(1));
@@ -585,13 +608,25 @@ impl Detector {
                     &buy.wallet,
                     &buy.wallet_name,
                     buy.sol_spent,
+                    buy.fees_sol,
                     Instant::now(),
+                    chrono::Utc::now(),
                 )
             };
 
+            // A token stops announcing once called, but its buys keep
+            // arriving. Folding them in means an update reports fees as they
+            // stand now, not a frozen copy of the call.
+            if buy.fees_sol > 0.0 {
+                self.signals.add_fees(&buy.mint, buy.fees_sol);
+            }
+
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
-                self.spawn_conviction_alert(signal);
+                // The triggering buy becomes the reference trade for every
+                // later performance update — a real fill, captured now,
+                // because it cannot be reconstructed afterwards.
+                self.spawn_conviction_alert(signal, buy);
             }
         }
     }
@@ -603,10 +638,18 @@ impl Detector {
     /// money buying something with a live mint authority is itself worth
     /// knowing, and in an alerts-only phase a silent drop teaches you nothing
     /// about where the threshold belongs.
-    fn spawn_conviction_alert(&self, signal: crate::conviction::ConvictionSignal) {
+    fn spawn_conviction_alert(
+        &self,
+        signal: crate::conviction::ConvictionSignal,
+        reference: crate::wallets::TrackedBuy,
+    ) {
         let alerter = self.alerter.clone();
         let rpc = self.rpc.clone();
         let safety_enabled = self.cfg.safety.enabled;
+        let signals = self.signals.clone();
+        let track = self.cfg.tracked.track_performance;
+        let jupiter_url = self.cfg.tracked.jupiter_base_url.clone();
+        let tz = self.cfg.tracked.display_utc_offset_hours;
 
         tokio::spawn(async move {
             // Metaplex PDA derivation needs the Solana crates, so a
@@ -622,8 +665,46 @@ impl Detector {
             } else {
                 None
             };
-            let body = crate::conviction::render_signal(&signal, meta.as_ref(), mint_info.as_ref());
-            alerter.send_html(body).await;
+
+            // FDV at signal time, from the reference fill: the wallet's own
+            // execution price times total supply times SOL/USD. Captured now
+            // because a later read returns the price THEN-unknowable — it
+            // returns the price now, which is a different number.
+            // Always resolved, not just when tracking: the alert itself is
+            // denominated in USD, so the rate is needed even if nothing will
+            // re-price this token later.
+            let supply = rpc.token_supply(&signal.mint).await;
+            let market = market_at_signal(&reference, supply, &jupiter_url).await;
+            let fdv_usd = market.and_then(|m| m.fdv_usd);
+
+            let body = crate::conviction::render_signal(
+                &signal,
+                meta.as_ref(),
+                mint_info.as_ref(),
+                market.as_ref(),
+                tz,
+            );
+            let message_id = alerter.send_html_returning_id(body, None).await;
+
+            if track {
+                let (name, symbol) = meta.unwrap_or_default();
+                signals.insert(crate::signals::SignalRecord {
+                    mint: signal.mint.clone(),
+                    name: crate::wallets::sanitize_name(&name, &signal.mint),
+                    symbol: crate::wallets::sanitize_name(&symbol, ""),
+                    first_seen_utc: signal.first_seen_utc,
+                    message_id,
+                    reference_sol: reference.sol_spent,
+                    reference_tokens_raw: reference.token_amount_raw,
+                    fdv_usd_at_signal: fdv_usd,
+                    supply,
+                    wallets: signal.buyers.iter().map(|(n, _)| n.clone()).collect(),
+                    total_sol: signal.total_sol,
+                    total_fees_sol: signal.total_fees_sol,
+                    total_usd: market.map(|m| m.usd(signal.total_sol)),
+                    last_reported_multiple: 1.0,
+                });
+            }
         });
     }
 
@@ -1099,6 +1180,38 @@ mod tests {
         println!("first update after: {:?}", first_at);
         println!("rate: {:.1} tx/min", count as f64 / started.elapsed().as_secs_f64() * 60.0);
     }
+}
+
+/// USD context at signal time, derived from the reference fill.
+///
+/// Price comes from a trade that actually executed (`sol_spent / tokens`), not
+/// a mid-price — so it already includes the slippage a real buyer paid. Market
+/// cap is that price times total supply.
+///
+/// The SOL/USD rate is fetched once and returned, so every figure in the alert
+/// converts with the same number. Returns `None` only when the rate itself is
+/// unknown; price and market cap degrade independently, because a missing
+/// supply should not also cost you the buy sizes.
+async fn market_at_signal(
+    reference: &crate::wallets::TrackedBuy,
+    supply: Option<f64>,
+    jupiter_url: &str,
+) -> Option<crate::conviction::MarketSnapshot> {
+    let sol_usd = crate::jupiter::Jupiter::new(jupiter_url).sol_price_usd().await.ok()?;
+    if !(sol_usd.is_finite() && sol_usd > 0.0) {
+        return None;
+    }
+
+    let price_usd = (reference.token_amount > 0.0)
+        .then(|| reference.sol_spent / reference.token_amount * sol_usd)
+        .filter(|p| p.is_finite() && *p > 0.0);
+
+    let fdv_usd = match (price_usd, supply) {
+        (Some(p), Some(s)) if s > 0.0 => Some(p * s).filter(|f| f.is_finite()),
+        _ => None,
+    };
+
+    Some(crate::conviction::MarketSnapshot { sol_usd, price_usd, fdv_usd })
 }
 
 /// Connect to a Geyser endpoint, applying TLS only when the URL asks for it.

@@ -10,12 +10,14 @@ mod bot;
 mod config;
 mod conviction;
 mod dedup;
+mod fees;
 mod detector;
 #[cfg(feature = "sniper")]
 mod execute;
 #[cfg(feature = "sniper")]
 mod jito;
-#[cfg(feature = "sniper")]
+// Not sniper-gated: this module is pure HTTP + JSON with no Solana crates, and
+// the conviction performance tracker needs quotes in an alerts-only build.
 mod jupiter;
 mod metrics;
 mod model;
@@ -27,6 +29,7 @@ mod quote;
 mod rpc;
 #[cfg(feature = "sniper")]
 mod sniper;
+mod signals;
 mod storage;
 #[cfg(feature = "sniper")]
 mod submit;

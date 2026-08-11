@@ -251,10 +251,13 @@ wallets_path = "tracked_wallets.json"
 # Distinct wallets that must buy the same token inside `window_secs` before
 # anything is announced. ONE wallet buying is not a signal — 700 wallets going
 # about normal business generate ~861 tx/min, so a threshold of 1 would be pure
-# noise. Each additional distinct buyer re-announces with a higher count, but a
-# wallet already counted never re-triggers: scaling into a position is one
-# opinion, not two.
-conviction_threshold = 2
+# noise.
+#
+# A token announces ONCE, on the buy that first reaches this count. Further
+# buyers are the same call getting louder, not a new one, and re-posting them is
+# what makes a channel unreadable. Suppression lapses after `track_for_secs`, so
+# a token that goes quiet and genuinely re-accumulates can call again.
+conviction_threshold = 3
 window_secs = 600
 # Minimum SOL a wallet must spend for a buy to count. Not 0: every signer pays
 # a transaction fee, so zero would count any tracked wallet that merely signed
@@ -265,6 +268,33 @@ min_buy_sol = 0.05
 # it can only be collected going forward — never reconstructed later. Keep on.
 log_all_buys = true
 buys_path = "tracked_buys.jsonl"
+
+# --- Performance tracking ---
+# Re-price announced signals and post a threaded UPDATE when one runs.
+#
+# Performance is measured against a REFERENCE TRADE captured at announce time:
+# the SOL a triggering wallet actually paid, for the exact token quantity it
+# actually received. The multiple is then one division — what those same tokens
+# fetch now, over what was paid. No decimals arithmetic, no mid-price that
+# ignores slippage, and no need to know which pool the token trades in. The
+# entry price is UNRECOVERABLE after the fact, which is why signals are
+# persisted rather than held in memory.
+track_performance = true
+signals_path = "conviction_signals.jsonl"
+update_check_secs = 300
+# Stop re-pricing a signal after 24h.
+track_for_secs = 86400
+# Multiples that trigger an update; each rung fires AT MOST ONCE. A ladder
+# rather than a single "% gain" threshold: one percentage either re-posts
+# forever on a token drifting upward, or is set so high you never hear about a
+# 3x. A token that gaps straight to 12x announces the 10x rung once, not four
+# messages climbing the ladder.
+update_multiples = [2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
+# Jupiter swap API root, used only for valuation quotes here.
+jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
+# Timezone for rendered timestamps. Alerts are read by people in one place at a
+# glance, and UTC forces mental arithmetic every time.
+display_utc_offset_hours = 8
 
 [log]
 # trace | debug | info | warn | error   (RUST_LOG overrides this entirely)

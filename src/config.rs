@@ -67,10 +67,57 @@ pub struct TrackedConfig {
     pub log_all_buys: bool,
     #[serde(default = "default_buys_path")]
     pub buys_path: String,
+
+    // --- Performance tracking (Phase 2) ---
+    /// Re-price announced signals and post updates when they run.
+    #[serde(default)]
+    pub track_performance: bool,
+    /// Where announced signals are persisted. Entry price is unrecoverable
+    /// after the fact, so this file is what lets a restart keep tracking.
+    #[serde(default = "default_signals_path")]
+    pub signals_path: String,
+    /// Seconds between re-pricing sweeps.
+    #[serde(default = "default_update_check")]
+    pub update_check_secs: u64,
+    /// Stop tracking a signal after this long.
+    #[serde(default = "default_track_for")]
+    pub track_for_secs: u64,
+    /// Multiples that trigger an update. Each rung fires at most once.
+    ///
+    /// A ladder rather than a single "% gain" threshold: one percentage either
+    /// re-posts forever on a token drifting upward, or is set so high you never
+    /// hear about a 3x. Rungs are also how call channels actually speak.
+    #[serde(default = "default_update_multiples")]
+    pub update_multiples: Vec<f64>,
+    /// Jupiter swap API root, used for valuation quotes.
+    #[serde(default = "default_jupiter_url")]
+    pub jupiter_base_url: String,
+    /// Hours offset from UTC for rendered timestamps. Alerts are read by people
+    /// in one trading timezone; making them convert from UTC in their head is
+    /// friction at exactly the wrong moment.
+    #[serde(default = "default_tz_offset")]
+    pub display_utc_offset_hours: i32,
+}
+
+fn default_tz_offset() -> i32 {
+    8
+}
+
+fn default_signals_path() -> String {
+    "conviction_signals.jsonl".to_string()
+}
+fn default_update_check() -> u64 {
+    300
+}
+fn default_track_for() -> u64 {
+    86_400
+}
+fn default_update_multiples() -> Vec<f64> {
+    vec![2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0]
 }
 
 fn default_conviction_threshold() -> usize {
-    2
+    3
 }
 fn default_conviction_window() -> u64 {
     600
@@ -92,6 +139,13 @@ impl Default for TrackedConfig {
             min_buy_sol: default_min_buy_sol(),
             log_all_buys: true,
             buys_path: default_buys_path(),
+            track_performance: false,
+            signals_path: default_signals_path(),
+            update_check_secs: default_update_check(),
+            track_for_secs: default_track_for(),
+            update_multiples: default_update_multiples(),
+            jupiter_base_url: default_jupiter_url(),
+            display_utc_offset_hours: default_tz_offset(),
         }
     }
 }

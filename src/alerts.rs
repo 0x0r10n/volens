@@ -46,28 +46,67 @@ impl Alerter {
 
     /// Send an arbitrary HTML message (used for watcher follow-ups).
     pub async fn send_html(&self, text: String) {
+        let _ = self.send_html_returning_id(text, None).await;
+    }
+
+    /// Send and return Telegram's `message_id`.
+    ///
+    /// The id is what makes a later update a *reply* to the original call
+    /// rather than a loose message — in a busy group an unanchored "up 3.2x"
+    /// is unreadable, because nobody remembers which token it refers to.
+    ///
+    /// `reply_to` threads this message under an earlier one. A stale id (the
+    /// original was deleted, or the chat was changed) makes Telegram reject the
+    /// send, so the reply is retried once unanchored rather than lost.
+    pub async fn send_html_returning_id(
+        &self,
+        text: String,
+        reply_to: Option<i64>,
+    ) -> Option<i64> {
         if !self.enabled {
-            return;
+            return None;
         }
+        match self.post_message(&text, reply_to).await {
+            Ok(id) => id,
+            Err(e) => {
+                if reply_to.is_some() {
+                    debug!(error = %e, "reply failed; retrying unanchored");
+                    return self.post_message(&text, None).await.ok().flatten();
+                }
+                warn!(error = %e, "telegram alert failed");
+                None
+            }
+        }
+    }
+
+    async fn post_message(&self, text: &str, reply_to: Option<i64>) -> anyhow::Result<Option<i64>> {
         let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": true,
         });
-
-        match self.client.post(&url).json(&body).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                debug!("telegram alert sent");
-            }
-            Ok(resp) => {
-                let status = resp.status();
-                let detail = resp.text().await.unwrap_or_default();
-                warn!(%status, detail, "telegram alert failed");
-            }
-            Err(e) => warn!(error = %e, "telegram request error"),
+        if let Some(id) = reply_to {
+            body["reply_parameters"] = serde_json::json!({
+                "message_id": id,
+                // Without this, a reply to a deleted message is an error rather
+                // than a normal send.
+                "allow_sending_without_reply": true,
+            });
         }
+
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram {status}: {payload}");
+        }
+        debug!("telegram alert sent");
+        Ok(payload
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64()))
     }
 }
 

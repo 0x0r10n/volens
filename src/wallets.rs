@@ -168,8 +168,21 @@ pub struct TrackedBuy {
     pub mint: String,
     /// Tokens gained (UI units).
     pub token_amount: f64,
+    /// Tokens gained in RAW base units. Carried because Jupiter quotes are
+    /// denominated in raw units, and re-deriving this from the UI amount loses
+    /// precision on high-decimal tokens.
+    pub token_amount_raw: u64,
+    pub decimals: u32,
     /// SOL that left the wallet, net of the token side.
     pub sol_spent: f64,
+    /// Fees paid in this transaction: network + tip + platform.
+    #[serde(default)]
+    pub fees_sol: f64,
+    /// Trading terminal the buy came through, when recognisable. Logged
+    /// because several wallets arriving via the SAME front-end is a weaker,
+    /// more correlated signal than the same count arriving independently.
+    #[serde(default)]
+    pub platform: Option<String>,
     pub signature: String,
     pub slot: u64,
 }
@@ -190,17 +203,23 @@ pub fn detect_buys(
         return Vec::new();
     };
 
-    // (owner, mint) -> ui amount, before and after.
-    let mut before: HashMap<(&str, &str), f64> = HashMap::new();
+    // (owner, mint) -> (ui amount, raw amount) before. Both are kept: the UI
+    // amount reads well in an alert, the raw one is what Jupiter quotes take.
+    let mut before: HashMap<(&str, &str), (f64, u128)> = HashMap::new();
     for b in &meta.pre_token_balances {
         if let Some(amt) = b.ui_token_amount.as_ref() {
-            before.insert((b.owner.as_str(), b.mint.as_str()), amt.ui_amount);
+            let raw = amt.amount.parse::<u128>().unwrap_or(0);
+            before.insert((b.owner.as_str(), b.mint.as_str()), (amt.ui_amount, raw));
         }
     }
 
     // SOL deltas, keyed by owner. Computed lazily: most transactions touch no
     // tracked wallet at all and the key decode is pure waste for those.
     let mut sol_out: Option<HashMap<String, f64>> = None;
+    // Fees are per TRANSACTION, not per buy, so they are computed once and
+    // attributed to the first tracked buy found. Charging them to every buy in
+    // a multi-wallet transaction would multiply one cost by the buyer count.
+    let mut fees_charged = false;
 
     let mut out = Vec::new();
     for b in &meta.post_token_balances {
@@ -216,11 +235,16 @@ pub fn detect_buys(
         // Absent from `pre` means the token account was created by this
         // transaction — the normal shape of a FIRST buy, and the case that
         // matters most. Treat missing as zero, not as unknown.
-        let prev = before.get(&(owner, mint)).copied().unwrap_or(0.0);
-        let gained = amt.ui_amount - prev;
+        let (prev_ui, prev_raw) = before.get(&(owner, mint)).copied().unwrap_or((0.0, 0));
+        let gained = amt.ui_amount - prev_ui;
         if gained <= 0.0 {
             continue;
         }
+        let gained_raw = amt
+            .amount
+            .parse::<u128>()
+            .unwrap_or(0)
+            .saturating_sub(prev_raw);
 
         let deltas = sol_out.get_or_insert_with(|| sol_deltas(tx_info, meta));
         let spent = deltas.get(owner).copied().unwrap_or(0.0);
@@ -228,12 +252,26 @@ pub fn detect_buys(
             continue;
         }
 
+        let (fees_sol, platform) = if fees_charged {
+            (0.0, None)
+        } else {
+            fees_charged = true;
+            (
+                crate::fees::capture(tx_info, meta).total_sol(),
+                crate::fees::platform_of(tx_info, meta),
+            )
+        };
+
         out.push(TrackedBuy {
             wallet: tracked.address.clone(),
             wallet_name: tracked.name.clone(),
             mint: mint.to_string(),
             token_amount: gained,
+            token_amount_raw: gained_raw.min(u64::MAX as u128) as u64,
+            decimals: amt.decimals,
             sol_spent: spent,
+            fees_sol,
+            platform,
             signature: signature.to_string(),
             slot,
         });
