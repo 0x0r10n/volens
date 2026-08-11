@@ -111,9 +111,13 @@ impl Jupiter {
         // 429ing RPC provider.
         let body = resp.text().await.context("jupiter quote: unreadable body")?;
         if !status.is_success() {
+            if status.as_u16() == 429 {
+                note_rate_limited();
+            }
             let snippet: String = body.chars().take(120).collect();
             bail!("jupiter quote HTTP {status}: {snippet}");
         }
+        note_success();
         let raw: Value = serde_json::from_str(&body).map_err(|e| {
             let snippet: String = body.chars().take(120).collect();
             anyhow::anyhow!("jupiter quote: non-JSON body ({e}): {snippet}")
@@ -276,43 +280,115 @@ mod tests {
 /// is logged; only a cold cache with a failing endpoint yields `None`.
 pub async fn cached_sol_price_usd(base_url: &str) -> Option<f64> {
     use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     const TTL: Duration = Duration::from_secs(300);
-    static CACHE: OnceLock<Mutex<Option<(f64, Instant)>>> = OnceLock::new();
-    let cell = CACHE.get_or_init(|| Mutex::new(None));
+    /// After a failed refresh, wait this long before spending another request.
+    const FAIL_COOLDOWN: Duration = Duration::from_secs(60);
 
-    // A poisoned lock would mean another task panicked mid-update; the cached
-    // price is still valid data, so recover rather than propagate.
-    let cached = cell.lock().unwrap_or_else(|p| p.into_inner()).to_owned();
+    static CACHE: OnceLock<Mutex<Option<(f64, Instant)>>> = OnceLock::new();
+    static LAST_FAIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+    // A poisoned lock means another task panicked mid-update. The cached price
+    // is still valid data, so recover rather than propagate.
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+    let fails = LAST_FAIL.get_or_init(|| Mutex::new(None));
+    let cached = *cache.lock().unwrap_or_else(|p| p.into_inner());
+    let stale = cached.map(|(p, _)| p);
+
     if let Some((price, at)) = cached {
         if at.elapsed() < TTL {
             return Some(price);
         }
     }
 
+    // Negative caching. Without it a FAILED refresh stores nothing, so the very
+    // next caller retries immediately — failures then generate MORE requests,
+    // which is exactly what sustains a rate limit. Observed live as repeated
+    // 429s spaced one throttle-interval apart.
+    if let Some(at) = *fails.lock().unwrap_or_else(|p| p.into_inner()) {
+        if at.elapsed() < FAIL_COOLDOWN {
+            return stale;
+        }
+    }
+
     match Jupiter::new(base_url).sol_price_usd().await {
         Ok(p) if p.is_finite() && p > 0.0 => {
-            *cell.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, Instant::now()));
+            *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some((p, Instant::now()));
+            *fails.lock().unwrap_or_else(|e| e.into_inner()) = None;
             Some(p)
         }
         Ok(bad) => {
+            *fails.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
             tracing::warn!(price = bad, "nonsensical SOL price; keeping previous");
-            cached.map(|(p, _)| p)
+            stale
         }
         Err(e) => {
-            tracing::warn!(error = %format!("{e:#}"), "SOL price refresh failed; serving cached");
-            cached.map(|(p, _)| p)
+            *fails.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                cooldown_secs = FAIL_COOLDOWN.as_secs(),
+                "SOL price refresh failed; serving cached and pausing retries"
+            );
+            stale
         }
     }
 }
 
-/// Minimum gap between Jupiter requests, in milliseconds.
-static MIN_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1200);
+/// Configured floor for request spacing, in milliseconds.
+static BASE_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1200);
+/// Spacing actually in force. Widens on a 429, decays back toward the base.
+static CURRENT_INTERVAL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1200);
+/// Ceiling on the adaptive backoff — beyond this the tracker is too slow to
+/// be useful and the operator should move to the paid endpoint.
+const MAX_INTERVAL_MS: u64 = 15_000;
 
-/// Set the global request spacing. Called once at startup from config.
+/// Set the global request spacing floor. Called once at startup from config.
 pub fn set_min_interval_ms(ms: u64) {
-    MIN_INTERVAL_MS.store(ms.max(50), std::sync::atomic::Ordering::Relaxed);
+    use std::sync::atomic::Ordering;
+    let ms = ms.max(50);
+    BASE_INTERVAL_MS.store(ms, Ordering::Relaxed);
+    CURRENT_INTERVAL_MS.store(ms, Ordering::Relaxed);
+}
+
+/// Widen the global spacing after a rate-limit rejection.
+///
+/// The documented free-tier limit and the limit an individual IP actually gets
+/// are different numbers — a VPS kept getting 429s at 50 req/min against a
+/// published ~60. Rather than guess a constant that is wrong on some hosts,
+/// the spacing doubles on every 429 and decays back on sustained success, so
+/// it converges on whatever this host is really allowed.
+pub fn note_rate_limited() {
+    use std::sync::atomic::Ordering;
+    let cur = CURRENT_INTERVAL_MS.load(Ordering::Relaxed);
+    let next = (cur.saturating_mul(2)).min(MAX_INTERVAL_MS);
+    if next != cur {
+        CURRENT_INTERVAL_MS.store(next, Ordering::Relaxed);
+        tracing::warn!(
+            from_ms = cur,
+            to_ms = next,
+            "rate limited by the quote API; widening request spacing"
+        );
+    }
+}
+
+/// Ease the spacing back toward the configured base after successes.
+///
+/// Decays slowly (10% per success) so one lucky request does not undo a
+/// backoff that is holding the rate limit at bay.
+fn note_success() {
+    use std::sync::atomic::Ordering;
+    let base = BASE_INTERVAL_MS.load(Ordering::Relaxed);
+    let cur = CURRENT_INTERVAL_MS.load(Ordering::Relaxed);
+    if cur > base {
+        let next = base.max(cur - (cur / 10).max(1));
+        CURRENT_INTERVAL_MS.store(next, Ordering::Relaxed);
+    }
+}
+
+/// Spacing currently in force, for logging and tests.
+pub fn current_interval_ms() -> u64 {
+    CURRENT_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process-wide request spacing for the Jupiter API.
@@ -343,7 +419,7 @@ pub async fn throttle() {
 
     // Held across the await deliberately: that is what serialises callers.
     let mut last = cell.lock().await;
-    let gap = Duration::from_millis(MIN_INTERVAL_MS.load(Ordering::Relaxed));
+    let gap = Duration::from_millis(CURRENT_INTERVAL_MS.load(Ordering::Relaxed));
     if let Some(prev) = *last {
         let elapsed = prev.elapsed();
         if elapsed < gap {
@@ -373,6 +449,45 @@ mod throttle_tests {
             "spacing not enforced: {:?}",
             start.elapsed()
         );
+        set_min_interval_ms(1200);
+    }
+
+    /// The published free-tier limit and what an individual IP actually gets
+    /// are different numbers — a VPS kept getting 429s at 50 req/min against a
+    /// documented ~60. The spacing must therefore find the real limit rather
+    /// than trust a constant.
+    #[test]
+    fn spacing_widens_on_a_rate_limit_and_recovers_on_success() {
+        set_min_interval_ms(1000);
+        assert_eq!(current_interval_ms(), 1000);
+
+        note_rate_limited();
+        assert_eq!(current_interval_ms(), 2000, "a 429 must widen the gap");
+        note_rate_limited();
+        assert_eq!(current_interval_ms(), 4000);
+
+        // Recovery is gradual: one lucky request must not undo a backoff that
+        // is holding the limit at bay.
+        note_success();
+        let after_one = current_interval_ms();
+        assert!(after_one < 4000 && after_one > 3000, "got {after_one}");
+
+        for _ in 0..200 {
+            note_success();
+        }
+        assert_eq!(current_interval_ms(), 1000, "must return to the configured base");
+        set_min_interval_ms(1200);
+    }
+
+    /// Backoff is bounded: past a point the tracker is too slow to be useful
+    /// and the operator should move to the paid endpoint.
+    #[test]
+    fn backoff_is_capped() {
+        set_min_interval_ms(1000);
+        for _ in 0..50 {
+            note_rate_limited();
+        }
+        assert_eq!(current_interval_ms(), MAX_INTERVAL_MS);
         set_min_interval_ms(1200);
     }
 

@@ -157,7 +157,10 @@ fn default_signals_path() -> String {
     "conviction_signals.jsonl".to_string()
 }
 fn default_jupiter_interval() -> u64 {
-    1200
+    // 30 req/min. The documented free tier is ~60, but a live VPS was still
+    // rate limited at 50, so the floor starts conservative and the adaptive
+    // backoff handles anything stricter.
+    2000
 }
 fn default_max_per_sweep() -> usize {
     120

@@ -315,8 +315,14 @@ jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
 # loops at 400ms are 300 req/min, and because a sleep-based gap makes the rate
 # depend on host latency, the same build floods from a fast VPS while behaving
 # on a slower box. 1200ms = 50 req/min, comfortably under the free tier.
+# This is a FLOOR, not a fixed rate: a 429 doubles the spacing (up to 15s) and
+# sustained success decays it back. The published limit and what a given IP
+# actually gets are different numbers — a VPS kept getting 429s at 50 req/min
+# against a documented ~60 — so the throttle finds the real limit instead of
+# trusting a constant.
+#
 # Lower this only when pointing at the paid endpoint.
-jupiter_min_interval_ms = 1200
+jupiter_min_interval_ms = 2000
 
 # --- Outcome sampling (data for wallet scoring) ---
 # Records what happened to EVERY token a tracked wallet buys, not just the ones
