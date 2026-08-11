@@ -19,3 +19,7 @@ detected_pools.jsonl
 # Curated smart-money wallet list. Not a secret in the key sense, but it is the
 # research the alpha signal is built on — committing it publishes it.
 tracked_wallets.json
+
+# Claude Code local settings — machine-specific, and the harness writes
+# transient .tmp files here that must never be committed.
+.claude/
