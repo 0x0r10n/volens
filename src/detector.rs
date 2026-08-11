@@ -63,6 +63,9 @@ pub struct Detector {
     /// Announced signals, for performance updates. Always constructed so the
     /// field is not feature-shaped; it stays empty when tracking is off.
     signals: Arc<crate::signals::SignalStore>,
+    /// Outcome sampling for EVERY token a tracked wallet buys — the data
+    /// wallet scoring needs, which the call-only view cannot provide.
+    outcomes: Arc<crate::outcomes::OutcomeStore>,
     #[cfg(feature = "sniper")]
     sniper: Arc<Sniper>,
 }
@@ -93,6 +96,8 @@ impl Detector {
         };
 
         let cfg_signals_path = cfg.tracked.signals_path.clone();
+        let cfg_pending_path = cfg.tracked.outcome_pending_path.clone();
+        let cfg_outcomes_path = cfg.tracked.outcomes_path.clone();
         let conviction = ConvictionTracker::new(
             Duration::from_secs(cfg.tracked.window_secs),
             cfg.tracked.conviction_threshold,
@@ -113,6 +118,10 @@ impl Detector {
             wallets: Arc::new(wallets),
             conviction: Arc::new(Mutex::new(conviction)),
             signals: Arc::new(crate::signals::SignalStore::load(&cfg_signals_path)),
+            outcomes: Arc::new(crate::outcomes::OutcomeStore::load(
+                &cfg_pending_path,
+                &cfg_outcomes_path,
+            )),
             #[cfg(feature = "sniper")]
             sniper,
         })
@@ -219,6 +228,21 @@ impl Detector {
             shutdown.clone(),
         );
 
+        if self.cfg.tracked.enabled && self.cfg.tracked.track_outcomes {
+            info!(
+                pending = self.outcomes.len(),
+                horizons = ?self.cfg.tracked.outcome_horizons_secs,
+                "outcome sampling enabled"
+            );
+            // Spawned independently of the conviction tracker: outcome data is
+            // collected for every token, including ones that never call.
+            crate::outcomes::spawn_sampler(
+                self.outcomes.clone(),
+                self.rpc.clone(),
+                self.cfg.tracked.clone(),
+                shutdown.clone(),
+            );
+        }
         if self.cfg.tracked.enabled && self.cfg.tracked.track_performance {
             info!(
                 tracking = self.signals.len(),
@@ -627,6 +651,20 @@ impl Detector {
             self.signals
                 .add_buy(&buy.mint, &buy.wallet, buy.sol_spent, buy.fees_sol);
 
+            // Every distinct token, not just the ones that reach a call. This
+            // is the unbiased sample wallet scoring needs.
+            if self.cfg.tracked.track_outcomes {
+                self.outcomes.register(crate::outcomes::PendingToken {
+                    mint: buy.mint.clone(),
+                    first_buy_utc: chrono::Utc::now(),
+                    reference_tokens_raw: buy.token_amount_raw,
+                    reference_sol: buy.sol_spent,
+                    decimals: buy.decimals,
+                    first_wallet: buy.wallet.clone(),
+                    sampled: Vec::new(),
+                });
+            }
+
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
                 // The triggering buy becomes the reference trade for every
@@ -708,8 +746,11 @@ impl Detector {
                 let (name, symbol) = meta.unwrap_or_default();
                 signals.insert(crate::signals::SignalRecord {
                     mint: signal.mint.clone(),
-                    name: crate::wallets::sanitize_name(&name, &signal.mint),
-                    symbol: crate::wallets::sanitize_name(&symbol, ""),
+                    // NOT `sanitize_name`: its address fallback would store
+                    // the mint as the token's name, which then renders as a
+                    // ticker and blocks the identity backfill forever.
+                    name: crate::wallets::sanitize_token_label(&name).unwrap_or_default(),
+                    symbol: crate::wallets::sanitize_token_label(&symbol).unwrap_or_default(),
                     first_seen_utc: signal.first_seen_utc,
                     message_id,
                     reference_sol: reference.sol_spent,

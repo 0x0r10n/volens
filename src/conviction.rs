@@ -309,7 +309,6 @@ pub fn render_signal(
         stamp(Utc::now(), tz_offset_hours)
     ));
 
-    s.push_str("🧠 <b>SMART MONEY DETECTED</b>\n");
     s.push_str(&format!("<b>{title}</b>\n"));
     s.push_str(&format!("<code>{}</code>\n\n", signal.mint));
 
@@ -418,26 +417,6 @@ fn money(sol: f64, market: Option<&MarketSnapshot>) -> String {
     }
 }
 
-/// Token prices span many orders of magnitude, so a fixed precision is wrong at
-/// one end or the other: `$0.00` for a memecoin, `$1.00000000` for a major.
-/// Precision follows the magnitude, and anything below a billionth falls back
-/// to scientific rather than printing a wall of zeros.
-pub fn format_price_usd(p: f64) -> String {
-    match p.abs() {
-        v if v == 0.0 => "$0".to_string(),
-        v if v >= 1.0 => format!("${p:.4}"),
-        v if v >= 0.01 => format!("${p:.5}"),
-        v if v >= 1e-9 => {
-            // Enough decimals to keep four significant figures, then drop the
-            // trailing zeros that padding leaves behind — `$0.00006120` reads
-            // as more precision than `$0.0000612` and there is none.
-            let places = (-v.log10().floor() as i32 + 3).clamp(2, 18) as usize;
-            let s = format!("{p:.places$}");
-            format!("${}", s.trim_end_matches('0').trim_end_matches('.'))
-        }
-        _ => format!("${p:.3e}"),
-    }
-}
 
 /// Format a USD figure the way a call channel reads it: `$41.2K`, `$1.8M`.
 pub fn format_usd(v: f64) -> String {
@@ -449,38 +428,7 @@ pub fn format_usd(v: f64) -> String {
     }
 }
 
-/// One-line mint verdict. Three distinct states, never collapsed to two:
-/// a mint that could not be read is NOT the same as a mint that read clean.
-fn mint_status(mint_info: Option<&crate::rpc::MintInfo>) -> String {
-    let Some(info) = mint_info else {
-        return "❓ unverified".to_string();
-    };
 
-    let mut flags = Vec::new();
-    if info.mint_authority.is_some() {
-        flags.push("mint authority LIVE");
-    }
-    if info.freeze_authority.is_some() {
-        flags.push("freeze authority LIVE");
-    }
-    if !info.risky_extensions.is_empty() {
-        flags.push("risky extensions");
-    }
-
-    if flags.is_empty() {
-        "✅ clean".to_string()
-    } else {
-        format!("⚠️ risky — {}", flags.join(", "))
-    }
-}
-
-fn format_spread(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{}s", secs / 60, secs % 60)
-    }
-}
 
 fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
@@ -744,7 +692,6 @@ mod render_tests {
         let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
         println!("\n--- initial alert ---\n{out}\n");
 
-        assert!(out.contains("🧠 <b>SMART MONEY DETECTED</b>"));
         assert!(out.contains("$CRED (Credible)"), "ticker first, name in parens:\n{out}");
         assert!(out.contains("SM: 3"));
         assert!(out.contains("MC: $41.2K"));

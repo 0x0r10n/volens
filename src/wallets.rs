@@ -152,6 +152,31 @@ pub fn sanitize_name(raw: &str, address: &str) -> String {
     }
 }
 
+/// Sanitize a TOKEN name or symbol, with no address fallback.
+///
+/// [`sanitize_name`] substitutes the shortened address when a name is empty or
+/// blocked, which is right for a wallet (you still want to identify it) and
+/// wrong for a token: the substituted mint is indistinguishable from a real
+/// name downstream. It then gets a `$` prefix and rendered as a ticker, and it
+/// defeats every "is the identity unknown?" check, because the field is no
+/// longer empty.
+///
+/// Returns `None` for empty or blocked input so the caller can keep it empty
+/// and let a later backfill fill it in.
+pub fn sanitize_token_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_lowercase();
+    if trimmed.is_empty() || BLOCKED_TERMS.iter().any(|t| lower.contains(t)) {
+        return None;
+    }
+    let cleaned: String = trimmed.chars().filter(|c| !c.is_control()).take(24).collect();
+    let escaped = cleaned
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    (!escaped.trim().is_empty()).then_some(escaped)
+}
+
 /// `5R4RJo…SpLfcW` — enough to identify, short enough to sit inline.
 pub fn short_address(address: &str) -> String {
     if address.len() <= 12 {
@@ -394,6 +419,18 @@ mod tests {
     fn empty_name_falls_back_to_address() {
         assert_eq!(sanitize_name("", ADDR), short_address(ADDR));
         assert_eq!(sanitize_name("   ", ADDR), short_address(ADDR));
+    }
+
+    /// A token label must never silently become the mint: that value would be
+    /// rendered as a ticker and would defeat every "identity unknown?" check.
+    #[test]
+    fn token_labels_stay_empty_rather_than_becoming_the_mint() {
+        assert_eq!(sanitize_token_label(""), None);
+        assert_eq!(sanitize_token_label("   "), None);
+        assert_eq!(sanitize_token_label("Grok Bot"), Some("Grok Bot".into()));
+        // Slur filtering still applies — token names reach the same group chat.
+        assert_eq!(sanitize_token_label("retard coin"), None);
+        assert_eq!(sanitize_token_label("<b>X</b>"), Some("&lt;b&gt;X&lt;/b&gt;".into()));
     }
 
     #[test]

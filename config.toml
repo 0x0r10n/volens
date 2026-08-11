@@ -282,6 +282,12 @@ buys_path = "tracked_buys.jsonl"
 track_performance = true
 signals_path = "conviction_signals.jsonl"
 update_check_secs = 300
+# Most signals re-priced per sweep. A Jupiter quote is ~1.6s round trip, so a
+# sweep costs ~2s per signal: at ~2 calls/min the 24h queue reaches ~2880, and
+# an uncapped sweep would take 96 MINUTES against this 5-minute interval.
+# Newest calls are prioritised — that is where a move is most actionable — and
+# older ones are still measured by the outcome sampler at fixed horizons.
+max_repriced_per_sweep = 120
 # Stop re-pricing a signal after 24h.
 track_for_secs = 86400
 # Multiples that trigger an update; each rung fires AT MOST ONCE. A ladder
@@ -300,6 +306,27 @@ track_for_secs = 86400
 update_multiples = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0]
 # Jupiter swap API root, used only for valuation quotes here.
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
+
+# --- Outcome sampling (data for wallet scoring) ---
+# Records what happened to EVERY token a tracked wallet buys, not just the ones
+# that reached a call. Call-only data is biased by construction: it can show how
+# the consensus performed, never whether one wallet's solo buys were worth
+# following — which is the whole question when scoring 700 wallets.
+#
+# This can ONLY be collected forward. A token that ran 5x in twenty minutes and
+# died looks, a day later, exactly like one that never moved.
+#
+# Cost is small: ~3 quotes per distinct token, roughly 1 request/minute.
+track_outcomes = true
+# Ages at which to sample, in seconds: 1h, 6h, 24h.
+# `peak` is the max across SAMPLED points, so resolution is bounded by this
+# list. Memecoins do most of their moving in the first hour — add shorter
+# horizons (e.g. 300, 900) if the peak reads too coarse.
+outcome_horizons_secs = [3600, 21600, 86400]
+outcomes_path = "token_outcomes.jsonl"
+# Pending queue, persisted so a 24h horizon survives a restart.
+outcome_pending_path = "outcome_pending.jsonl"
+sample_check_secs = 60
 # Timezone for rendered timestamps. Alerts are read by people in one place at a
 # glance, and UTC forces mental arithmetic every time.
 display_utc_offset_hours = 8

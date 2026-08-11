@@ -197,6 +197,14 @@ impl SignalStore {
         }
     }
 
+    /// Tracked signals, newest first. The re-pricing sweep works this order so
+    /// a cap drops the oldest rather than an arbitrary slice.
+    pub fn ranked_by_recency(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
+        let mut out = self.active(now, max_age_secs);
+        out.sort_by(|a, b| b.first_seen_utc.cmp(&a.first_seen_utc));
+        out
+    }
+
     /// Every tracked signal, best performer first. For `/calls`.
     pub fn ranked(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
         let mut out = self.active(now, max_age_secs);
@@ -255,6 +263,32 @@ impl SignalStore {
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+
+    /// Fill in the USD rate when it was unavailable at call time.
+    ///
+    /// A later rate is not the rate that applied then, but SOL moves single
+    /// digits over hours while the alternative is no USD figures at all.
+    pub fn set_sol_rate(&self, mint: &str, rate: f64) {
+        let mut map = self.lock();
+        let Some(rec) = map.get_mut(mint) else { return };
+        if rec.sol_usd_at_signal.is_none() && rate > 0.0 {
+            rec.sol_usd_at_signal = Some(rate);
+            // The reference fill is exact in SOL, so the signal-time FDV can be
+            // reconstructed as soon as a rate exists.
+            if rec.fdv_usd_at_signal.is_none() {
+                if let (Some(supply), true) = (rec.supply, rec.decimals > 0) {
+                    let tokens_ui =
+                        rec.reference_tokens_raw as f64 / 10f64.powi(rec.decimals as i32);
+                    if tokens_ui > 0.0 && supply > 0.0 {
+                        let fdv = (rec.reference_sol / tokens_ui) * supply * rate;
+                        if fdv.is_finite() {
+                            rec.fdv_usd_at_signal = Some(fdv);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Fill in decimals resolved after the fact.
@@ -411,10 +445,12 @@ pub fn render_update(
     // The ticker alone. An update is a reply to the original call, so the token
     // is already identified one message up — repeating name, mint and buyer
     // list is the spam this format exists to remove.
+    // `$` is a TICKER sigil. A name is not a ticker, and a mint certainly is
+    // not — `$HukaK2…myT8WJ` reads as a ticker and is not one.
     let ticker = if !rec.symbol.is_empty() {
         format!("${}", rec.symbol)
     } else if !rec.name.is_empty() {
-        format!("${}", rec.name)
+        rec.name.clone()
     } else {
         crate::conviction::short_mint(&rec.mint)
     };
@@ -423,20 +459,27 @@ pub fn render_update(
 
     // Only claim a move when BOTH ends are known. One known side and one blank
     // reads as a collapse to zero.
+    // Degrades in steps rather than all-or-nothing. A known CURRENT market cap
+    // is useful on its own; refusing to show it because the signal-time figure
+    // is missing throws away the half we do have.
+    let elapsed = format_elapsed((now - rec.first_seen_utc).num_seconds().max(0));
     match (rec.fdv_usd_at_signal, current_fdv_usd) {
-        (Some(then), Some(now_mc)) => {
-            s.push_str(&format!(
-                "💵 MC: {} → {} in {}\n",
-                crate::conviction::format_usd(then),
-                crate::conviction::format_usd(now_mc),
-                format_elapsed((now - rec.first_seen_utc).num_seconds().max(0))
-            ));
-        }
-        _ => s.push_str(&format!(
-            "💵 MC: unavailable — {} in {}\n",
-            format_multiple(multiple),
-            format_elapsed((now - rec.first_seen_utc).num_seconds().max(0))
+        (Some(then), Some(now_mc)) => s.push_str(&format!(
+            "💵 MC: {} → {} in {elapsed}\n",
+            crate::conviction::format_usd(then),
+            crate::conviction::format_usd(now_mc),
         )),
+        (None, Some(now_mc)) => s.push_str(&format!(
+            "💵 MC now: {} ({} in {elapsed})\n",
+            crate::conviction::format_usd(now_mc),
+            format_multiple(multiple),
+        )),
+        (Some(then), None) => s.push_str(&format!(
+            "💵 MC at signal: {} ({} in {elapsed})\n",
+            crate::conviction::format_usd(then),
+            format_multiple(multiple),
+        )),
+        (None, None) => s.push_str(&format!("💵 {} in {elapsed}\n", format_multiple(multiple))),
     }
 
     // Recomputed from the CURRENT running total at the call's own SOL/USD
@@ -550,7 +593,13 @@ pub fn spawn_tracker(
 
             let now = Utc::now();
             let retired = store.retire(now, max_age);
-            let batch = store.active(now, max_age);
+            // Newest first, then capped: a sweep must finish well inside its
+            // own interval or updates arrive after they stop being useful.
+            let mut batch = store.ranked_by_recency(now, max_age);
+            let total = batch.len();
+            let cap = cfg.max_repriced_per_sweep.max(1);
+            batch.truncate(cap);
+            let skipped = total.saturating_sub(batch.len());
             // Counted and reported per sweep. Without this the tracker is
             // invisible: a healthy sweep that crosses no rung logs nothing, so
             // "no updates" and "not running" look identical from the outside.
@@ -558,7 +607,16 @@ pub fn spawn_tracker(
             let mut priced = 0usize;
             let mut routeless = 0usize;
             let mut best = 0.0f64;
-            tracing::info!(tracking = batch.len(), retired, "re-pricing signals");
+            if skipped > 0 {
+                tracing::warn!(
+                    total,
+                    cap,
+                    skipped,
+                    "signal queue exceeds the per-sweep cap; oldest calls not re-priced \
+                     this round (lower tracked.track_for_secs or raise max_repriced_per_sweep)"
+                );
+            }
+            tracing::info!(tracking = batch.len(), total, retired, "re-pricing signals");
 
             let mut named = 0usize;
             for rec in batch {
@@ -571,14 +629,33 @@ pub fn spawn_tracker(
                 // records predate the Token-2022 lookup entirely), so a call
                 // announced as a bare mint gets its ticker on the next sweep
                 // instead of staying anonymous forever.
-                if rec.symbol.is_empty() && rec.name.is_empty() {
+                let name_is_really_the_mint =
+                    rec.name == crate::conviction::short_mint(&rec.mint);
+                if rec.symbol.is_empty() || name_is_really_the_mint {
                     if let Some(m) = rpc.token_meta(&rec.mint).await {
-                        if !m.name.is_empty() || !m.symbol.is_empty() {
-                            store.set_identity(&rec.mint, &m.name, &m.symbol);
+                        let name = crate::wallets::sanitize_token_label(&m.name)
+                            .unwrap_or_default();
+                        let symbol = crate::wallets::sanitize_token_label(&m.symbol)
+                            .unwrap_or_default();
+                        if !name.is_empty() || !symbol.is_empty() {
+                            store.set_identity(&rec.mint, &name, &symbol);
                             named += 1;
                         }
                     }
                 }
+                // The USD basis is captured once, at the call. If the SOL
+                // price happened to be unavailable in that instant the record
+                // has no USD figures for its whole life — which is exactly the
+                // "MC: unavailable" seen hours later. Recover it: the SOL side
+                // of the reference trade is exact, so only the rate is missing.
+                if rec.sol_usd_at_signal.is_none() {
+                    if let Some(rate) =
+                        crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await
+                    {
+                        store.set_sol_rate(&rec.mint, rate);
+                    }
+                }
+
                 // Same backfill for decimals, which older records predate.
                 // Without it the live market cap stays unavailable for them
                 // forever and they silently keep using the scaled estimate.
@@ -991,6 +1068,33 @@ mod tests {
         assert_eq!(ranked, vec!["B", "D", "C", "A"], "multiple desc, then newest");
     }
 
+    /// A sweep must stay bounded. Uncapped, a day's queue would take ~96
+    /// minutes against a 5-minute interval and every update would land late.
+    #[test]
+    fn recency_order_puts_the_newest_first_so_a_cap_drops_the_oldest() {
+        let store = SignalStore::load("/nonexistent/volens-cap.jsonl");
+        let now = Utc::now();
+        for (mint, age) in [("OLD", 20_000), ("NEW", 60), ("MID", 5_000)] {
+            let mut r = rec(mint);
+            r.first_seen_utc = now - chrono::Duration::seconds(age);
+            store.lock().insert(mint.to_string(), r);
+        }
+        let order: Vec<String> = store
+            .ranked_by_recency(now, 86_400)
+            .iter()
+            .map(|r| r.mint.clone())
+            .collect();
+        assert_eq!(order, vec!["NEW", "MID", "OLD"]);
+
+        // A cap of 2 therefore keeps the two newest.
+        let mut capped = store.ranked_by_recency(now, 86_400);
+        capped.truncate(2);
+        assert_eq!(
+            capped.iter().map(|r| r.mint.as_str()).collect::<Vec<_>>(),
+            vec!["NEW", "MID"]
+        );
+    }
+
     #[test]
     fn retire_drops_only_the_old() {
         let store = SignalStore::load("/nonexistent/volens-test-signals.jsonl");
@@ -1155,12 +1259,86 @@ mod tests {
         assert_eq!(format_elapsed(-5), "-5s");
     }
 
-    /// A known "then" with an unknown "now" must not render as a collapse.
+    /// The reported bug: an update three hours later said "MC: unavailable"
+    /// because the SOL price happened to be missing in the single instant the
+    /// call was made. A known current figure must still be shown.
+    #[test]
+    fn a_missing_signal_time_mc_still_shows_the_current_one() {
+        let mut r = rec("M");
+        r.fdv_usd_at_signal = None;
+        let out = render_update(&r, 3.5, Some(88_000.0), Utc::now(), 8);
+        assert!(out.contains("MC now: $88.0K"), "got:\n{out}");
+        assert!(!out.contains("unavailable"), "half the data is not none of it:\n{out}");
+    }
+
+    /// Only when BOTH are unknown does the line reduce to the multiple.
+    #[test]
+    fn with_no_mc_at_all_the_line_reduces_to_the_multiple() {
+        let mut r = rec("M");
+        r.fdv_usd_at_signal = None;
+        let out = render_update(&r, 3.5, None, Utc::now(), 8);
+        assert!(out.contains("💵 x3.5 in"), "got:\n{out}");
+        assert!(!out.contains("MC"), "got:\n{out}");
+    }
+
+    /// `$HukaK2…myT8WJ` — a mint wearing a ticker sigil, because the name field
+    /// had been poisoned with the shortened mint.
+    #[test]
+    fn a_mint_never_wears_a_ticker_sigil() {
+        let mut r = rec("HukaK2eHhbTyiuUwuKMntjPJP4aGdD4VwiExsNmyT8WJ");
+        r.symbol = String::new();
+        r.name = String::new();
+        let out = render_update(&r, 32.5, None, Utc::now(), 8);
+        assert!(!out.contains("$HukaK2"), "got:\n{out}");
+        assert!(out.contains("HukaK2"), "the mint should still identify it:\n{out}");
+
+        // A name is not a ticker either.
+        r.name = "Grok Bot".into();
+        let out = render_update(&r, 32.5, None, Utc::now(), 8);
+        assert!(out.contains("Grok Bot"), "got:\n{out}");
+        assert!(!out.contains("$Grok"), "a name must not get a $ sigil:\n{out}");
+    }
+
+    /// Recovering the rate must reconstruct the signal-time market cap too,
+    /// or the update still cannot show a "then -> now" move.
+    #[test]
+    fn recovering_the_rate_reconstructs_the_signal_time_mc() {
+        let store = SignalStore::load("/nonexistent/volens-rate.jsonl");
+        let mut r = rec("MINT_A");
+        r.sol_usd_at_signal = None;
+        r.fdv_usd_at_signal = None;
+        r.supply = Some(1_000_000_000.0);
+        r.decimals = 6;
+        r.reference_tokens_raw = 1_000_000;   // 1.0 token
+        r.reference_sol = 0.001;              // 0.001 SOL per token
+        store.lock().insert("MINT_A".into(), r);
+
+        store.set_sol_rate("MINT_A", 75.0);
+        let back = store.active(Utc::now(), 86_400).pop().unwrap();
+        assert_eq!(back.sol_usd_at_signal, Some(75.0));
+        // 0.001 SOL/token x 1e9 supply x $75 = $75,000,000
+        assert_eq!(back.fdv_usd_at_signal, Some(75_000_000.0));
+    }
+
+    /// A rate that arrived on time must never be overwritten by a later one.
+    #[test]
+    fn an_existing_rate_is_not_replaced() {
+        let store = SignalStore::load("/nonexistent/volens-rate2.jsonl");
+        let mut r = rec("MINT_A");
+        r.sol_usd_at_signal = Some(74.0);
+        store.lock().insert("MINT_A".into(), r);
+        store.set_sol_rate("MINT_A", 99.0);
+        assert_eq!(store.active(Utc::now(), 86_400)[0].sol_usd_at_signal, Some(74.0));
+    }
+
+    /// A known "then" with an unknown "now" must not render as a collapse:
+    /// no arrow, and no implied move to zero.
     #[test]
     fn a_missing_current_fdv_is_stated_not_implied() {
         let out = render_update(&rec("M"), 2.4, None, Utc::now(), 8);
-        assert!(out.contains("MC: unavailable"), "got:\n{out}");
+        assert!(out.contains("MC at signal: $41.2K"), "got:\n{out}");
         assert!(!out.contains("→"), "no arrow without both ends:\n{out}");
+        assert!(!out.contains("$0"), "must not imply a collapse:\n{out}");
     }
 
     /// A performance figure must never flatter itself. Rounding turned 99.7

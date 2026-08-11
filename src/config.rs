@@ -82,6 +82,17 @@ pub struct TrackedConfig {
     /// Stop tracking a signal after this long.
     #[serde(default = "default_track_for")]
     pub track_for_secs: u64,
+    /// Most signals re-priced in one sweep.
+    ///
+    /// A Jupiter quote is ~1.6s round trip, so a sweep costs roughly 2s per
+    /// signal. At ~2 calls/min the 24h queue reaches ~2880, which would make a
+    /// full sweep take 96 MINUTES against a 5-minute interval — updates would
+    /// arrive long after they were useful. Capping keeps each sweep bounded;
+    /// newest calls are prioritised because that is where a move is both most
+    /// likely and most actionable, and older ones are still measured by the
+    /// outcome sampler at fixed horizons.
+    #[serde(default = "default_max_per_sweep")]
+    pub max_repriced_per_sweep: usize,
     /// Multiples that trigger an update. Each rung fires at most once.
     ///
     /// A ladder rather than a single "% gain" threshold: one percentage either
@@ -92,6 +103,25 @@ pub struct TrackedConfig {
     /// Jupiter swap API root, used for valuation quotes.
     #[serde(default = "default_jupiter_url")]
     pub jupiter_base_url: String,
+
+    // --- Outcome sampling (wallet scoring data) ---
+    /// Record what happened to EVERY token a tracked wallet buys, not just the
+    /// ones that reached a call. Without this, wallet scoring can only ever see
+    /// the biased subset where three wallets already agreed.
+    #[serde(default)]
+    pub track_outcomes: bool,
+    /// Ages at which to sample, in seconds. `peak` is the max across sampled
+    /// points, so resolution is bounded by this list — memecoins move most in
+    /// the first hour, so add shorter horizons if the peak reads too coarse.
+    #[serde(default = "default_horizons")]
+    pub outcome_horizons_secs: Vec<u64>,
+    #[serde(default = "default_outcomes_path")]
+    pub outcomes_path: String,
+    #[serde(default = "default_pending_path")]
+    pub outcome_pending_path: String,
+    /// How often to check for due samples.
+    #[serde(default = "default_sample_check")]
+    pub sample_check_secs: u64,
     /// Hours offset from UTC for rendered timestamps. Alerts are read by people
     /// in one trading timezone; making them convert from UTC in their head is
     /// friction at exactly the wrong moment.
@@ -103,8 +133,23 @@ fn default_tz_offset() -> i32 {
     8
 }
 
+fn default_horizons() -> Vec<u64> {
+    vec![3_600, 21_600, 86_400]
+}
+fn default_outcomes_path() -> String {
+    "token_outcomes.jsonl".to_string()
+}
+fn default_pending_path() -> String {
+    "outcome_pending.jsonl".to_string()
+}
+fn default_sample_check() -> u64 {
+    60
+}
 fn default_signals_path() -> String {
     "conviction_signals.jsonl".to_string()
+}
+fn default_max_per_sweep() -> usize {
+    120
 }
 fn default_update_check() -> u64 {
     300
@@ -145,8 +190,14 @@ impl Default for TrackedConfig {
             signals_path: default_signals_path(),
             update_check_secs: default_update_check(),
             track_for_secs: default_track_for(),
+            max_repriced_per_sweep: default_max_per_sweep(),
             update_multiples: default_update_multiples(),
             jupiter_base_url: default_jupiter_url(),
+            track_outcomes: false,
+            outcome_horizons_secs: default_horizons(),
+            outcomes_path: default_outcomes_path(),
+            outcome_pending_path: default_pending_path(),
+            sample_check_secs: default_sample_check(),
             display_utc_offset_hours: default_tz_offset(),
         }
     }

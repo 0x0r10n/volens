@@ -21,6 +21,7 @@ mod jito;
 mod jupiter;
 mod metrics;
 mod model;
+mod outcomes;
 mod parser;
 #[cfg(feature = "sniper")]
 mod positions;
