@@ -63,6 +63,9 @@ pub struct Detector {
     /// Announced signals, for performance updates. Always constructed so the
     /// field is not feature-shaped; it stays empty when tracking is off.
     signals: Arc<crate::signals::SignalStore>,
+    /// Prices derived from the stream itself — no external API, so nothing to
+    /// rate limit or IP-block.
+    prices: Arc<crate::prices::PriceIndex>,
     /// Outcome sampling for EVERY token a tracked wallet buys — the data
     /// wallet scoring needs, which the call-only view cannot provide.
     outcomes: Arc<crate::outcomes::OutcomeStore>,
@@ -77,8 +80,14 @@ impl Detector {
         let quote_mints = cfg.filters.quote_mints.clone();
         let dedup = Dedup::new(Duration::from_secs(cfg.alerts.dedup_ttl_secs));
         let rpc = Arc::new(RpcClient::new(&cfg.rpc));
+        let prices = Arc::new(crate::prices::PriceIndex::new());
         #[cfg(feature = "sniper")]
-        let sniper = Arc::new(Sniper::new(cfg.sniper.clone(), rpc.clone(), &cfg.rpc)?);
+        let sniper = Arc::new(Sniper::new(
+            cfg.sniper.clone(),
+            rpc.clone(),
+            &cfg.rpc,
+            prices.clone(),
+        )?);
 
         // Load the tracked-wallet list up front so a bad path is a startup
         // error, not a feature that silently never fires.
@@ -118,6 +127,7 @@ impl Detector {
             wallets: Arc::new(wallets),
             conviction: Arc::new(Mutex::new(conviction)),
             signals: Arc::new(crate::signals::SignalStore::load(&cfg_signals_path)),
+            prices,
             outcomes: Arc::new(crate::outcomes::OutcomeStore::load(
                 &cfg_pending_path,
                 &cfg_outcomes_path,
@@ -189,6 +199,11 @@ impl Detector {
         }
     }
 
+    /// The stream-derived price index, shared with the trackers.
+    pub fn prices(&self) -> Arc<crate::prices::PriceIndex> {
+        self.prices.clone()
+    }
+
     /// Announced calls, for the command bot's `/calls`.
     pub fn signals(&self) -> Arc<crate::signals::SignalStore> {
         self.signals.clone()
@@ -231,6 +246,37 @@ impl Detector {
             shutdown.clone(),
         );
 
+        // The price index is now load-bearing for every USD figure, every
+        // performance update and the market-cap ceiling. A silent price system
+        // is how the previous one stayed broken for hours, so it reports.
+        {
+            let prices = self.prices.clone();
+            let mut sd = shutdown.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                        _ = sd.changed() => { if *sd.borrow() { return; } continue; }
+                    }
+                    // Tokens untraded for an hour cannot be priced anyway.
+                    let pruned = prices.prune(Duration::from_secs(3600));
+                    match prices.sol_usd(Duration::from_secs(300)) {
+                        Some(p) => info!(
+                            sol_usd = format!("{p:.2}"),
+                            tokens = prices.tracked_tokens(),
+                            pruned,
+                            "price index"
+                        ),
+                        None => warn!(
+                            tokens = prices.tracked_tokens(),
+                            "price index has NO SOL/USD — every USD figure will be blank \
+                             and the market-cap ceiling will refuse trades"
+                        ),
+                    }
+                }
+            });
+        }
+
         if self.cfg.tracked.enabled && self.cfg.tracked.track_outcomes {
             info!(
                 pending = self.outcomes.len(),
@@ -242,6 +288,7 @@ impl Detector {
             crate::outcomes::spawn_sampler(
                 self.outcomes.clone(),
                 self.rpc.clone(),
+                self.prices.clone(),
                 self.cfg.tracked.clone(),
                 shutdown.clone(),
             );
@@ -257,6 +304,7 @@ impl Detector {
                 self.signals.clone(),
                 self.alerter.clone(),
                 self.rpc.clone(),
+                self.prices.clone(),
                 self.cfg.tracked.clone(),
                 shutdown.clone(),
             );
@@ -469,6 +517,14 @@ impl Detector {
                                 if meta.err.is_some() {
                                     continue;
                                 }
+                            }
+
+                            // Every transaction is a price observation, not
+                            // just the ones that parse as a pool creation.
+                            // This is the whole price feed: ~56% of the stream
+                            // yields a fill, at no network cost.
+                            if let Some(meta) = tx_info.meta.as_ref() {
+                                self.prices.observe(tx_info, meta);
                             }
 
                             let tracked = matched.iter().any(|f| f == TRACKED_FILTER);
@@ -695,7 +751,7 @@ impl Detector {
         let safety_enabled = self.cfg.safety.enabled;
         let signals = self.signals.clone();
         let track = self.cfg.tracked.track_performance;
-        let jupiter_url = self.cfg.tracked.jupiter_base_url.clone();
+        let prices = self.prices.clone();
         let tz = self.cfg.tracked.display_utc_offset_hours;
 
         tokio::spawn(async move {
@@ -732,7 +788,7 @@ impl Detector {
             // denominated in USD, so the rate is needed even if nothing will
             // re-price this token later.
             let supply = rpc.token_supply(&signal.mint).await;
-            let market = market_at_signal(&reference, supply, &jupiter_url).await;
+            let market = market_at_signal(&reference, supply, &prices);
             let fdv_usd = market.and_then(|m| m.fdv_usd);
 
             let body = crate::conviction::render_signal(
@@ -1261,12 +1317,12 @@ mod tests {
 /// converts with the same number. Returns `None` only when the rate itself is
 /// unknown; price and market cap degrade independently, because a missing
 /// supply should not also cost you the buy sizes.
-async fn market_at_signal(
+fn market_at_signal(
     reference: &crate::wallets::TrackedBuy,
     supply: Option<f64>,
-    jupiter_url: &str,
+    prices: &crate::prices::PriceIndex,
 ) -> Option<crate::conviction::MarketSnapshot> {
-    let sol_usd = crate::jupiter::cached_sol_price_usd(jupiter_url).await?;
+    let sol_usd = prices.sol_usd(std::time::Duration::from_secs(300))?;
 
     let price_usd = (reference.token_amount > 0.0)
         .then(|| reference.sol_spent / reference.token_amount * sol_usd)
@@ -1316,4 +1372,204 @@ pub fn describe_targets(cfg: &Config) -> String {
         .map(|d: &Dex| format!("{} ({})", d.label(), d.program_id()))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+#[cfg(test)]
+mod price_from_stream_probe {
+    use super::*;
+
+    /// Can we derive token prices from the stream we ALREADY receive, without
+    /// any external price API?
+    ///
+    /// Counts, over a short window, how many streamed transactions yield a
+    /// usable (mint, sol_delta, token_delta) observation using the same
+    /// balance-delta technique `wallets::detect_buys` uses.
+    ///
+    ///   cargo test --features sniper -- --ignored --nocapture price_from_stream
+    #[ignore = "hits a live Geyser endpoint"]
+    #[tokio::test]
+    async fn price_from_stream_feasibility() {
+        let _ = dotenvy::dotenv();
+        let endpoint = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
+        let token = std::env::var("GRPC_X_TOKEN").ok().filter(|t| !t.is_empty());
+        let mut client = connect_geyser(&endpoint, token).await.expect("connect");
+
+        let programs: Vec<String> = [
+            Dex::RaydiumV4, Dex::RaydiumCpmm, Dex::PumpSwap,
+            Dex::MeteoraDbc, Dex::MeteoraDlmm,
+        ]
+        .iter()
+        .map(|d| d.program_id().to_string())
+        .collect();
+
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "swaps".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: programs,
+                ..Default::default()
+            },
+        );
+        let (_sink, mut stream) = client
+            .subscribe_with_request(Some(SubscribeRequest {
+                transactions,
+                commitment: Some(CommitmentLevel::Processed as i32),
+                ..Default::default()
+            }))
+            .await
+            .expect("subscribe");
+
+        const WSOL: &str = "So11111111111111111111111111111111111111112";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let (mut seen, mut priced) = (0usize, 0usize);
+        let mut mints = std::collections::HashSet::new();
+        let mut sol_volume = 0.0f64;
+        let mut samples: Vec<(String, f64)> = Vec::new();
+
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let Ok(update) = item else { continue };
+            let Some(UpdateOneof::Transaction(tx)) = update.update_oneof else { continue };
+            let Some(info) = tx.transaction.as_ref() else { continue };
+            let Some(meta) = info.meta.as_ref() else { continue };
+            if info.is_vote || meta.err.is_some() {
+                continue;
+            }
+            seen += 1;
+
+            // Same technique as detect_buys: pair a token delta with a SOL delta.
+            let mut before = HashMap::new();
+            for b in &meta.pre_token_balances {
+                if let Some(a) = b.ui_token_amount.as_ref() {
+                    before.insert((b.owner.as_str(), b.mint.as_str()), a.ui_amount);
+                }
+            }
+            let mut sol_moved: f64 = 0.0;
+            for b in &meta.post_token_balances {
+                if b.mint != WSOL {
+                    continue;
+                }
+                if let Some(a) = b.ui_token_amount.as_ref() {
+                    let prev = before.get(&(b.owner.as_str(), b.mint.as_str())).copied().unwrap_or(0.0);
+                    sol_moved = sol_moved.max((a.ui_amount - prev).abs());
+                }
+            }
+            for b in &meta.post_token_balances {
+                if b.mint == WSOL {
+                    continue;
+                }
+                let Some(a) = b.ui_token_amount.as_ref() else { continue };
+                let prev = before.get(&(b.owner.as_str(), b.mint.as_str())).copied().unwrap_or(0.0);
+                let delta = (a.ui_amount - prev).abs();
+                if delta > 0.0 && sol_moved > 0.0 {
+                    priced += 1;
+                    mints.insert(b.mint.clone());
+                    sol_volume += sol_moved;
+                    if samples.len() < 5 {
+                        samples.push((b.mint.clone(), sol_moved / delta));
+                    }
+                    break;
+                }
+            }
+        }
+
+        println!("\n--- 30s of the stream we already receive ---");
+        println!("transactions           {seen}");
+        println!("yielded a price        {priced}  ({:.0}%)", 100.0 * priced as f64 / seen.max(1) as f64);
+        println!("distinct tokens        {}", mints.len());
+        println!("SOL volume observed    {sol_volume:.1}");
+        println!("\nsample prices (SOL per token):");
+        for (m, p) in &samples {
+            println!("  {}  {p:.3e}", &m[..12]);
+        }
+        assert!(priced > 0, "no prices derivable from the stream");
+    }
+
+    /// Can SOL/USD be derived from the SAME stream, with no external feed?
+    /// A swap that moves WSOL one way and USDC the other IS a SOL price.
+    ///
+    ///   cargo test --features sniper -- --ignored --nocapture sol_usd_from_stream
+    #[ignore = "hits a live Geyser endpoint"]
+    #[tokio::test]
+    async fn sol_usd_from_stream_feasibility() {
+        let _ = dotenvy::dotenv();
+        let endpoint = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
+        let token = std::env::var("GRPC_X_TOKEN").ok().filter(|t| !t.is_empty());
+        let mut client = connect_geyser(&endpoint, token).await.expect("connect");
+
+        let programs: Vec<String> = [Dex::RaydiumV4, Dex::RaydiumCpmm, Dex::PumpSwap]
+            .iter()
+            .map(|d| d.program_id().to_string())
+            .collect();
+        let mut transactions = HashMap::new();
+        transactions.insert(
+            "swaps".to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                account_include: programs,
+                ..Default::default()
+            },
+        );
+        let (_sink, mut stream) = client
+            .subscribe_with_request(Some(SubscribeRequest {
+                transactions,
+                commitment: Some(CommitmentLevel::Processed as i32),
+                ..Default::default()
+            }))
+            .await
+            .expect("subscribe");
+
+        const WSOL: &str = "So11111111111111111111111111111111111111112";
+        const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+        let mut obs: Vec<(f64, f64)> = Vec::new(); // (price, size_sol)
+
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let Ok(update) = item else { continue };
+            let Some(UpdateOneof::Transaction(tx)) = update.update_oneof else { continue };
+            let Some(info) = tx.transaction.as_ref() else { continue };
+            let Some(meta) = info.meta.as_ref() else { continue };
+            if info.is_vote || meta.err.is_some() {
+                continue;
+            }
+
+            let mut before: HashMap<(&str, &str), f64> = HashMap::new();
+            for b in &meta.pre_token_balances {
+                if let Some(a) = b.ui_token_amount.as_ref() {
+                    before.insert((b.owner.as_str(), b.mint.as_str()), a.ui_amount);
+                }
+            }
+            // One owner whose WSOL and USDC both moved, in opposite directions.
+            let mut per_owner: HashMap<&str, (f64, f64)> = HashMap::new();
+            for b in &meta.post_token_balances {
+                let Some(a) = b.ui_token_amount.as_ref() else { continue };
+                let prev = before.get(&(b.owner.as_str(), b.mint.as_str())).copied().unwrap_or(0.0);
+                let d = a.ui_amount - prev;
+                if b.mint == WSOL {
+                    per_owner.entry(b.owner.as_str()).or_default().0 += d;
+                } else if b.mint == USDC {
+                    per_owner.entry(b.owner.as_str()).or_default().1 += d;
+                }
+            }
+            for (_, (dsol, dusdc)) in per_owner {
+                if dsol.abs() > 0.01 && dusdc.abs() > 1.0 && (dsol > 0.0) != (dusdc > 0.0) {
+                    obs.push((dusdc.abs() / dsol.abs(), dsol.abs()));
+                }
+            }
+        }
+
+        obs.sort_by(|a, b| a.0.total_cmp(&b.0));
+        println!("\n--- 45s: SOL/USD observations from our own stream ---");
+        println!("observations: {}", obs.len());
+        if !obs.is_empty() {
+            let med = obs[obs.len() / 2].0;
+            let biggest = obs.iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+            println!("median price: ${med:.2}");
+            println!("range:        ${:.2} - ${:.2}", obs[0].0, obs[obs.len() - 1].0);
+            println!("largest swap: {:.1} SOL @ ${:.2}", biggest.1, biggest.0);
+        }
+        assert!(!obs.is_empty(), "no WSOL/USDC swaps seen — SOL/USD not derivable this way");
+    }
 }

@@ -2671,7 +2671,7 @@ mod tests {
         sc.trade_size_sol = 0.02;
         sc.max_trade_size_sol = 0.1;
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default()).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
 
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
         let msg = b.render_settings();

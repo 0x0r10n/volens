@@ -230,11 +230,11 @@ fn ensure_parent(path: &str) {
 pub fn spawn_sampler(
     store: std::sync::Arc<OutcomeStore>,
     rpc: std::sync::Arc<crate::rpc::RpcClient>,
+    prices: std::sync::Arc<crate::prices::PriceIndex>,
     cfg: crate::config::TrackedConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let jup = crate::jupiter::Jupiter::new(&cfg.jupiter_base_url);
         let tick = std::time::Duration::from_secs(cfg.sample_check_secs.max(30));
         let horizons = cfg.outcome_horizons_secs.clone();
 
@@ -278,12 +278,19 @@ pub fn spawn_sampler(
                     break;
                 }
 
-                let sol_value = crate::signals::quote_sol_value(
-                    &jup,
-                    &token.mint,
-                    token.reference_tokens_raw,
-                )
-                .await;
+                // From the stream. A token with no trade inside the window is
+                // not priceable — and "nobody is trading it" is exactly the
+                // outcome scoring wants to record.
+                let sol_value = prices
+                    .price_sol(&token.mint, std::time::Duration::from_secs(3600))
+                    .map(|p| {
+                        p.price_sol
+                            * crate::signals::tokens_ui(
+                                token.reference_tokens_raw,
+                                token.decimals,
+                            )
+                    })
+                    .filter(|v| *v > 0.0);
 
                 let (value, ok) = match sol_value {
                     Some(v) => {
@@ -306,7 +313,7 @@ pub fn spawn_sampler(
                 };
 
                 let fdv_usd = if ok {
-                    live_fdv(&rpc, &token, value, &cfg).await
+                    live_fdv(&rpc, &token, value, &prices).await
                 } else {
                     Some(0.0)
                 };
@@ -347,7 +354,7 @@ async fn live_fdv(
     rpc: &crate::rpc::RpcClient,
     token: &PendingToken,
     sol_value: f64,
-    cfg: &crate::config::TrackedConfig,
+    prices: &crate::prices::PriceIndex,
 ) -> Option<f64> {
     if token.decimals == 0 || token.reference_tokens_raw == 0 {
         return None;
@@ -360,7 +367,7 @@ async fn live_fdv(
     if tokens_ui <= 0.0 {
         return None;
     }
-    let sol_usd = crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await?;
+    let sol_usd = prices.sol_usd(std::time::Duration::from_secs(300))?;
     let fdv = (sol_value / tokens_ui) * supply * sol_usd;
     fdv.is_finite().then_some(fdv)
 }

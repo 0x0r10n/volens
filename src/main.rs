@@ -25,6 +25,7 @@ mod outcomes;
 mod parser;
 #[cfg(feature = "sniper")]
 mod positions;
+mod prices;
 #[cfg(feature = "sniper")]
 mod quote;
 mod rpc;

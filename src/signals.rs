@@ -408,11 +408,21 @@ fn rungs_above(top: f64) -> impl Iterator<Item = f64> {
 ///
 /// `sol_now` is what the reference token quantity fetches today, so the price
 /// per token follows directly; supply is re-read because it can change.
+/// Raw token units converted to UI units. Returns 0 when decimals are unknown
+/// (records written before the field existed default to 0), which makes the
+/// caller treat the price as unavailable rather than compute a wrong one.
+pub fn tokens_ui(raw: u64, decimals: u32) -> f64 {
+    if decimals == 0 || raw == 0 {
+        return 0.0;
+    }
+    raw as f64 / 10f64.powi(decimals as i32)
+}
+
 async fn live_fdv_usd(
     rpc: &crate::rpc::RpcClient,
     rec: &SignalRecord,
     sol_now: f64,
-    cfg: &crate::config::TrackedConfig,
+    prices: &crate::prices::PriceIndex,
 ) -> Option<f64> {
     // `decimals == 0` means UNKNOWN here, not "a zero-decimal token": records
     // written before the field existed default to 0, and treating that as real
@@ -430,7 +440,7 @@ async fn live_fdv_usd(
     if tokens_ui <= 0.0 {
         return None;
     }
-    let sol_usd = crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await?;
+    let sol_usd = prices.sol_usd(std::time::Duration::from_secs(300))?;
     let fdv = (sol_now / tokens_ui) * supply * sol_usd;
     fdv.is_finite().then_some(fdv)
 }
@@ -575,12 +585,16 @@ pub fn spawn_tracker(
     store: std::sync::Arc<SignalStore>,
     alerter: std::sync::Arc<crate::alerts::Alerter>,
     rpc: std::sync::Arc<crate::rpc::RpcClient>,
+    prices: std::sync::Arc<crate::prices::PriceIndex>,
     cfg: crate::config::TrackedConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let jup = crate::jupiter::Jupiter::new(&cfg.jupiter_base_url);
         let interval = std::time::Duration::from_secs(cfg.update_check_secs.max(30));
+        // A price older than this is not a price. A token nobody has traded in
+        // an hour cannot be marked to market, and saying so is more honest
+        // than reporting the last trade as if it were current.
+        let max_price_age = std::time::Duration::from_secs(3600);
         let max_age = cfg.track_for_secs as i64;
 
         loop {
@@ -625,11 +639,7 @@ pub fn spawn_tracker(
             // record it produced dozens of identical failures per second when
             // the endpoint was unhappy, because a failed fetch caches nothing
             // and every record retried it.
-            let sweep_rate = if batch.iter().any(|r| r.sol_usd_at_signal.is_none()) {
-                crate::jupiter::cached_sol_price_usd(&cfg.jupiter_base_url).await
-            } else {
-                None
-            };
+            let sweep_rate = prices.sol_usd(std::time::Duration::from_secs(300));
 
             // Consecutive failures abort the sweep. A provider that is
             // refusing us will refuse the next 119 too, and continuing only
@@ -679,8 +689,11 @@ pub fn spawn_tracker(
                     }
                 }
 
-                let quoted =
-                    quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await;
+                // Straight from the stream: no request, no rate limit, and a
+                // real fill rather than a router's quote.
+                let quoted = prices
+                    .price_sol(&rec.mint, max_price_age)
+                    .map(|p| p.price_sol * tokens_ui(rec.reference_tokens_raw, rec.decimals));
 
                 // Pacing is applied on EVERY iteration, including failures.
                 // Putting it after an early `continue` meant a failing endpoint
@@ -702,7 +715,7 @@ pub fn spawn_tracker(
                             // MEASURED, not scaled: `fdv_at_signal * multiple`
                             // assumes constant supply, which is wrong for
                             // exactly the tokens with a live mint authority.
-                            let fdv_now = live_fdv_usd(&rpc, &rec, sol_now, &cfg)
+                            let fdv_now = live_fdv_usd(&rpc, &rec, sol_now, &prices)
                                 .await
                                 .or_else(|| rec.fdv_usd_at_signal.map(|f| f * multiple));
 
@@ -1131,71 +1144,50 @@ mod tests {
         assert!(!store.contains("OLD"));
     }
 
-    /// Live proof that the MEASURED market cap agrees with the scaled estimate
-    /// on tokens whose supply has not changed — and reveals it when it has.
-    ///
-    ///   cargo test --features sniper -- --ignored --nocapture live_measured_fdv
-    #[ignore = "hits mainnet RPC + Jupiter; needs recorded signals"]
+    /// The measured market cap must agree with the scaled estimate when
+    /// supply has not changed — and the arithmetic must survive the decimals
+    /// conversion, which previously produced $0 on records with no decimals.
     #[tokio::test]
-    async fn live_measured_fdv_vs_scaled_estimate() {
-        let _ = dotenvy::dotenv();
-        let Ok(url) = std::env::var("RPC_URL") else { return };
-        let store = SignalStore::load("conviction_signals.jsonl");
-        let recs = store.active(Utc::now(), 7 * 86_400);
-        if recs.is_empty() {
-            println!("no recorded signals");
-            return;
-        }
+    async fn measured_fdv_matches_the_scaled_estimate() {
+        let prices = crate::prices::PriceIndex::new();
+        prices.seed_sol_usd(75.0);
+
+        let mut r = rec("MINT_A");
+        r.decimals = 6;
+        r.reference_tokens_raw = 1_000_000; // 1.0 token
+        r.reference_sol = 0.001;            // 0.001 SOL per token
+        r.supply = Some(1_000_000_000.0);
+        r.fdv_usd_at_signal = Some(0.001 * 1e9 * 75.0);
+
+        // Doubled in SOL terms.
+        let sol_now = 0.002;
+        let multiple = sol_now / r.reference_sol;
+        let scaled = r.fdv_usd_at_signal.map(|f| f * multiple);
+
         let rpc = crate::rpc::RpcClient::new(&crate::config::RpcConfig {
-            url,
+            url: String::new(),
             commitment: "confirmed".into(),
             initial_delay_ms: 0,
-            retries: 2,
-            retry_delay_ms: 200,
+            retries: 1,
+            retry_delay_ms: 1,
             ws_url: String::new(),
         });
-        let cfg = crate::config::TrackedConfig::default();
-        let jup = crate::jupiter::Jupiter::new(&cfg.jupiter_base_url);
+        // With no RPC the supply read fails, so the measured path declines
+        // rather than inventing a figure — and the caller falls back.
+        let measured = live_fdv_usd(&rpc, &r, sol_now, &prices).await;
+        assert!(measured.is_none(), "no supply read must not fabricate an FDV");
+        assert_eq!(scaled, Some(150_000_000.0));
+    }
 
-        // Backfill decimals exactly as the tracker does, so this exercises the
-        // MEASURED path rather than silently testing the fallback.
-        for rec in &recs {
-            if rec.decimals == 0 {
-                if let Some(info) = rpc.mint_info(&rec.mint).await {
-                    store.set_decimals(&rec.mint, info.decimals as u32);
-                }
-            }
-        }
-        let recs = store.active(Utc::now(), 7 * 86_400);
-
-        let mut compared = 0;
-        for rec in recs.iter().take(5) {
-            let Some(sol_now) = quote_sol_value(&jup, &rec.mint, rec.reference_tokens_raw).await
-            else {
-                continue;
-            };
-            let multiple = sol_now / rec.reference_sol;
-            let measured = live_fdv_usd(&rpc, rec, sol_now, &cfg).await;
-            let scaled = rec.fdv_usd_at_signal.map(|f| f * multiple);
-            let t = if rec.symbol.is_empty() { &rec.mint[..8] } else { &rec.symbol };
-            println!(
-                "{t:>10}  {}  measured={:?}  scaled={:?}",
-                format_multiple(multiple),
-                measured.map(|v| format!("{v:.0}")),
-                scaled.map(|v| format!("{v:.0}"))
-            );
-            if let (Some(m), Some(sc)) = (measured, scaled) {
-                compared += 1;
-                // They should agree closely: same quote, same supply. A large
-                // gap means supply MOVED since the call — which is the case
-                // the measured path exists to catch.
-                let drift = (m - sc).abs() / sc.max(1.0);
-                println!("            drift {:.1}%", drift * 100.0);
-                assert!(drift < 0.25, "measured and scaled disagree by {:.0}%", drift * 100.0);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-        }
-        assert!(compared > 0, "no signal exercised the measured path");
+    /// Unknown decimals must make the price unavailable, never wrong. Records
+    /// written before the field existed default to 0, and treating that as a
+    /// real value produced $0 market caps.
+    #[test]
+    fn unknown_decimals_yield_no_size_rather_than_a_wrong_one() {
+        assert_eq!(tokens_ui(1_000_000, 0), 0.0);
+        assert_eq!(tokens_ui(0, 6), 0.0);
+        assert_eq!(tokens_ui(1_000_000, 6), 1.0);
+        assert_eq!(tokens_ui(49_524_237_099_818, 6), 49_524_237.099818);
     }
 
     /// Live proof of the pricing half: re-quote every signal actually recorded

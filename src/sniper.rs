@@ -94,6 +94,9 @@ pub enum Denial {
     PoolCoolingDown { seconds_remaining: i64 },
     /// Fully-diluted valuation at or above the configured ceiling.
     MarketCapTooHigh { mcap_usd: f64, max_usd: f64 },
+    /// The ceiling could not be evaluated. Refused rather than waved through:
+    /// an unreadable guard is not a passed guard.
+    MarketCapUnreadable,
     /// The venue has no verified encoder, or state could not be read.
     CannotBuild { reason: String },
     /// The trade would move the pool more than we tolerate.
@@ -116,6 +119,7 @@ impl Denial {
             Denial::DailyTradeCountReached { .. } => "daily trade count reached",
             Denial::PoolCoolingDown { .. } => "pool traded recently",
             Denial::MarketCapTooHigh { .. } => "market cap too high",
+            Denial::MarketCapUnreadable => "market cap unreadable",
             Denial::CannotBuild { .. } => "cannot build trade",
             Denial::PriceImpactTooHigh { .. } => "price impact too high",
             Denial::NoSimulationIdentity => "no simulate_as configured",
@@ -336,6 +340,10 @@ pub struct Sniper {
     /// See `Tunable`. Behind its own lock; read once per decision.
     tunable: Mutex<Tunable>,
     rpc: Arc<RpcClient>,
+    /// Stream-derived prices. Replaces the external quote API that was
+    /// IP-blocked, and which — while the market-cap gate still failed open —
+    /// silently disabled that ceiling for hours.
+    prices: Arc<crate::prices::PriceIndex>,
     submitter: Submitter,
     jito: Option<JitoClient>,
 }
@@ -361,7 +369,12 @@ impl Sniper {
     ///
     /// Arming loads the configured keypair; a missing path or unreadable file is
     /// a hard error, never a silent fallback to dry run.
-    pub fn new(cfg: SniperConfig, rpc: Arc<RpcClient>, rpc_cfg: &RpcConfig) -> Result<Self> {
+    pub fn new(
+        cfg: SniperConfig,
+        rpc: Arc<RpcClient>,
+        rpc_cfg: &RpcConfig,
+        prices: Arc<crate::prices::PriceIndex>,
+    ) -> Result<Self> {
         // max_trade_size_sol == 0 means "no per-trade ceiling" (unlimited).
         // Only enforce the ceiling when one is actually configured.
         if cfg.max_trade_size_sol > 0.0 && cfg.trade_size_sol > cfg.max_trade_size_sol {
@@ -425,6 +438,7 @@ impl Sniper {
         Ok(Self {
             cfg,
             mode,
+            prices,
             state: Mutex::new(DailyState::default()),
             tunable: Mutex::new(tunable),
             rpc,
@@ -707,9 +721,19 @@ impl Sniper {
 
         // MARKET CAP CEILING. Checked here, after every cheap gate has already
         // passed, so the extra reads are only spent on a pool we are otherwise
-        // about to buy. An unreadable market cap does NOT block the trade: the
-        // other guards (liquidity, mint safety, price impact) still apply, and
-        // failing closed here would halt all trading whenever Jupiter is down.
+        // about to buy.
+        //
+        // FAILS CLOSED. This used to proceed when the market cap was
+        // unreadable, on the reasoning that the other guards still applied and
+        // failing closed would halt trading whenever the price source was
+        // down. That was wrong, and it went wrong in exactly the predicted
+        // way: the price source WAS blocked for hours, and this guard — added
+        // after buying a high-market-cap rug — was silently inert the whole
+        // time. Nothing said so.
+        //
+        // A display field may degrade. A guard may not: "I could not check"
+        // must never read as "the check passed". Refusing costs a missed
+        // trade; proceeding costs the exact loss the ceiling exists to stop.
         if self.cfg.max_market_cap_usd > 0.0 {
             match self.event_market_cap_usd(ev).await {
                 Some(mcap) if mcap >= self.cfg.max_market_cap_usd => {
@@ -730,10 +754,19 @@ impl Sniper {
                     };
                 }
                 Some(mcap) => info!(pool = %ev.pool, mcap_usd = mcap, "market cap within ceiling"),
-                None => warn!(
-                    pool = %ev.pool,
-                    "market cap unreadable — proceeding on the other guards"
-                ),
+                None => {
+                    let d = Denial::MarketCapUnreadable;
+                    warn!(
+                        pool = %ev.pool,
+                        "sniper: skipped — market cap unreadable, refusing rather than \
+                         trading with the ceiling disabled"
+                    );
+                    self.audit(ev, Some(&plan), Some(&d), None).await;
+                    return Execution::Skipped {
+                        pool: ev.pool.clone(),
+                        reason: d.label().to_string(),
+                    };
+                }
             }
         }
 
@@ -1026,15 +1059,14 @@ impl Sniper {
         }
     }
 
-    /// SOL price in USD.
+    /// SOL price in USD, from the stream-derived index.
     ///
-    /// Delegates to the shared cache in `jupiter`, which serves a stale price
-    /// on a failed refresh. This used to keep its own cache that returned
-    /// `None` on any error — so a single transient Jupiter failure disabled the
-    /// market-cap ceiling entirely, which is the guard failing OPEN.
+    /// No external API: the previous source was IP-blocked for hours, which —
+    /// while this gate still failed open — silently disabled the market-cap
+    /// ceiling. A price we derive from our own feed cannot be rate limited.
     #[cfg(feature = "sniper")]
     async fn sol_price_usd(&self) -> Option<f64> {
-        crate::jupiter::cached_sol_price_usd(&self.cfg.jupiter_base_url).await
+        self.prices.sol_usd(std::time::Duration::from_secs(300))
     }
 
     /// Fully-diluted market cap of the launched token, in USD.
@@ -1339,6 +1371,23 @@ async fn append_line(path: &str, value: &serde_json::Value) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The market-cap ceiling must REFUSE when it cannot read a price.
+    ///
+    /// This failed open for most of the project's life, and it went wrong in
+    /// the predicted way: the price source was IP-blocked for hours and the
+    /// ceiling — added specifically after buying a high-market-cap rug — was
+    /// silently inert the whole time, with nothing to say so.
+    #[test]
+    fn an_unreadable_market_cap_is_a_denial_not_a_pass() {
+        let d = super::Denial::MarketCapUnreadable;
+        assert_eq!(d.label(), "market cap unreadable");
+
+        // The distinction that matters: "could not check" is its own outcome,
+        // never folded into "checked and fine".
+        let too_high = super::Denial::MarketCapTooHigh { mcap_usd: 9e4, max_usd: 5e4 };
+        assert_ne!(d.label(), too_high.label());
+    }
+
     use super::*;
     use crate::model::{Dex, PoolEvent, WSOL_MINT};
 
@@ -1386,7 +1435,12 @@ mod tests {
             url: "https://api.mainnet-beta.solana.com".into(),
             ..Default::default()
         };
-        Sniper::new(c, Arc::new(RpcClient::new(&rpc_cfg)), &rpc_cfg)
+        Sniper::new(
+            c,
+            Arc::new(RpcClient::new(&rpc_cfg)),
+            &rpc_cfg,
+            Arc::new(crate::prices::PriceIndex::new()),
+        )
     }
 
     fn event() -> PoolEvent {
