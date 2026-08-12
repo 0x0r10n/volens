@@ -104,34 +104,53 @@ def main():
     live = {}
     if missing and not args.no_quotes:
         print(f"\nquoting {len(missing)} tokens with no samples yet…")
+        # Older rows predate `token_amount_raw`; they can still be scored from
+        # sampled outcomes, they just cannot be re-quoted.
         raw_by_mint = {}
         for b in buys:
-            raw_by_mint.setdefault(b["mint"], 0)
-            raw_by_mint[b["mint"]] = max(raw_by_mint[b["mint"]], b["token_amount_raw"])
-        for i, mint in enumerate(missing, 1):
+            raw = b.get("token_amount_raw")
+            if raw:
+                raw_by_mint[b["mint"]] = max(raw_by_mint.get(b["mint"], 0), raw)
+        quotable = [m for m in missing if m in raw_by_mint]
+        skipped = len(missing) - len(quotable)
+        if skipped:
+            print(f"  {skipped} tokens have no raw amount recorded; using samples only")
+
+        # Give up after a run of failures rather than grinding through
+        # thousands: a quote endpoint that refuses us will refuse them all.
+        fails = 0
+        for i, mint in enumerate(quotable, 1):
             v = quote_sol(mint, raw_by_mint[mint])
             live[mint] = v
+            fails = 0 if v is not None else fails + 1
+            if fails >= 15:
+                print(f"  quote endpoint failing ({fails} in a row) — stopping at {i};"
+                      f" remaining tokens scored from samples only")
+                break
             if i % 25 == 0:
-                print(f"  {i}/{len(missing)}…")
+                print(f"  {i}/{len(quotable)}…")
             time.sleep(0.35)
 
     W = collections.defaultdict(lambda: {
         "name": "", "n": 0, "paid": 0.0, "peak_w": 0.0, "final_w": 0.0,
-        "rugs": 0, "wins": 0, "sampled": 0,
+        "rugs": 0, "wins": 0, "sampled": 0, "unknown": 0,
     })
     for b in buys:
         w = W[b["wallet"]]
         w["name"] = b.get("wallet_name") or b["wallet"][:8]
-        w["n"] += 1
         paid = b["sol_spent"]
-        w["paid"] += paid
 
         o = outcomes.get(b["mint"])
         if o:
             w["sampled"] += 1
             peak, final, rugged = o["peak"], o["final"], o["rugged"]
         else:
-            v = live.get(b["mint"])
+            v = live.get(b["mint"], "unknown")
+            if v == "unknown":
+                # No sample AND no quote: we do not know. Excluded rather than
+                # counted as a rug — "we did not look" is not "it died".
+                w["unknown"] += 1
+                continue
             if v is None:
                 peak = final = 0.0
                 rugged = True
@@ -140,6 +159,10 @@ def main():
                 m = (v / ref) if ref > 0 else 0.0
                 peak = final = m
                 rugged = False
+        # Counted only once we know an outcome, so the denominator matches the
+        # numerator and an unscored buy cannot dilute the average.
+        w["n"] += 1
+        w["paid"] += paid
         # Weight by size: a 40 SOL call should count for more than a 0.05 dust buy.
         w["peak_w"] += peak * paid
         w["final_w"] += final * paid
@@ -152,12 +175,12 @@ def main():
     ranked.sort(key=lambda v: v["peak_w"] / v["paid"], reverse=True)
 
     print(f"\n{len(ranked)} wallets with >= {args.min_buys} buys\n")
-    print(f"{'wallet':<24}{'buys':>5}{'paid':>9}{'peak':>7}{'final':>7}{'2x+':>6}{'rug':>6}{'smp':>5}")
+    print(f"{'wallet':<24}{'buys':>5}{'paid':>9}{'peak':>7}{'final':>7}{'2x+':>6}{'rug':>6}{'smp':>5}{'?':>5}")
     print("-" * 69)
     for v in ranked[: args.top]:
         print(f"{v['name'][:24]:<24}{v['n']:>5}{v['paid']:>9.2f}"
               f"{v['peak_w']/v['paid']:>6.2f}x{v['final_w']/v['paid']:>6.2f}x"
-              f"{v['wins']:>5}/{v['n']}{v['rugs']:>5}/{v['n']}{v['sampled']:>5}")
+              f"{v['wins']:>5}/{v['n']}{v['rugs']:>5}/{v['n']}{v['sampled']:>5}{v['unknown']:>5}")
 
     tp = sum(v["paid"] for v in ranked)
     if tp:

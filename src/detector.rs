@@ -260,8 +260,13 @@ impl Detector {
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                         _ = sd.changed() => { if *sd.borrow() { return; } continue; }
                     }
-                    // Tokens untraded for an hour cannot be priced anyway.
-                    let pruned = prices.prune(Duration::from_secs(3600));
+                    // Retained for six hours, not one. The outcome sampler
+                    // asks about tokens at +1h/+6h/+24h, and pruning at an
+                    // hour meant those lookups found nothing and recorded a
+                    // live token as unsellable. Memory is the cheaper side of
+                    // that trade: a few hundred bytes per token against a
+                    // corrupted scoring dataset.
+                    let pruned = prices.prune(Duration::from_secs(6 * 3600));
                     match prices.sol_usd(Duration::from_secs(300)) {
                         Some(p) => info!(
                             sol_usd = format!("{p:.2}"),

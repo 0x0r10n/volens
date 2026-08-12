@@ -89,8 +89,19 @@ pub struct OutcomeSample {
     pub reference_sol: f64,
     /// `sol_value / reference_sol`. 0 when unroutable.
     pub multiple: f64,
-    /// False = no route out. Unsellable is an outcome, not a missing datapoint.
+    /// Did we have a usable price at this horizon?
+    ///
+    /// `false` means UNKNOWN, not "unsellable". The distinction matters and
+    /// was got wrong once: prices come from trades we observe, so a token that
+    /// simply has not traded in our window looks identical to one that cannot
+    /// be sold. Recording the first as a rug poisons the very dataset this
+    /// exists to build. Scoring must exclude these, never count them as zeros.
     pub routed: bool,
+    /// How stale the price was, in seconds. `None` when there was no price at
+    /// all. A price hours old is itself information — nobody is trading it —
+    /// but it is not a current mark, and the scorer needs to tell them apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_age_secs: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fdv_usd: Option<f64>,
 }
@@ -235,8 +246,11 @@ pub fn spawn_sampler(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let tick = std::time::Duration::from_secs(cfg.sample_check_secs.max(30));
+        let tick = std::time::Duration::from_secs(cfg.sample_check_secs.max(15));
         let horizons = cfg.outcome_horizons_secs.clone();
+        // A price this old still counts: "last traded six hours ago" is a real
+        // observation about a token, and far better than recording nothing.
+        let max_price_age = std::time::Duration::from_secs(6 * 3600);
 
         loop {
             tokio::select! {
@@ -281,8 +295,8 @@ pub fn spawn_sampler(
                 // From the stream. A token with no trade inside the window is
                 // not priceable — and "nobody is trading it" is exactly the
                 // outcome scoring wants to record.
-                let sol_value = prices
-                    .price_sol(&token.mint, std::time::Duration::from_secs(3600))
+                let observed = prices.price_sol(&token.mint, max_price_age);
+                let sol_value = observed
                     .map(|p| {
                         p.price_sol
                             * crate::signals::tokens_ui(
@@ -298,7 +312,9 @@ pub fn spawn_sampler(
                         routed += 1;
                         (v, true)
                     }
-                    // Unsellable IS the outcome — recorded, never skipped.
+                    // UNKNOWN, not unsellable. Recorded so the gap is visible,
+                    // but flagged so scoring can exclude it rather than treat
+                    // a token we simply never saw trade as a rug.
                     None => {
                         consecutive_fail += 1;
                         dead += 1;
@@ -319,6 +335,7 @@ pub fn spawn_sampler(
                 };
 
                 store.append_sample(&OutcomeSample {
+                    price_age_secs: observed.map(|p| p.age.as_secs()),
                     mint: token.mint.clone(),
                     horizon_secs: horizon,
                     at: now,
@@ -338,8 +355,8 @@ pub fn spawn_sampler(
 
             store.persist_pending();
             tracing::info!(
-                routed,
-                unsellable = dead,
+                priced = routed,
+                unpriced = dead,
                 expired,
                 pending = store.len(),
                 took_secs = started.elapsed().as_secs(),
@@ -485,10 +502,12 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Unsellable is the single most important outcome for scoring. It must be
-    /// recorded as a zero, never dropped as a missing datapoint.
+    /// An unpriced horizon is recorded, but flagged UNKNOWN rather than as a
+    /// rug. Prices come from trades we observe, so "we never saw it trade" and
+    /// "it cannot be sold" are different claims — conflating them was writing
+    /// live tokens into the scoring set as failures.
     #[test]
-    fn an_unsellable_token_is_recorded_not_skipped() {
+    fn an_unpriced_token_is_recorded_as_unknown_not_as_a_rug() {
         let dir = std::env::temp_dir().join(format!("volens-dead-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let s = dir.join("samples.jsonl").to_string_lossy().to_string();
@@ -496,6 +515,7 @@ mod tests {
 
         let store = OutcomeStore::load("/nonexistent/p4.jsonl", &s);
         store.append_sample(&OutcomeSample {
+            price_age_secs: None,
             mint: "DEAD".into(),
             horizon_secs: 3600,
             at: Utc::now(),
@@ -509,8 +529,9 @@ mod tests {
         });
         let line = std::fs::read_to_string(&s).unwrap();
         let back: OutcomeSample = serde_json::from_str(line.trim()).unwrap();
-        assert!(!back.routed);
+        assert!(!back.routed, "flagged as no usable price");
         assert_eq!(back.multiple, 0.0);
+        assert_eq!(back.price_age_secs, None, "no price means no age to report");
         let _ = std::fs::remove_file(&s);
     }
 }

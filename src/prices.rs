@@ -294,7 +294,7 @@ impl PriceIndex {
         if age > max_age {
             return None;
         }
-        let price = median(series.recent.iter().map(|o| o.price))?;
+        let price = weighted_median(&series.recent)?;
         Some(Priced { price_sol: price, age, observations: series.recent.len() })
     }
 
@@ -337,6 +337,34 @@ impl PriceIndex {
     }
 }
 
+/// Median weighted by trade size.
+///
+/// An unweighted median treats a 0.03 SOL dust trade as equal evidence to a
+/// 40 SOL one, and dust carries most of the slippage. Observed live: a token's
+/// reported multiple swinging 9.9x -> 16.4x inside 90 seconds, which is the
+/// aggregation moving, not the price. Weighting by size lets the trades that
+/// actually set the market dominate.
+fn weighted_median(obs: &VecDeque<Obs>) -> Option<f64> {
+    let mut v: Vec<(f64, f64)> = obs
+        .iter()
+        .filter(|o| o.price.is_finite() && o.price > 0.0 && o.size_sol > 0.0)
+        .map(|o| (o.price, o.size_sol))
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total: f64 = v.iter().map(|(_, w)| w).sum();
+    let mut acc = 0.0;
+    for (price, w) in &v {
+        acc += w;
+        if acc >= total / 2.0 {
+            return Some(*price);
+        }
+    }
+    v.last().map(|(p, _)| *p)
+}
+
 /// Median of an iterator of prices. `None` when empty.
 ///
 /// Median rather than mean: measured artifacts include a 68,579 SOL "swap"
@@ -369,6 +397,31 @@ mod tests {
         let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
         assert!(mean < 62.0, "a mean is dragged to {mean:.1} by one artifact");
         assert!(mean < 76.4 - 14.0, "and it lands far outside the true cluster");
+    }
+
+    /// A dust trade must not carry the same weight as a large one: dust is
+    /// where the slippage lives, and letting it vote equally made a token's
+    /// reported multiple swing 9.9x -> 16.4x in 90 seconds.
+    #[test]
+    fn weighting_lets_real_size_set_the_price() {
+        let mut obs = VecDeque::new();
+        // Three dust trades at silly prices, one large trade at the real one.
+        for p in [2.0, 3.0, 4.0] {
+            obs.push_back(Obs { at: Instant::now(), price: p, size_sol: 0.03 });
+        }
+        obs.push_back(Obs { at: Instant::now(), price: 1.0, size_sol: 40.0 });
+
+        assert_eq!(weighted_median(&obs), Some(1.0), "the 40 SOL trade should decide");
+        // The unweighted median would have picked a dust price.
+        assert_eq!(median(obs.iter().map(|o| o.price)), Some(2.5));
+    }
+
+    #[test]
+    fn weighted_median_handles_degenerate_input() {
+        assert_eq!(weighted_median(&VecDeque::new()), None);
+        let mut obs = VecDeque::new();
+        obs.push_back(Obs { at: Instant::now(), price: 5.0, size_sol: 0.0 });
+        assert_eq!(weighted_median(&obs), None, "zero-size observations carry no weight");
     }
 
     #[test]
