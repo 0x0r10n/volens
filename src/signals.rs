@@ -704,9 +704,13 @@ pub fn spawn_tracker(
 
                 // Straight from the stream: no request, no rate limit, and a
                 // real fill rather than a router's quote.
+                // A zero is not a price: `tokens_ui` returns 0 when decimals
+                // are unknown, and multiplying through would report a real
+                // token as worthless rather than as unpriceable.
                 let quoted = prices
                     .price_sol(&rec.mint, max_price_age)
-                    .map(|p| p.price_sol * tokens_ui(rec.reference_tokens_raw, rec.decimals));
+                    .map(|p| p.price_sol * tokens_ui(rec.reference_tokens_raw, rec.decimals))
+                    .filter(|v| *v > 0.0);
 
                 // Pacing is applied on EVERY iteration, including failures.
                 // Putting it after an early `continue` meant a failing endpoint

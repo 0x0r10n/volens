@@ -44,6 +44,8 @@ fn redact(url: &str) -> String {
 /// one stream can carry two independent subscriptions.
 const POOL_FILTER: &str = "pool_creations";
 const TRACKED_FILTER: &str = "tracked_wallets";
+/// Venues watched only to price tokens, never parsed for pool creations.
+const PRICE_FILTER: &str = "price_feed";
 
 pub struct Detector {
     cfg: Arc<Config>,
@@ -529,6 +531,15 @@ impl Detector {
 
                             let tracked = matched.iter().any(|f| f == TRACKED_FILTER);
                             let pools = matched.iter().any(|f| f == POOL_FILTER);
+                            // Price-only venues are observed above and then
+                            // dropped: they create no pools worth parsing, and
+                            // running the parser over them is pure waste.
+                            let price_only =
+                                matched.iter().any(|f| f == PRICE_FILTER) && !pools && !tracked;
+                            if price_only {
+                                self.metrics.incr(&self.metrics.price_only_tx);
+                                continue;
+                            }
 
                             // A transaction can match BOTH filters — a tracked
                             // wallet buying into a pool it just created. Route
@@ -567,6 +578,25 @@ impl Detector {
                 failed: Some(false),
                 signature: None,
                 account_include: program_ids,
+                account_exclude: vec![],
+                account_required: vec![],
+                token_accounts: None,
+            },
+        );
+
+        // Third filter: venues that create no pools we care about but DO
+        // carry the trades that price a token. Without these a pump.fun
+        // token trading $100k/day has no price at all.
+        transactions.insert(
+            PRICE_FILTER.to_string(),
+            SubscribeRequestFilterTransactions {
+                vote: Some(false),
+                failed: Some(false),
+                signature: None,
+                account_include: crate::prices::PRICE_ONLY_PROGRAMS
+                    .iter()
+                    .map(|(_, p)| (*p).to_string())
+                    .collect(),
                 account_exclude: vec![],
                 account_required: vec![],
                 token_accounts: None,
@@ -1488,6 +1518,72 @@ mod price_from_stream_probe {
             println!("  {}  {p:.3e}", &m[..12]);
         }
         assert!(priced > 0, "no prices derivable from the stream");
+    }
+
+    /// Which extra programs carry price traffic we currently miss?
+    ///
+    ///   cargo test --features sniper -- --ignored --nocapture missing_venues
+    #[ignore = "hits a live Geyser endpoint"]
+    #[tokio::test]
+    async fn missing_venue_coverage() {
+        let _ = dotenvy::dotenv();
+        let endpoint = std::env::var("GRPC_ENDPOINT").expect("GRPC_ENDPOINT");
+        let token = std::env::var("GRPC_X_TOKEN").ok().filter(|t| !t.is_empty());
+        let mut client = connect_geyser(&endpoint, token).await.expect("connect");
+
+        // Candidates we do NOT currently watch.
+        let candidates: Vec<(&str, &str)> = vec![
+            ("pump.fun curve", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+            ("meteora damm v2", "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"),
+            ("raydium clmm", "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"),
+            ("orca whirlpool", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
+        ];
+
+        let mut transactions = HashMap::new();
+        for (name, prog) in &candidates {
+            transactions.insert(
+                (*name).to_string(),
+                SubscribeRequestFilterTransactions {
+                    vote: Some(false),
+                    failed: Some(false),
+                    account_include: vec![(*prog).to_string()],
+                    ..Default::default()
+                },
+            );
+        }
+        let (_sink, mut stream) = client
+            .subscribe_with_request(Some(SubscribeRequest {
+                transactions,
+                commitment: Some(CommitmentLevel::Processed as i32),
+                ..Default::default()
+            }))
+            .await
+            .expect("subscribe");
+
+        let index = crate::prices::PriceIndex::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let mut per_filter: HashMap<String, usize> = HashMap::new();
+
+        while let Ok(Some(item)) = tokio::time::timeout_at(deadline, stream.next()).await {
+            let Ok(update) = item else { continue };
+            let labels = update.filters.clone();
+            let Some(UpdateOneof::Transaction(tx)) = update.update_oneof else { continue };
+            let Some(info) = tx.transaction.as_ref() else { continue };
+            let Some(meta) = info.meta.as_ref() else { continue };
+            if info.is_vote || meta.err.is_some() {
+                continue;
+            }
+            for l in labels {
+                *per_filter.entry(l).or_default() += 1;
+            }
+            index.observe(info, meta);
+        }
+
+        println!("\n--- 30s on venues we do NOT currently watch ---");
+        for (name, _) in &candidates {
+            println!("  {name:<16} {} tx", per_filter.get(*name).copied().unwrap_or(0));
+        }
+        println!("  tokens priced from them: {}", index.tracked_tokens());
     }
 
     /// Can SOL/USD be derived from the SAME stream, with no external feed?

@@ -34,6 +34,9 @@ pub struct Metrics {
     pub tracked_buys: AtomicU64,
     /// Tokens that reached the conviction threshold and were announced.
     pub conviction_signals: AtomicU64,
+    /// Transactions observed purely for pricing, from venues that create no
+    /// pools we track (pump.fun curve, DAMM v2, CLMM, Whirlpool).
+    pub price_only_tx: AtomicU64,
 }
 
 impl Metrics {
@@ -58,6 +61,7 @@ impl Metrics {
             volume_confirmed: self.volume_confirmed.load(Ordering::Relaxed),
             tracked_buys: self.tracked_buys.load(Ordering::Relaxed),
             conviction_signals: self.conviction_signals.load(Ordering::Relaxed),
+            price_only_tx: self.price_only_tx.load(Ordering::Relaxed),
         }
     }
 }
@@ -76,6 +80,7 @@ pub struct Snapshot {
     pub volume_confirmed: u64,
     pub tracked_buys: u64,
     pub conviction_signals: u64,
+    pub price_only_tx: u64,
 }
 
 /// Spawn a task that logs a counter summary every `period`, plus deltas since
@@ -109,6 +114,7 @@ pub fn spawn_reporter(
                 volume_confirmed = cur.volume_confirmed,
                 tracked_buys = cur.tracked_buys,
                 conviction_signals = cur.conviction_signals,
+                price_only_tx = cur.price_only_tx,
                 tx_delta = cur.tx_seen.saturating_sub(prev.tx_seen),
                 detected_delta = cur.detected.saturating_sub(prev.detected),
                 "metrics"

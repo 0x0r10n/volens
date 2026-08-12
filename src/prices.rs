@@ -46,6 +46,30 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use yellowstone_grpc_proto::prelude::{SubscribeUpdateTransactionInfo, TransactionStatusMeta};
 
+/// Programs watched PURELY for price observations.
+///
+/// Detection only needs venues where pools are created; pricing needs every
+/// venue a token might actually trade on, and those are not the same set. A
+/// token still on the pump.fun bonding curve — most fresh launches, and
+/// exactly what smart money buys early — trades on a program that creates no
+/// pool, so it was invisible to the price feed while trading hundreds of
+/// thousands of dollars a day.
+///
+/// Measured over 30s on venues that were NOT watched:
+/// ```text
+///   pump.fun curve   1160 tx      meteora damm v2   661 tx
+///   raydium clmm      147 tx      orca whirlpool    164 tx
+///   -> 70 tokens priced that could not be priced before
+/// ```
+pub const PRICE_ONLY_PROGRAMS: &[(&str, &str)] = &[
+    // The bonding curve tokens live on BEFORE graduating to PumpSwap.
+    ("pump.fun curve", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"),
+    // Where Meteora DBC tokens graduate to — i.e. the ones that succeeded.
+    ("meteora damm v2", "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"),
+    ("raydium clmm", "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"),
+    ("orca whirlpool", "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
+];
+
 pub const WSOL: &str = "So11111111111111111111111111111111111111112";
 pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
