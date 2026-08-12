@@ -299,6 +299,7 @@ pub fn render_signal(
     mint_info: Option<&crate::rpc::MintInfo>,
     market: Option<&MarketSnapshot>,
     socials: Option<&crate::socials::Socials>,
+    holders: Option<&crate::rpc::HolderStats>,
     tz_offset_hours: i32,
 ) -> String {
     // The `$` prefix is a TICKER sigil, so it is only ever applied to a real
@@ -335,6 +336,18 @@ pub fn render_signal(
     // set.
     if signal.total_fees_sol > 0.0 {
         s.push_str(&format!("SM Fees: {}\n", format_sol(signal.total_fees_sol)));
+    }
+
+    // Risk: how many hold it, and how concentrated the non-pool holders are.
+    // Omitted entirely when unreadable rather than shown as 0 — a fabricated
+    // "0 holders" would read as a rug on a perfectly fine token.
+    if let Some(h) = holders {
+        s.push_str(&format!(
+            "Holders: {}{}\n",
+            h.count,
+            if h.capped { "+" } else { "" }
+        ));
+        s.push_str(&format!("Top10: {:.1}%\n", h.top10_pct));
     }
 
     // Safety stays an annotation, and only when it has something to say. A
@@ -699,7 +712,7 @@ mod render_tests {
     #[test]
     fn renders_a_readable_alert() {
         let meta = ("Credible".to_string(), "CRED".to_string());
-        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, None, 8);
         println!("\n--- initial alert ---\n{out}\n");
 
         assert!(out.contains("$CRED (Credible)"), "ticker first, name in parens:\n{out}");
@@ -716,7 +729,7 @@ mod render_tests {
     #[test]
     fn no_wallet_names_or_individual_sizes_are_published() {
         let meta = ("Credible".to_string(), "CRED".to_string());
-        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, None, 8);
 
         for name in ["Silver", "Ratwiz", "OGANT"] {
             assert!(!out.contains(name), "{name} leaked into the alert:\n{out}");
@@ -730,11 +743,11 @@ mod render_tests {
     /// Times are local trading time, not UTC.
     #[test]
     fn timestamps_render_in_the_configured_offset() {
-        let out = render_signal(&signal(), None, None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), None, None, Some(&market()), None, None, 8);
         assert!(out.contains("(UTC+8)"), "got:\n{out}");
         assert!(out.contains("First signal:"));
 
-        let west = render_signal(&signal(), None, None, Some(&market()), None, -5);
+        let west = render_signal(&signal(), None, None, Some(&market()), None, None, -5);
         assert!(west.contains("(UTC-5)"), "got:\n{west}");
     }
 
@@ -748,7 +761,7 @@ mod render_tests {
             decimals: 6,
             risky_extensions: vec![],
         };
-        let out = render_signal(&signal(), None, Some(&clean), Some(&market()), None, 8);
+        let out = render_signal(&signal(), None, Some(&clean), Some(&market()), None, None, 8);
         assert!(!out.contains("⚠️"), "a clean mint must not add a line:\n{out}");
 
         let risky = MintInfo {
@@ -757,7 +770,7 @@ mod render_tests {
             decimals: 6,
             risky_extensions: vec![],
         };
-        let out = render_signal(&signal(), None, Some(&risky), Some(&market()), None, 8);
+        let out = render_signal(&signal(), None, Some(&risky), Some(&market()), None, None, 8);
         assert!(out.contains("⚠️"), "a live authority must be flagged:\n{out}");
     }
 
@@ -767,7 +780,7 @@ mod render_tests {
     /// like an answer.
     #[test]
     fn a_nameless_token_shows_the_mint_without_a_ticker_sigil() {
-        let out = render_signal(&signal(), None, None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), None, None, Some(&market()), None, None, 8);
         assert!(out.contains("8Ky9Bm…W1abcd"), "got:\n{out}");
         assert!(!out.contains("$8Ky9Bm"), "a mint must not wear a $ sigil:\n{out}");
     }
@@ -776,15 +789,37 @@ mod render_tests {
     #[test]
     fn a_symbolless_token_shows_its_name() {
         let meta = ("Cheesecoin".to_string(), String::new());
-        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), Some(&meta), None, Some(&market()), None, None, 8);
         assert!(out.contains("Cheesecoin"), "got:\n{out}");
         assert!(!out.contains("$Cheesecoin"), "no symbol means no ticker:\n{out}");
+    }
+
+    /// Holder risk appears only when readable. A fabricated "0 holders" would
+    /// read as a rug on a perfectly healthy token.
+    #[test]
+    fn holder_risk_renders_only_when_known() {
+        let out = render_signal(&signal(), None, None, Some(&market()), None, None, 8);
+        assert!(!out.contains("Holders:"), "unknown must be omitted:\n{out}");
+
+        let h = crate::rpc::HolderStats {
+            count: 14,
+            capped: false,
+            top10_pct: 6.1,
+            largest_pct: 91.7,
+        };
+        let out = render_signal(&signal(), None, None, Some(&market()), None, Some(&h), 8);
+        assert!(out.contains("Holders: 14"), "got:\n{out}");
+        assert!(out.contains("Top10: 6.1%"), "got:\n{out}");
+        // 20 is the RPC ceiling, so a full page is a floor, not a count.
+        let capped = crate::rpc::HolderStats { count: 20, capped: true, ..h };
+        let out = render_signal(&signal(), None, None, Some(&market()), None, Some(&capped), 8);
+        assert!(out.contains("Holders: 20+"), "a capped count must say so:\n{out}");
     }
 
     /// Socials render inline with the chart link, and only when present.
     #[test]
     fn socials_render_beside_the_chart_link() {
-        let none = render_signal(&signal(), None, None, Some(&market()), None, 8);
+        let none = render_signal(&signal(), None, None, Some(&market()), None, None, 8);
         assert!(none.contains(">Chart</a>"));
         assert!(!none.contains(">X</a>"), "no socials means no pipes:\n{none}");
 
@@ -794,7 +829,7 @@ mod render_tests {
             website: Some("https://example.com".into()),
             image: None,
         };
-        let out = render_signal(&signal(), None, None, Some(&market()), Some(&soc), 8);
+        let out = render_signal(&signal(), None, None, Some(&market()), Some(&soc), None, 8);
         assert!(out.contains(r#"| <a href="https://x.com/foo">X</a>"#), "got:\n{out}");
         assert!(out.contains(r#"| <a href="https://example.com">Web</a>"#), "got:\n{out}");
         assert!(!out.contains(">TG</a>"), "absent link must not render:\n{out}");
@@ -803,7 +838,7 @@ mod render_tests {
     /// A missing SOL/USD rate must not blank the volume figure.
     #[test]
     fn without_a_rate_it_falls_back_to_sol_rather_than_dropping_figures() {
-        let out = render_signal(&signal(), None, None, None, None, 8);
+        let out = render_signal(&signal(), None, None, None, None, None, 8);
         assert!(out.contains("Vol: 26.39 SOL"), "got:\n{out}");
         assert!(!out.contains("MC:"), "no rate means no market cap to claim");
     }
@@ -812,14 +847,14 @@ mod render_tests {
     #[test]
     fn a_zero_rate_is_treated_as_unknown() {
         let broken = MarketSnapshot { sol_usd: 0.0, price_usd: None, fdv_usd: None };
-        let out = render_signal(&signal(), None, None, Some(&broken), None, 8);
+        let out = render_signal(&signal(), None, None, Some(&broken), None, None, 8);
         assert!(out.contains("26.39 SOL"), "got:\n{out}");
     }
 
     #[test]
     fn token_name_from_chain_is_escaped() {
         let evil = ("<b>PUMP</b>".to_string(), "X".to_string());
-        let out = render_signal(&signal(), Some(&evil), None, Some(&market()), None, 8);
+        let out = render_signal(&signal(), Some(&evil), None, Some(&market()), None, None, 8);
         assert!(out.contains("&lt;b&gt;PUMP&lt;/b&gt;"));
         assert!(!out.contains("<b>PUMP</b>"));
     }

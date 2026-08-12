@@ -788,6 +788,9 @@ impl Detector {
             // denominated in USD, so the rate is needed even if nothing will
             // re-price this token later.
             let supply = rpc.token_supply(&signal.mint).await;
+            // Holder concentration. One extra RPC call, and only on a CALL —
+            // never on the hot path.
+            let holders = rpc.holder_stats(&signal.mint).await;
             let market = market_at_signal(&reference, supply, &prices);
             let fdv_usd = market.and_then(|m| m.fdv_usd);
 
@@ -797,6 +800,7 @@ impl Detector {
                 mint_info.as_ref(),
                 market.as_ref(),
                 socials.as_ref(),
+                holders.as_ref(),
                 tz,
             );
             // The image is decoration — `send_photo_html` falls back to a

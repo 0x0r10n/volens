@@ -29,6 +29,38 @@ pub struct TokenMeta {
     pub uri: Option<String>,
 }
 
+/// A share as a percentage, guaranteed to render sanely.
+///
+/// Returns a clean `0.0` for an empty or negative numerator: `-0.0` survives
+/// `clamp` (it is not less than `0.0`) and rendered as "-0.0%" on a token
+/// whose only holder was the pool.
+fn pct(part: f64, whole: f64) -> f64 {
+    if !(part > 0.0) || !(whole > 0.0) {
+        return 0.0;
+    }
+    (100.0 * part / whole).min(100.0)
+}
+
+/// Holder concentration — the other half of the rug-risk surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HolderStats {
+    /// Holders counted. `getTokenLargestAccounts` returns at most 20, so this
+    /// is EXACT below that and a floor at it.
+    pub count: usize,
+    /// True when the count hit the RPC's 20-account ceiling, i.e. "20+".
+    pub capped: bool,
+    /// Share held by the top 10 holders, EXCLUDING the largest.
+    ///
+    /// The largest account is almost always the pool or bonding curve —
+    /// measured at 91.7% on a real token. Including it reports ~98% for every
+    /// launch, which is not a risk signal, it is noise. Excluding it gave
+    /// 6.1% on the same token, which is the number that means something.
+    pub top10_pct: f64,
+    /// What that largest account holds, as a share. Informative on its own: a
+    /// "pool" holding only 30% means somebody else is holding a lot.
+    pub largest_pct: f64,
+}
+
 /// Authority + extension state of an SPL mint. This is the rug-risk surface.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MintInfo {
@@ -419,6 +451,59 @@ impl RpcClient {
         base64::engine::general_purpose::STANDARD.decode(d).ok()
     }
 
+    /// Holder count and concentration.
+    ///
+    /// A TRUE holder count needs `getProgramAccounts` over the token program,
+    /// which this provider refuses ("Too many accounts requested") — as most
+    /// do, since it is an unbounded scan. `getTokenLargestAccounts` caps at 20,
+    /// which is exact for a fresh launch and a floor after that. For deciding
+    /// on a minutes-old token, the range below 20 is the one that matters.
+    pub async fn holder_stats(&self, mint: &str) -> Option<HolderStats> {
+        let body = json!({
+            "jsonrpc":"2.0","id":1,"method":"getTokenLargestAccounts",
+            "params":[mint, {"commitment": self.commitment}],
+        });
+        let resp: serde_json::Value = self
+            .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
+        let accounts = resp.pointer("/result/value")?.as_array()?;
+        if accounts.is_empty() {
+            return None;
+        }
+
+        let mut amounts: Vec<f64> = accounts
+            .iter()
+            .filter_map(|a| a.get("uiAmount").and_then(|v| v.as_f64()))
+            .filter(|v| *v > 0.0)
+            .collect();
+        if amounts.is_empty() {
+            return None;
+        }
+        amounts.sort_by(|a, b| b.total_cmp(a));
+
+        let supply = self.token_supply(mint).await?;
+        if supply <= 0.0 {
+            return None;
+        }
+
+        let largest = amounts[0];
+        // Skip the largest, then take the next ten.
+        let top10: f64 = amounts.iter().skip(1).take(10).sum();
+
+        Some(HolderStats {
+            count: amounts.len(),
+            // Capped on the count of NON-ZERO holders, not raw rows. The RPC
+            // returns the top 20 BY BALANCE and pads with zero-balance
+            // accounts, so 20 rows of which 4 hold anything means there are
+            // exactly 4 holders — not "4 or more". Using the raw row count
+            // reported "4+" for a token whose holders we had seen in full.
+            capped: amounts.len() >= 20,
+            // `clamp` alone is not enough: -0.0 is not LESS than 0.0, so it
+            // survives and renders as "-0.0%". An explicit positivity test is.
+            top10_pct: pct(top10, supply),
+            largest_pct: pct(largest, supply),
+        })
+    }
+
     /// Token `(name, symbol)`, from wherever this mint actually keeps it.
     ///
     /// There are TWO places, and checking only one is how a token ends up
@@ -712,6 +797,56 @@ fn parse_mint_info(resp: &serde_json::Value) -> Option<MintInfo> {
 #[cfg(test)]
 mod live_meta_tests {
     use super::*;
+
+    /// Live check of holder concentration against real mints.
+    ///
+    ///   cargo test --features sniper -- --ignored --nocapture live_holder_stats
+    #[ignore = "hits mainnet RPC; needs RPC_URL"]
+    #[tokio::test]
+    async fn live_holder_stats() {
+        let _ = dotenvy::dotenv();
+        let Ok(url) = std::env::var("RPC_URL") else { return };
+        let rpc = RpcClient::new(&crate::config::RpcConfig {
+            url,
+            commitment: "confirmed".into(),
+            initial_delay_ms: 0,
+            retries: 2,
+            retry_delay_ms: 200,
+            ws_url: String::new(),
+        });
+
+        let mints: Vec<String> = std::fs::read_to_string("conviction_signals.jsonl")
+            .map(|t| {
+                let mut seen = std::collections::BTreeSet::new();
+                for l in t.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                        if let Some(m) = v.get("mint").and_then(|m| m.as_str()) {
+                            seen.insert(m.to_string());
+                        }
+                    }
+                }
+                seen.into_iter().collect()
+            })
+            .unwrap_or_default();
+        if mints.is_empty() {
+            println!("no recorded signals");
+            return;
+        }
+
+        for mint in mints.iter().take(4) {
+            match rpc.holder_stats(mint).await {
+                Some(h) => println!(
+                    "{:.10}…  holders={}{}  top10(ex-pool)={:.1}%  largest={:.1}%",
+                    mint,
+                    h.count,
+                    if h.capped { "+" } else { "" },
+                    h.top10_pct,
+                    h.largest_pct
+                ),
+                None => println!("{:.10}…  unreadable", mint),
+            }
+        }
+    }
 
     /// Live check that the Token-2022 metadata path works. This is the bug the
     /// path exists for: CHEESECOIN keeps its name in the mint's `tokenMetadata`

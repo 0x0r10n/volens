@@ -590,7 +590,11 @@ pub fn spawn_tracker(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
-        let interval = std::time::Duration::from_secs(cfg.update_check_secs.max(30));
+        // Floor of 5s, not 30: the 30 was a guard against a sweep that made a
+        // network call per signal. Pricing is local now and a sweep measures
+        // in microseconds, so the floor exists only to stop a config typo
+        // spinning the task.
+        let interval = std::time::Duration::from_secs(cfg.update_check_secs.max(5));
         // A price older than this is not a price. A token nobody has traded in
         // an hour cannot be marked to market, and saying so is more honest
         // than reporting the last trade as if it were current.
@@ -646,6 +650,12 @@ pub fn spawn_tracker(
             // hammers it — which is precisely what keeps a rate limit engaged.
             const ABORT_AFTER: usize = 8;
             let mut consecutive_fail = 0usize;
+            // Pricing is now free (it reads the in-process index), but the
+            // identity/decimals backfills still hit the RPC. With a fast sweep
+            // interval an unbounded backfill would hammer it, so only a few
+            // records are repaired per sweep — they converge within minutes.
+            const MAX_BACKFILLS_PER_SWEEP: usize = 8;
+            let mut backfills = 0usize;
 
             for rec in batch {
                 if *shutdown.borrow() {
@@ -666,7 +676,9 @@ pub fn spawn_tracker(
                 // as a bare mint gets its ticker here rather than never.
                 let name_is_really_the_mint =
                     rec.name == crate::conviction::short_mint(&rec.mint);
-                if rec.symbol.is_empty() || name_is_really_the_mint {
+                let may_backfill = backfills < MAX_BACKFILLS_PER_SWEEP;
+                if may_backfill && (rec.symbol.is_empty() || name_is_really_the_mint) {
+                    backfills += 1;
                     if let Some(m) = rpc.token_meta(&rec.mint).await {
                         let name =
                             crate::wallets::sanitize_token_label(&m.name).unwrap_or_default();
@@ -681,7 +693,8 @@ pub fn spawn_tracker(
                 if let (Some(rate), true) = (sweep_rate, rec.sol_usd_at_signal.is_none()) {
                     store.set_sol_rate(&rec.mint, rate);
                 }
-                if rec.decimals == 0 {
+                if rec.decimals == 0 && backfills < MAX_BACKFILLS_PER_SWEEP {
+                    backfills += 1;
                     if let Some(info) = rpc.mint_info(&rec.mint).await {
                         if info.decimals > 0 {
                             store.set_decimals(&rec.mint, info.decimals as u32);

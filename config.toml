@@ -281,13 +281,15 @@ buys_path = "tracked_buys.jsonl"
 # persisted rather than held in memory.
 track_performance = true
 signals_path = "conviction_signals.jsonl"
-update_check_secs = 300
-# Most signals re-priced per sweep. A Jupiter quote is ~1.6s round trip, so a
-# sweep costs ~2s per signal: at ~2 calls/min the 24h queue reaches ~2880, and
-# an uncapped sweep would take 96 MINUTES against this 5-minute interval.
-# Newest calls are prioritised — that is where a move is most actionable — and
-# older ones are still measured by the outcome sampler at fixed horizons.
-max_repriced_per_sweep = 120
+# 15s. Re-pricing reads the in-process price index — no network call per token
+# — so a sweep costs microseconds. The old 5-minute interval was pacing against
+# a quote API that no longer exists in this path, and a token can run 3x inside
+# five minutes. Telegram updates STILL only fire on a new multiple, so a faster
+# check makes updates timelier, not noisier.
+update_check_secs = 15
+# A safety bound, not a performance one: pricing is local now. Newest calls are
+# processed first, so if it ever bites it drops the oldest.
+max_repriced_per_sweep = 5000
 # Stop re-pricing a signal after 24h.
 track_for_secs = 86400
 # Multiples that trigger an update; each rung fires AT MOST ONCE. A ladder

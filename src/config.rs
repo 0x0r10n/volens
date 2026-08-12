@@ -84,13 +84,9 @@ pub struct TrackedConfig {
     pub track_for_secs: u64,
     /// Most signals re-priced in one sweep.
     ///
-    /// A Jupiter quote is ~1.6s round trip, so a sweep costs roughly 2s per
-    /// signal. At ~2 calls/min the 24h queue reaches ~2880, which would make a
-    /// full sweep take 96 MINUTES against a 5-minute interval — updates would
-    /// arrive long after they were useful. Capping keeps each sweep bounded;
-    /// newest calls are prioritised because that is where a move is both most
-    /// likely and most actionable, and older ones are still measured by the
-    /// outcome sampler at fixed horizons.
+    /// A safety bound, not a performance one: prices come from an in-process
+    /// index now, so a sweep is microseconds per signal. Newest calls are
+    /// still processed first, so if this ever does bite it drops the oldest.
     #[serde(default = "default_max_per_sweep")]
     pub max_repriced_per_sweep: usize,
     /// Multiples that trigger an update. Each rung fires at most once.
@@ -163,10 +159,17 @@ fn default_jupiter_interval() -> u64 {
     2000
 }
 fn default_max_per_sweep() -> usize {
-    120
+    // Sized at 120 when each signal cost a ~2s quote. Pricing is now local, so
+    // the whole book fits in one sweep.
+    5_000
 }
 fn default_update_check() -> u64 {
-    300
+    // 15s. Re-pricing now reads an in-process index rather than making a
+    // network call per token, so a sweep costs microseconds and the old
+    // 5-minute interval was pacing against a constraint that no longer exists.
+    // A token can run 3x inside five minutes; that update should not arrive
+    // after it has already faded.
+    15
 }
 fn default_track_for() -> u64 {
     86_400
