@@ -70,6 +70,12 @@ impl WalletBook {
     /// Parse a tracker export. Malformed entries are skipped rather than fatal:
     /// one bad row in a 700-entry list must not cost the other 699.
     pub fn from_export_json(json: &str) -> anyhow::Result<Self> {
+        // Strip a UTF-8 BOM. Editors and Google Docs exports routinely add one,
+        // and serde rejects it as "expected value at line 1 column 1" — an
+        // error that reads like malformed JSON rather than an invisible first
+        // character. Since an unparseable list is a STARTUP failure, that would
+        // take the bot down over a byte nobody can see.
+        let json = json.strip_prefix('\u{feff}').unwrap_or(json);
         let raw: Vec<ExportedWallet> =
             serde_json::from_str(json).map_err(|e| anyhow::anyhow!("parsing wallet export: {e}"))?;
 
@@ -378,6 +384,20 @@ mod tests {
         let book = WalletBook::from_export_json(&json).unwrap();
         assert_eq!(book.len(), 1);
         assert_eq!(book.get(ADDR).unwrap().name, "Andy?");
+    }
+
+    /// A UTF-8 BOM is invisible and fatal: serde reports "expected value at
+    /// line 1 column 1", which reads as broken JSON, and an unparseable list
+    /// stops the bot from starting at all. The real export arrived with one.
+    #[test]
+    fn a_byte_order_mark_does_not_break_the_export() {
+        let body = format!(
+            r#"[{{"trackedWalletAddress":"{ADDR}","name":"Andy"}}]"#
+        );
+        let json = format!("\u{feff}{body}");
+        let book = WalletBook::from_export_json(&json).expect("BOM must be tolerated");
+        assert_eq!(book.len(), 1);
+        assert_eq!(book.get(ADDR).unwrap().name, "Andy");
     }
 
     #[test]
