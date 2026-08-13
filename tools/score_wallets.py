@@ -182,8 +182,18 @@ def main():
         # thousands: a quote endpoint that refuses us will refuse them all.
         fails = 0
         for i, mint in enumerate(quotable, 1):
-            v = quote_sol(mint, raw_by_mint[mint])
-            live[mint] = v
+            quoted_raw = raw_by_mint[mint]
+            v = quote_sol(mint, quoted_raw)
+            # Store SOL per RAW UNIT, not the total. One quote per token keeps
+            # the request count sane, but the figure it returns belongs to the
+            # quantity we asked about — so every buy must be valued by its OWN
+            # size. Dividing one wallet's proceeds by another's outlay scored
+            # every small buyer as if they held the largest buyer's position.
+            #
+            # Scaling one quote across sizes ignores price impact, which flatters
+            # buys larger than the quoted one. Sampled outcomes do not have this
+            # problem; this path is provisional by design.
+            live[mint] = (v / quoted_raw) if (v is not None and quoted_raw) else v
             fails = 0 if v is not None else fails + 1
             if fails >= 15:
                 print(f"  quote endpoint failing ({fails} in a row) — stopping at {i};"
@@ -217,8 +227,13 @@ def main():
                 peak = final = 0.0
                 rugged = True
             else:
+                # `v` is SOL per raw unit; value THIS buy's own quantity.
+                raw = b.get("token_amount_raw")
+                if not raw:
+                    w["unknown"] += 1
+                    continue
                 ref = b["sol_spent"]
-                m = (v / ref) if ref > 0 else 0.0
+                m = (v * raw / ref) if ref > 0 else 0.0
                 peak = final = m
                 rugged = False
         # Counted only once we know an outcome, so the denominator matches the
