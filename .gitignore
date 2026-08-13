@@ -26,3 +26,5 @@ tracked_wallets.json.*
 # Claude Code local settings — machine-specific, and the harness writes
 # transient .tmp files here that must never be committed.
 .claude/
+__pycache__/
+*.pyc
