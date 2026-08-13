@@ -302,7 +302,12 @@ pub fn spawn_sampler(
             tokio::select! {
                 _ = tokio::time::sleep(tick) => {}
                 _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
+                    if *shutdown.borrow() {
+                        // The queue is the only record that a token is being
+                        // watched. Write it before going away.
+                        store.persist_pending();
+                        return;
+                    }
                     continue;
                 }
             }
@@ -313,11 +318,13 @@ pub fn spawn_sampler(
             if retired > 0 {
                 tracing::debug!(retired, "horizons missed their window; not sampled");
             }
+            // Every sweep, not just the ones that sampled something. `register`
+            // is memory-only, so a queue built up before the first horizon comes
+            // due existed nowhere else — one restart in that window silently
+            // discarded every token being watched.
+            store.persist_pending();
             let batch = store.due(now, &horizons);
             if batch.is_empty() {
-                if expired > 0 || retired > 0 {
-                    store.persist_pending();
-                }
                 continue;
             }
 
@@ -586,6 +593,29 @@ mod tests {
         let t = reloaded.lock().get("MINT_A").unwrap().clone();
         assert_eq!(t.sampled, vec![3600]);
         assert_eq!(t.due(Utc::now(), HORIZONS), None, "6h not yet reached");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A token registered minutes ago has nothing due yet, and `register` only
+    /// touches memory — so if persistence waited for a sample, the queue would
+    /// exist nowhere but RAM until the first horizon came due. One restart in
+    /// that window took the whole watchlist with it, silently: the log said
+    /// `pending=0` and looked like a clean start.
+    #[test]
+    fn a_freshly_registered_token_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("volens-fresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("pending.jsonl").to_string_lossy().to_string();
+        let s = dir.join("samples.jsonl").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&p);
+
+        let store = OutcomeStore::load(&p, &s);
+        store.register(token("BRAND_NEW", 10));
+        assert_eq!(store.due(Utc::now(), HORIZONS).len(), 0, "nothing due this early");
+        store.persist_pending();
+
+        let reloaded = OutcomeStore::load(&p, &s);
+        assert_eq!(reloaded.len(), 1, "the queue must not depend on having sampled");
         let _ = std::fs::remove_file(&p);
     }
 
