@@ -337,11 +337,13 @@ jupiter_min_interval_ms = 2000
 #
 # Cost is small: ~3 quotes per distinct token, roughly 1 request/minute.
 track_outcomes = true
-# Ages at which to sample, in seconds: 1h, 6h, 24h.
+# Ages at which to sample, in seconds: 5m, 15m, 1h, 6h, 24h.
 # `peak` is the max across SAMPLED points, so resolution is bounded by this
-# list. Memecoins do most of their moving in the first hour — add shorter
-# horizons (e.g. 300, 900) if the peak reads too coarse.
-outcome_horizons_secs = [3600, 21600, 86400]
+# list. The short marks exist because tokens have run 3.77x inside a minute —
+# at 1h that is long over, and the token reads flat or dead.
+# A horizon missed by more than `horizon_grace` is skipped rather than filed
+# under the wrong label, so adding marks cannot retroactively mislabel a token.
+outcome_horizons_secs = [300, 900, 3600, 21600, 86400]
 outcomes_path = "token_outcomes.jsonl"
 # Pending queue, persisted so a 24h horizon survives a restart.
 outcome_pending_path = "outcome_pending.jsonl"

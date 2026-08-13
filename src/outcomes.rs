@@ -57,8 +57,23 @@ pub struct PendingToken {
     pub sampled: Vec<u64>,
 }
 
+/// How late a horizon may be sampled and still be filed under its own label.
+///
+/// A sample says "this is what the token was worth N seconds after the first
+/// buy". Taken an hour late it says something else entirely, and filing it under
+/// the original label makes the dataset quietly wrong rather than visibly
+/// incomplete. Proportional, because six minutes late means nothing to a 24-hour
+/// mark and everything to a five-minute one; the floor keeps a slow sweep or a
+/// brief restart from throwing away good samples.
+fn horizon_grace(horizon: u64) -> i64 {
+    (horizon as i64 / 10).max(90)
+}
+
 impl PendingToken {
     /// The next horizon that is due, if any.
+    ///
+    /// Due means inside its window: reached, and not so late that the reading
+    /// would no longer describe the horizon it is named after.
     fn due(&self, now: DateTime<Utc>, horizons: &[u64]) -> Option<u64> {
         let age = (now - self.first_buy_utc).num_seconds();
         if age < 0 {
@@ -67,8 +82,21 @@ impl PendingToken {
         horizons
             .iter()
             .copied()
-            .filter(|h| !self.sampled.contains(h) && age >= *h as i64)
+            .filter(|h| !self.sampled.contains(h))
+            .filter(|h| age >= *h as i64 && age < *h as i64 + horizon_grace(*h))
             .min()
+    }
+
+    /// Horizons whose window has closed unsampled. They will never be recorded,
+    /// so they must not hold the token in the queue forever either.
+    fn missed(&self, now: DateTime<Utc>, horizons: &[u64]) -> Vec<u64> {
+        let age = (now - self.first_buy_utc).num_seconds();
+        horizons
+            .iter()
+            .copied()
+            .filter(|h| !self.sampled.contains(h))
+            .filter(|h| age >= *h as i64 + horizon_grace(*h))
+            .collect()
     }
 
     fn finished(&self, horizons: &[u64]) -> bool {
@@ -172,6 +200,24 @@ impl OutcomeStore {
         }
     }
 
+    /// Retire horizons whose window closed without a sample, dropping any token
+    /// left with nothing to wait for. Returns how many horizons were retired.
+    ///
+    /// Without this a missed horizon is retried on every sweep forever and the
+    /// token never finishes, so the queue only grows.
+    pub fn retire_missed(&self, now: DateTime<Utc>, horizons: &[u64]) -> usize {
+        let mut map = self.lock();
+        let mut retired = 0;
+        map.retain(|_, p| {
+            for h in p.missed(now, horizons) {
+                p.sampled.push(h);
+                retired += 1;
+            }
+            !p.finished(horizons)
+        });
+        retired
+    }
+
     /// Drop tokens whose last horizon has long passed but never sampled —
     /// otherwise a token registered while the sampler was down would sit in the
     /// queue forever.
@@ -263,9 +309,13 @@ pub fn spawn_sampler(
 
             let now = Utc::now();
             let expired = store.expire(now, &horizons);
+            let retired = store.retire_missed(now, &horizons);
+            if retired > 0 {
+                tracing::debug!(retired, "horizons missed their window; not sampled");
+            }
             let batch = store.due(now, &horizons);
             if batch.is_empty() {
-                if expired > 0 {
+                if expired > 0 || retired > 0 {
                     store.persist_pending();
                 }
                 continue;
@@ -419,27 +469,64 @@ mod tests {
         assert_eq!(t.due(Utc::now(), HORIZONS), Some(3600));
     }
 
-    /// A token registered while the sampler was down is older than several
-    /// horizons at once. It must take them in order, not skip to the newest,
-    /// or the early datapoints are silently lost.
+    /// A token registered while the sampler was down is past several horizons
+    /// at once. Sampling them now would file a day-old reading as the 1-hour
+    /// one — a number that reads as data and is not. Only a horizon still
+    /// inside its window is taken; the rest are lost, and being visibly absent
+    /// beats being quietly wrong.
     #[test]
-    fn a_backlogged_token_takes_horizons_in_order() {
-        let mut t = token("M", 90_000);
-        assert_eq!(t.due(Utc::now(), HORIZONS), Some(3600));
-        t.sampled.push(3600);
-        assert_eq!(t.due(Utc::now(), HORIZONS), Some(21_600));
-        t.sampled.push(21_600);
-        assert_eq!(t.due(Utc::now(), HORIZONS), Some(86_400));
-        t.sampled.push(86_400);
-        assert_eq!(t.due(Utc::now(), HORIZONS), None);
-        assert!(t.finished(HORIZONS));
+    fn a_backlogged_token_skips_the_horizons_it_missed() {
+        let t = token("M", 90_000);
+        assert_eq!(t.due(Utc::now(), HORIZONS), Some(86_400),
+                   "only the horizon whose window is still open");
+        assert_eq!(t.missed(Utc::now(), HORIZONS), vec![3600, 21_600]);
+    }
+
+    /// The window is generous enough to survive a slow sweep or a short restart.
+    #[test]
+    fn a_slightly_late_sample_is_still_taken() {
+        assert_eq!(token("M", 3600 + 300).due(Utc::now(), HORIZONS), Some(3600));
+        assert_eq!(token("M", 3600 + 400).due(Utc::now(), HORIZONS), None,
+                   "past the grace, the label would no longer be true");
+    }
+
+    /// Short horizons get proportionally tighter windows: five minutes late is
+    /// nothing at 24h and is the whole measurement at 5m.
+    #[test]
+    fn short_horizons_have_short_windows() {
+        const SHORT: &[u64] = &[300, 900];
+        assert_eq!(token("M", 305).due(Utc::now(), SHORT), Some(300));
+        assert_eq!(token("M", 300 + 89).due(Utc::now(), SHORT), Some(300));
+        assert_eq!(token("M", 300 + 91).due(Utc::now(), SHORT), None);
+    }
+
+    /// A missed horizon must not be retried forever, or the queue only grows.
+    #[test]
+    fn missed_horizons_are_retired_and_the_token_dropped() {
+        let store = OutcomeStore::load("/nonexistent/p.jsonl", "/nonexistent/s.jsonl");
+        assert!(store.register(token("OLD", 90_000)));
+        assert!(store.register(token("NEW", 10)));
+
+        // OLD missed 1h and 6h; 24h is still open, so it stays queued.
+        assert_eq!(store.retire_missed(Utc::now(), HORIZONS), 2);
+        assert_eq!(store.lock().len(), 2);
+
+        // Once every horizon has closed it has nothing left to wait for.
+        let mut older = token("OLDER", 200_000);
+        older.mint = "OLDER".into();
+        assert!(store.register(older));
+        assert_eq!(store.retire_missed(Utc::now(), HORIZONS), 3);
+        assert!(!store.lock().contains_key("OLDER"));
     }
 
     #[test]
     fn a_sampled_horizon_never_repeats() {
-        let mut t = token("M", 100_000);
+        let mut t = token("M", 86_400 + 100);
         t.sampled = vec![3600, 21_600];
         assert_eq!(t.due(Utc::now(), HORIZONS), Some(86_400));
+        t.sampled.push(86_400);
+        assert_eq!(t.due(Utc::now(), HORIZONS), None);
+        assert!(t.finished(HORIZONS));
     }
 
     /// The first buy is the basis. A later buyer must not rebase it, or the
