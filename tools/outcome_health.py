@@ -53,6 +53,9 @@ def label(secs):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--outcomes", default="token_outcomes.jsonl")
+    ap.add_argument("--worst", type=int, default=0, metavar="N",
+                    help="dump the N largest multiples in full, to judge whether "
+                         "they are tokens or artifacts")
     args = ap.parse_args()
 
     rows = load(args.outcomes)
@@ -88,6 +91,21 @@ def main():
                   f"above 100x is far more likely a pricing artifact than a token.\n"
                   f"     The index credits a swap's SOL leg to one token only; a\n"
                   f"     number this size means something is getting past that.")
+
+    if args.worst:
+        # FDV is the tell. A token really up 200x has a market cap to match; an
+        # artifact usually shows an FDV no token has, or none at all. The other
+        # tell is `reference_sol`: a first buy of a few hundredths of a SOL
+        # divides into a large number very easily.
+        print(f"\nlargest {args.worst} multiples in full:")
+        for r in sorted((r for r in rows if r["routed"]),
+                        key=lambda r: -r["multiple"])[: args.worst]:
+            fdv = r.get("fdv_usd")
+            fdv = f"${fdv:,.0f}" if fdv else "unknown"
+            print(f"\n  {r['mint']}  {label(r['horizon_secs'])}  {r['multiple']:.2f}x")
+            print(f"    ref {r['reference_sol']:.4f} SOL -> now {r['sol_value']:.4f} SOL"
+                  f"   fdv {fdv}   price age {r.get('price_age_secs', '?')}s")
+            print(f"    first buy {r['first_buy_utc']} by {r.get('first_wallet', '?')[:12]}")
 
     worst_late = max((ts(r["at"]) - ts(r["first_buy_utc"])).total_seconds() - r["horizon_secs"]
                      for r in rows)
