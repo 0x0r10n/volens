@@ -84,6 +84,15 @@ const MIN_OBS_SOL: f64 = 0.02;
 /// SOL/USD outside this band is an artifact, not a market move.
 const SOL_USD_MIN: f64 = 1.0;
 const SOL_USD_MAX: f64 = 10_000.0;
+/// Largest price change one fill may make, as a ratio to the current median.
+///
+/// Deliberately loose. A new token really can run 50x in a minute, and refusing
+/// that would make us useless exactly when a call is working — but it runs
+/// through a sequence of fills, each a small step. A single fill that jumps 50x
+/// has not repriced the token, it has mis-measured it.
+const MAX_TOKEN_JUMP: f64 = 50.0;
+/// Consecutive rejects before the series is treated as the stale party.
+const TOKEN_JUMP_CAPITULATE: u32 = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct Obs {
@@ -100,6 +109,9 @@ struct TokenSeries {
     /// Cumulative SOL traded since this token was first seen.
     volume_sol: f64,
     trades: u64,
+    /// Observations refused in a row for jumping. Bounds the refusal so a
+    /// series that has genuinely fallen behind cannot reject the market forever.
+    jump_rejects: u32,
 }
 
 /// A price with the age of the newest observation behind it.
@@ -193,9 +205,26 @@ impl PriceIndex {
             self.observe_sol_usd(dusdc.abs() / dsol.abs(), dsol.abs(), now);
         }
 
-        // --- Token prices, from an owner who moved a token against SOL.
+        // How many distinct tokens each owner moved. An owner who moved several
+        // cannot have their single SOL leg attributed to any one of them.
+        let mut tokens_moved: HashMap<&str, usize> = HashMap::new();
+        for (owner, _, _) in &token_deltas {
+            *tokens_moved.entry(owner).or_default() += 1;
+        }
+
+        // --- Token prices, from an owner who moved ONE token against SOL.
         for (owner, mint, dtok) in token_deltas {
             let Some(dsol) = sol_delta.get(owner) else { continue };
+            // The SOL leg is the size of the whole transaction. A multi-hop
+            // route (SOL -> MID -> OUT) leaves an unswept dust remainder in the
+            // intermediate, and dividing the full SOL leg by that residue
+            // prices it at millions of SOL each. Worse, the observation is
+            // weighted BY that SOL leg, so it does not just join the median, it
+            // outvotes every honest fill in the series. That is how a token
+            // reported x69364 at a $353M market cap.
+            if tokens_moved.get(owner).copied() != Some(1) {
+                continue;
+            }
             if dsol.abs() < MIN_OBS_SOL || dtok.abs() <= 0.0 {
                 continue;
             }
@@ -206,14 +235,43 @@ impl PriceIndex {
             if !price.is_finite() || price <= 0.0 {
                 continue;
             }
-            let mut map = self.tokens();
-            let series = map.entry(mint.to_string()).or_default();
-            series.recent.push_back(Obs { at: now, price, size_sol: dsol.abs() });
-            if series.recent.len() > KEEP_PER_TOKEN {
-                series.recent.pop_front();
+            self.observe_token(mint, price, dsol.abs(), now);
+        }
+    }
+
+    /// Record one token observation, refusing moves no single fill can make.
+    ///
+    /// Attribution above is the fix for the failure we actually saw; this is the
+    /// backstop for the ones we have not. A fill executes against a curve, so it
+    /// moves the price continuously — a 50x step between consecutive fills is an
+    /// accounting artifact, not a trade. Rejection is bounded the same way the
+    /// SOL/USD ladder is: if observations keep disagreeing with the series, the
+    /// series is what is stale, so it capitulates rather than wedging forever.
+    fn observe_token(&self, mint: &str, price: f64, size_sol: f64, now: Instant) {
+        let mut map = self.tokens();
+        let series = map.entry(mint.to_string()).or_default();
+        // Volume counts the trade even if its price is refused below: the swap
+        // happened, and only our reading of the price is in question.
+        series.volume_sol += size_sol;
+        series.trades += 1;
+
+        if let Some(current) = weighted_median(&series.recent) {
+            let ratio = price / current;
+            if !(1.0 / MAX_TOKEN_JUMP..=MAX_TOKEN_JUMP).contains(&ratio) {
+                series.jump_rejects += 1;
+                if series.jump_rejects < TOKEN_JUMP_CAPITULATE {
+                    return;
+                }
+                // Repeatedly told the same thing: believe the market, not the
+                // history, and start the series over from this observation.
+                series.recent.clear();
             }
-            series.volume_sol += dsol.abs();
-            series.trades += 1;
+        }
+        series.jump_rejects = 0;
+
+        series.recent.push_back(Obs { at: now, price, size_sol });
+        if series.recent.len() > KEEP_PER_TOKEN {
+            series.recent.pop_front();
         }
     }
 
@@ -509,6 +567,143 @@ mod tests {
     fn unknown_tokens_have_no_price() {
         assert!(idx().price_sol("NEVER_SEEN", Duration::from_secs(60)).is_none());
         assert!(idx().volume_sol("NEVER_SEEN").is_none());
+    }
+
+    // --- observe(): building a transaction the way the stream delivers one.
+
+    fn bal(owner: &str, mint: &str, amount: f64) -> yellowstone_grpc_proto::prelude::TokenBalance {
+        yellowstone_grpc_proto::prelude::TokenBalance {
+            account_index: 0,
+            mint: mint.into(),
+            owner: owner.into(),
+            program_id: String::new(),
+            ui_token_amount: Some(yellowstone_grpc_proto::prelude::UiTokenAmount {
+                ui_amount: amount,
+                decimals: 6,
+                amount: String::new(),
+                ui_amount_string: String::new(),
+            }),
+        }
+    }
+
+    fn observed(pre: Vec<yellowstone_grpc_proto::prelude::TokenBalance>,
+                post: Vec<yellowstone_grpc_proto::prelude::TokenBalance>) -> PriceIndex {
+        let i = idx();
+        let meta = TransactionStatusMeta {
+            pre_token_balances: pre,
+            post_token_balances: post,
+            ..Default::default()
+        };
+        i.observe(&SubscribeUpdateTransactionInfo::default(), &meta);
+        i
+    }
+
+    /// An ordinary swap: one owner, SOL out, one token in.
+    #[test]
+    fn a_plain_swap_prices_the_token() {
+        let i = observed(
+            vec![bal("alice", WSOL, 10.0), bal("alice", "TOK", 0.0)],
+            vec![bal("alice", WSOL, 5.0), bal("alice", "TOK", 1000.0)],
+        );
+        let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
+        assert!((p.price_sol - 0.005).abs() < 1e-9, "5 SOL for 1000 tokens, got {}", p.price_sol);
+    }
+
+    /// A multi-hop route leaves a dust residue in the intermediate token, while
+    /// the SOL leg is the size of the WHOLE trade. Attributing all that SOL to
+    /// the residue prices the intermediate at millions of SOL each — and because
+    /// the observation is weighted by the SOL leg, it does not merely join the
+    /// median, it OUTVOTES every honest trade in the series.
+    ///
+    /// This is what put `$Callout` at x69364 and a $353M market cap.
+    #[test]
+    fn a_routing_residue_does_not_price_the_intermediate_token() {
+        let i = observed(
+            vec![bal("router", WSOL, 10.0), bal("router", "MID", 0.0), bal("router", "OUT", 0.0)],
+            // 5 SOL spent, ending in OUT; MID keeps an unswept dust remainder.
+            vec![bal("router", WSOL, 5.0), bal("router", "MID", 0.000001),
+                 bal("router", "OUT", 1000.0)],
+        );
+        assert!(
+            i.price_sol("MID", Duration::from_secs(60)).is_none(),
+            "the SOL leg cannot be attributed to any one token when several moved"
+        );
+    }
+
+    /// The same defect with no dust involved: two tokens moved, so each would be
+    /// credited with the full SOL leg and both prices would be wrong.
+    #[test]
+    fn a_two_token_transfer_prices_neither_token() {
+        let i = observed(
+            vec![bal("bob", WSOL, 10.0), bal("bob", "AAA", 0.0), bal("bob", "BBB", 0.0)],
+            vec![bal("bob", WSOL, 6.0), bal("bob", "AAA", 100.0), bal("bob", "BBB", 200.0)],
+        );
+        assert!(i.price_sol("AAA", Duration::from_secs(60)).is_none());
+        assert!(i.price_sol("BBB", Duration::from_secs(60)).is_none());
+    }
+
+    /// Two owners in one transaction are two independent trades, not a route.
+    /// Only the owner who moved several tokens is ambiguous.
+    #[test]
+    fn separate_owners_are_still_priced_independently() {
+        let i = observed(
+            vec![bal("alice", WSOL, 10.0), bal("carol", WSOL, 10.0)],
+            vec![bal("alice", WSOL, 9.0), bal("alice", "TOK", 500.0),
+                 bal("carol", WSOL, 8.0), bal("carol", "TOK", 1000.0)],
+        );
+        let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
+        assert_eq!(p.observations, 2, "both owners should have been priced");
+    }
+
+    /// The backstop must not fight a token that is genuinely running: each fill
+    /// is a small step, so a 100x over a series of trades is accepted in full.
+    #[test]
+    fn a_real_run_is_tracked_all_the_way_up() {
+        let i = idx();
+        let mut p = 0.001;
+        for _ in 0..24 {
+            i.observe_token("RUNNER", p, 5.0, Instant::now());
+            p *= 1.25;
+        }
+        let out = i.price_sol("RUNNER", Duration::from_secs(60)).unwrap();
+        assert!(out.price_sol > 0.05, "a 200x run must come through, got {}", out.price_sol);
+    }
+
+    /// One impossible fill among honest ones is refused rather than believed.
+    #[test]
+    fn a_single_impossible_fill_is_refused() {
+        let i = idx();
+        for _ in 0..5 {
+            i.seed("TOK", 0.001, 1.0);
+        }
+        // The shape of the bug: an absurd price carrying a heavy SOL weight.
+        i.observe_token("TOK", 69_364.0, 40.0, Instant::now());
+        let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
+        assert!((p.price_sol - 0.001).abs() < 1e-9, "expected 0.001, got {}", p.price_sol);
+    }
+
+    /// …but if the market keeps saying it, the series is the stale party.
+    #[test]
+    fn repeated_disagreement_capitulates() {
+        let i = idx();
+        for _ in 0..5 {
+            i.seed("TOK", 0.001, 1.0);
+        }
+        for _ in 0..TOKEN_JUMP_CAPITULATE {
+            i.observe_token("TOK", 1.0, 1.0, Instant::now());
+        }
+        let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
+        assert_eq!(p.price_sol, 1.0, "a sustained repricing must eventually be believed");
+        assert_eq!(p.observations, 1, "and the stale history is discarded, not blended");
+    }
+
+    /// Volume is a record of trades, not of prices we accepted.
+    #[test]
+    fn refused_observations_still_count_as_volume() {
+        let i = idx();
+        i.observe_token("TOK", 0.001, 1.0, Instant::now());
+        i.observe_token("TOK", 69_364.0, 40.0, Instant::now());
+        assert_eq!(i.volume_sol("TOK"), Some(41.0));
     }
 
     #[test]

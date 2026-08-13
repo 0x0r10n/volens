@@ -75,19 +75,81 @@ def outcomes_by_mint(samples):
     return out
 
 
+def groups_by_wallet(path):
+    """address -> [group]. Absent file or untagged wallets yield nothing."""
+    if not os.path.exists(path):
+        return {}
+    try:
+        # utf-8-sig: exports arrive with a BOM often enough to be worth handling.
+        with open(path, encoding="utf-8-sig") as f:
+            rows = json.load(f)
+    except Exception:
+        return {}
+    return {r["trackedWalletAddress"]: r.get("groups") or []
+            for r in rows if r.get("trackedWalletAddress")}
+
+
+def report_groups(W, wallets_path):
+    """Compare cohorts — an imported leaderboard against the hand-built list.
+
+    A wallet in several groups is counted in each, so the rows overlap and do
+    not sum to the aggregate. That is the right trade: the question is how a
+    cohort performs, not how to apportion credit between overlapping labels.
+    """
+    tags = groups_by_wallet(wallets_path)
+    if not tags:
+        print(f"\n(no group tags found in {wallets_path})")
+        return
+
+    G = collections.defaultdict(lambda: {
+        "wallets": 0, "n": 0, "paid": 0.0, "peak_w": 0.0, "final_w": 0.0, "rugs": 0, "wins": 0})
+    for addr, v in W.items():
+        if v["n"] == 0 or v["paid"] <= 0:
+            continue
+        for g in tags.get(addr) or ["(untagged)"]:
+            r = G[g]
+            r["wallets"] += 1
+            for k in ("n", "paid", "peak_w", "final_w", "rugs", "wins"):
+                r[k] += v[k]
+
+    print(f"\nBY GROUP  (wallets in several groups count in each)\n")
+    print(f"{'group':<20}{'wlt':>5}{'buys':>6}{'paid':>9}{'peak':>7}{'final':>7}{'2x+':>7}{'rug':>7}")
+    print("-" * 68)
+    for g, r in sorted(G.items(), key=lambda kv: -kv[1]["peak_w"] / kv[1]["paid"]):
+        print(f"{g[:20]:<20}{r['wallets']:>5}{r['n']:>6}{r['paid']:>9.2f}"
+              f"{r['peak_w']/r['paid']:>6.2f}x{r['final_w']/r['paid']:>6.2f}x"
+              f"{r['wins']:>6}/{r['n']}{r['rugs']:>6}/{r['n']}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--buys", default="tracked_buys.jsonl")
     ap.add_argument("--outcomes", default="token_outcomes.jsonl")
+    ap.add_argument("--wallets", default="tracked_wallets.json",
+                    help="source of the per-wallet `groups` tags used by --by-group")
+    ap.add_argument("--since", default=None, metavar="YYYY-MM-DD",
+                    help="ignore buys observed before this date (outcomes follow, "
+                         "since they are looked up per mint)")
     ap.add_argument("--min-buys", type=int, default=3)
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--no-quotes", action="store_true",
                     help="skip live quotes; use sampled outcomes only")
+    ap.add_argument("--by-group", action="store_true",
+                    help="aggregate by wallet group instead of listing wallets")
     args = ap.parse_args()
 
     buys = load_jsonl(args.buys)
+    if args.since:
+        # Data collected before the pricing rebuild recorded unpriced tokens as
+        # unroutable, i.e. as rugs. Mixing it with current data would understate
+        # every wallet in the file, so an epoch is a real analytical need rather
+        # than tidiness.
+        before = len(buys)
+        buys = [b for b in buys if (b.get("observed_at") or "") >= args.since]
+        print(f"since {args.since}: {len(buys)} of {before} buys")
     if not buys:
-        sys.exit(f"no buys in {args.buys}")
+        sys.exit(f"no buys in {args.buys}"
+                 + (f" after {args.since}" if args.since else ""))
     samples = load_jsonl(args.outcomes)
     outcomes = outcomes_by_mint(samples)
 
@@ -188,6 +250,9 @@ def main():
               f"peak {sum(v['peak_w'] for v in ranked)/tp:.2f}x  "
               f"final {sum(v['final_w'] for v in ranked)/tp:.2f}x  "
               f"rugged {sum(v['rugs'] for v in ranked)}/{sum(v['n'] for v in ranked)}")
+
+    if args.by_group:
+        report_groups(W, args.wallets)
 
     if len(covered) < len(mints) * 0.5:
         print("\nNOTE: most tokens have no sampled outcomes yet, so peak is\n"
