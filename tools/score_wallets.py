@@ -46,13 +46,26 @@ def load_jsonl(path):
 
 
 def quote_sol(mint, raw, timeout=12):
-    """SOL the given raw quantity fetches now, or None if unroutable."""
+    """(sol, status) with status "ok" | "unroutable" | "unknown".
+
+    The tri-state is the whole point. An earlier version returned None for both
+    "this token has no market" and "the endpoint refused us", and the caller
+    scored both as rugs — so one rate-limited run reported 196 of 196 tokens
+    dead. A refusal is our problem, not the token's, and must never be written
+    into the dataset as an outcome.
+
+    Only an explicit 400 is read as unroutable: that is what the quote API
+    returns for a token with no route, and we control the other parameters. A
+    429, a 5xx or a timeout is us being throttled or offline.
+    """
     url = f"{JUP}?inputMint={mint}&outputMint={WSOL}&amount={int(raw)}&slippageBps=100"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as f:
-            return int(json.load(f)["outAmount"]) / 1e9
+            return int(json.load(f)["outAmount"]) / 1e9, "ok"
+    except urllib.error.HTTPError as e:
+        return None, "unroutable" if e.code == 400 else "unknown"
     except Exception:
-        return None
+        return None, "unknown"
 
 
 def outcomes_by_mint(samples):
@@ -181,9 +194,27 @@ def main():
         # Give up after a run of failures rather than grinding through
         # thousands: a quote endpoint that refuses us will refuse them all.
         fails = 0
+        refused = 0
         for i, mint in enumerate(quotable, 1):
             quoted_raw = raw_by_mint[mint]
-            v = quote_sol(mint, quoted_raw)
+            v, status = quote_sol(mint, quoted_raw)
+            if status == "unknown":
+                # Leave the mint absent from `live`: absent means unknown, and
+                # unknown buys are excluded from scoring rather than counted.
+                refused += 1
+                fails += 1
+                if fails >= 15:
+                    print(f"  quote endpoint refusing us ({fails} in a row) — stopping at {i}."
+                          f"\n  {len(quotable) - i} tokens left unquoted; they are recorded as"
+                          f" UNKNOWN, not as rugs.")
+                    break
+                time.sleep(0.35)
+                continue
+            if status == "unroutable":
+                live[mint] = None  # genuinely no market
+                fails = 0
+                time.sleep(0.35)
+                continue
             # Store SOL per RAW UNIT, not the total. One quote per token keeps
             # the request count sane, but the figure it returns belongs to the
             # quantity we asked about — so every buy must be valued by its OWN
@@ -193,15 +224,14 @@ def main():
             # Scaling one quote across sizes ignores price impact, which flatters
             # buys larger than the quoted one. Sampled outcomes do not have this
             # problem; this path is provisional by design.
-            live[mint] = (v / quoted_raw) if (v is not None and quoted_raw) else v
-            fails = 0 if v is not None else fails + 1
-            if fails >= 15:
-                print(f"  quote endpoint failing ({fails} in a row) — stopping at {i};"
-                      f" remaining tokens scored from samples only")
-                break
+            live[mint] = v / quoted_raw
+            fails = 0
             if i % 25 == 0:
                 print(f"  {i}/{len(quotable)}…")
             time.sleep(0.35)
+
+        if refused:
+            print(f"  {refused} tokens the endpoint would not answer for — excluded, not scored")
 
     W = collections.defaultdict(lambda: {
         "name": "", "n": 0, "paid": 0.0, "peak_w": 0.0, "final_w": 0.0,
