@@ -81,6 +81,26 @@ const KEEP_PER_TOKEN: usize = 9;
 const KEEP_SOL: usize = 25;
 /// Ignore dust: a 0.001 SOL swap prices nothing and is mostly noise.
 const MIN_OBS_SOL: f64 = 0.02;
+/// Most weight any single observation may carry, in SOL.
+///
+/// Weighting exists to stop dust voting equally with real size — it was never
+/// meant to let one trade dictate a price outright. Without a cap the SOL leg
+/// is both the thing we divide by AND the thing that decides whose division
+/// wins, so a single 40 SOL fill with a misread token leg outvotes nine honest
+/// ones instead of being outvoted by them.
+///
+/// Set near an ordinary fill, not above it. At 5 SOL a single observation still
+/// outweighed nine half-SOL trades combined, which is the same failure with a
+/// higher threshold. Past ~1 SOL a trade is real; more size does not make it
+/// better evidence about the price.
+const MAX_OBS_WEIGHT_SOL: f64 = 1.0;
+/// Observations required before a token has a price at all.
+///
+/// One fill is an anecdote: nothing has corroborated it and the jump guard has
+/// no baseline to judge it against, so a single artifact becomes the price. A
+/// token nobody has traded twice is better reported as unpriced than as a
+/// number we cannot check.
+const MIN_OBS_FOR_PRICE: usize = 2;
 /// SOL/USD outside this band is an artifact, not a market move.
 const SOL_USD_MIN: f64 = 1.0;
 const SOL_USD_MAX: f64 = 10_000.0;
@@ -157,7 +177,7 @@ impl PriceIndex {
     ///
     /// Called for EVERY streamed transaction, so it does no allocation beyond
     /// the two balance maps and never touches the network.
-    pub fn observe(&self, _tx: &SubscribeUpdateTransactionInfo, meta: &TransactionStatusMeta) {
+    pub fn observe(&self, tx: &SubscribeUpdateTransactionInfo, meta: &TransactionStatusMeta) {
         // (owner, mint) -> delta
         let mut before: HashMap<(&str, &str), f64> = HashMap::new();
         for b in &meta.pre_token_balances {
@@ -235,8 +255,39 @@ impl PriceIndex {
             if !price.is_finite() || price <= 0.0 {
                 continue;
             }
-            self.observe_token(mint, price, dsol.abs(), now);
+            self.observe_token_from(mint, price, dsol.abs(), now, &tx.signature);
         }
+    }
+
+    /// `observe_token` plus the signature of the transaction it came from, so a
+    /// refused observation can be looked up on an explorer.
+    ///
+    /// Refusals are the interesting ones. When a token prices absurdly we need
+    /// the actual transaction to see which leg was misread — reasoning about it
+    /// from the aggregate has cost a day already.
+    fn observe_token_from(
+        &self,
+        mint: &str,
+        price: f64,
+        size_sol: f64,
+        now: Instant,
+        sig: &[u8],
+    ) {
+        if let Some(current) = self.price_sol(mint, Duration::from_secs(600)) {
+            let ratio = price / current.price_sol;
+            if !(1.0 / MAX_TOKEN_JUMP..=MAX_TOKEN_JUMP).contains(&ratio) {
+                tracing::debug!(
+                    mint,
+                    signature = %bs58::encode(sig).into_string(),
+                    candidate = price,
+                    current = current.price_sol,
+                    ratio,
+                    size_sol,
+                    "price observation refused as a jump"
+                );
+            }
+        }
+        self.observe_token(mint, price, size_sol, now);
     }
 
     /// Record one token observation, refusing moves no single fill can make.
@@ -342,11 +393,14 @@ impl PriceIndex {
 
     /// Price of a token in SOL, as the median of recent fills.
     ///
-    /// A single observation is never returned as a price on its own unless it
-    /// is all we have — see the artifact rates in the module docs.
+    /// Needs `MIN_OBS_FOR_PRICE` corroborating fills — see the artifact rates
+    /// in the module docs.
     pub fn price_sol(&self, mint: &str, max_age: Duration) -> Option<Priced> {
         let map = self.tokens();
         let series = map.get(mint)?;
+        if series.recent.len() < MIN_OBS_FOR_PRICE {
+            return None;
+        }
         let newest = series.recent.iter().map(|o| o.at).max()?;
         let age = newest.elapsed();
         if age > max_age {
@@ -402,11 +456,16 @@ impl PriceIndex {
 /// reported multiple swinging 9.9x -> 16.4x inside 90 seconds, which is the
 /// aggregation moving, not the price. Weighting by size lets the trades that
 /// actually set the market dominate.
+///
+/// Weight is capped at `MAX_OBS_WEIGHT_SOL`. Past a few SOL, extra size is no
+/// longer better evidence about the price — and leaving it uncapped means the
+/// same SOL figure both forms the price and decides whose price wins, so one
+/// large fill with a misread token leg carries the vote outright.
 fn weighted_median(obs: &VecDeque<Obs>) -> Option<f64> {
     let mut v: Vec<(f64, f64)> = obs
         .iter()
         .filter(|o| o.price.is_finite() && o.price > 0.0 && o.size_sol > 0.0)
-        .map(|o| (o.price, o.size_sol))
+        .map(|o| (o.price, o.size_sol.min(MAX_OBS_WEIGHT_SOL)))
         .collect();
     if v.is_empty() {
         return None;
@@ -472,6 +531,35 @@ mod tests {
         assert_eq!(weighted_median(&obs), Some(1.0), "the 40 SOL trade should decide");
         // The unweighted median would have picked a dust price.
         assert_eq!(median(obs.iter().map(|o| o.price)), Some(2.5));
+    }
+
+    /// The shape of the 2738x sample: nine honest fills and one large trade
+    /// whose token leg was misread. Uncapped, its 40 SOL outweighs the other
+    /// nine combined and it becomes the price outright — the weighting meant to
+    /// suppress noise amplifying it instead.
+    #[test]
+    fn one_large_trade_cannot_outvote_the_market() {
+        let mut obs = VecDeque::new();
+        for _ in 0..9 {
+            obs.push_back(Obs { at: Instant::now(), price: 0.001, size_sol: 0.5 });
+        }
+        obs.push_back(Obs { at: Instant::now(), price: 2.5, size_sol: 40.0 });
+
+        assert_eq!(weighted_median(&obs), Some(0.001), "nine fills outweigh one");
+        // Uncapped, 40 > 9 * 0.5 and the outlier would carry the vote alone.
+        let uncapped: f64 = 40.0;
+        assert!(uncapped > 9.0 * 0.5, "premise: it really does dominate on raw size");
+    }
+
+    /// Capping must not flip the original problem back on: dust still loses.
+    #[test]
+    fn dust_still_loses_to_real_size() {
+        let mut obs = VecDeque::new();
+        for p in [2.0, 3.0, 4.0] {
+            obs.push_back(Obs { at: Instant::now(), price: p, size_sol: 0.03 });
+        }
+        obs.push_back(Obs { at: Instant::now(), price: 1.0, size_sol: 40.0 });
+        assert_eq!(weighted_median(&obs), Some(1.0));
     }
 
     #[test]
@@ -598,13 +686,19 @@ mod tests {
         i
     }
 
-    /// An ordinary swap: one owner, SOL out, one token in.
+    /// An ordinary swap: one owner, SOL out, one token in. One fill is not yet
+    /// a price — nothing has corroborated it and the jump guard has no baseline
+    /// to judge it against, so a lone artifact would simply become the price.
     #[test]
     fn a_plain_swap_prices_the_token() {
         let i = observed(
             vec![bal("alice", WSOL, 10.0), bal("alice", "TOK", 0.0)],
             vec![bal("alice", WSOL, 5.0), bal("alice", "TOK", 1000.0)],
         );
+        assert!(i.price_sol("TOK", Duration::from_secs(60)).is_none(),
+                "a single fill is an anecdote, not a price");
+
+        i.observe_token("TOK", 0.005, 5.0, Instant::now());
         let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
         assert!((p.price_sol - 0.005).abs() < 1e-9, "5 SOL for 1000 tokens, got {}", p.price_sol);
     }
@@ -692,9 +786,14 @@ mod tests {
         for _ in 0..TOKEN_JUMP_CAPITULATE {
             i.observe_token("TOK", 1.0, 1.0, Instant::now());
         }
+        // Capitulation clears the stale history, leaving one observation — which
+        // is below the corroboration floor, so there is deliberately no price
+        // until the new level is confirmed by a second fill.
+        assert!(i.price_sol("TOK", Duration::from_secs(60)).is_none());
+        i.observe_token("TOK", 1.0, 1.0, Instant::now());
         let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
         assert_eq!(p.price_sol, 1.0, "a sustained repricing must eventually be believed");
-        assert_eq!(p.observations, 1, "and the stale history is discarded, not blended");
+        assert_eq!(p.observations, 2, "and the stale history is discarded, not blended");
     }
 
     /// Volume is a record of trades, not of prices we accepted.
