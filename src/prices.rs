@@ -94,6 +94,19 @@ const MIN_OBS_SOL: f64 = 0.02;
 /// higher threshold. Past ~1 SOL a trade is real; more size does not make it
 /// better evidence about the price.
 const MAX_OBS_WEIGHT_SOL: f64 = 1.0;
+/// Least share of a mint's movement in one transaction that an owner must
+/// account for before their side is read as the trade.
+///
+/// Verified against chain. In one refused observation the buyer paid in NATIVE
+/// SOL — invisible in token balances — so the only WSOL movement present was a
+/// fee vault receiving 0.065 SOL, and that vault also happened to hold 608
+/// tokens. Dividing one by the other priced the token 527x over its market.
+/// Those 608 tokens were 0.0009% of the 70,386,983 that moved.
+///
+/// In a real swap the trader and the pool are the two largest movers and are
+/// equal but for fees, so both clear this easily; fee vaults, dust recipients
+/// and routing residues do not clear it at all.
+const MIN_TOKEN_SHARE: f64 = 0.5;
 /// Observations required before a token has a price at all.
 ///
 /// One fill is an anecdote: nothing has corroborated it and the jump guard has
@@ -232,6 +245,16 @@ impl PriceIndex {
             *tokens_moved.entry(owner).or_default() += 1;
         }
 
+        // The largest movement of each mint anywhere in the transaction. The
+        // trade is between the two biggest movers; everyone else is a fee, a
+        // residue or an onlooker, and pricing off them is how a 0.065 SOL fee
+        // receipt became a 527x.
+        let mut largest_move: HashMap<&str, f64> = HashMap::new();
+        for (_, mint, dtok) in &token_deltas {
+            let e = largest_move.entry(mint).or_insert(0.0);
+            *e = e.max(dtok.abs());
+        }
+
         // --- Token prices, from an owner who moved ONE token against SOL.
         for (owner, mint, dtok) in token_deltas {
             let Some(dsol) = sol_delta.get(owner) else { continue };
@@ -246,6 +269,13 @@ impl PriceIndex {
                 continue;
             }
             if dsol.abs() < MIN_OBS_SOL || dtok.abs() <= 0.0 {
+                continue;
+            }
+            // Only the principals to the trade. A fee vault that receives SOL
+            // and happens to hold a few of the tokens is not a counterparty,
+            // and its ratio is not a price.
+            let largest = largest_move.get(mint).copied().unwrap_or(0.0);
+            if largest > 0.0 && dtok.abs() < largest * MIN_TOKEN_SHARE {
                 continue;
             }
             if (*dsol > 0.0) == (dtok > 0.0) {
@@ -738,6 +768,54 @@ mod tests {
         );
         assert!(i.price_sol("AAA", Duration::from_secs(60)).is_none());
         assert!(i.price_sol("BBB", Duration::from_secs(60)).is_none());
+    }
+
+    /// Replayed from chain: signature 5aSGU3L1WQAt…, which priced mint
+    /// 4hB733Gh at 527x its market.
+    ///
+    /// The buyer paid in NATIVE SOL, which never appears in token balances, so
+    /// the only WSOL movement in the whole transaction belonged to a fee vault
+    /// receiving 0.065 SOL — a vault that also held 608 tokens. Nothing here is
+    /// a swap we can see; the correct output is no price at all, not the ratio
+    /// between two unrelated numbers.
+    #[test]
+    fn a_fee_vault_is_not_a_counterparty() {
+        let i = observed(
+            vec![
+                bal("pool", "TOK", 70_386_983.7),
+                bal("buyer", "TOK", 0.0),
+                bal("feevault", "TOK", 608.4),
+                bal("feevault", WSOL, 0.0),
+            ],
+            vec![
+                bal("pool", "TOK", 0.0),
+                bal("buyer", "TOK", 70_317_239.5),
+                // The vault's tokens go down while its WSOL goes up: opposite
+                // signs, which is all the old rule asked for.
+                bal("feevault", "TOK", 0.0),
+                bal("feevault", WSOL, 0.065073542),
+            ],
+        );
+        assert!(
+            i.price_sol("TOK", Duration::from_secs(60)).is_none(),
+            "0.065 SOL over 608 tokens is a fee, not a market"
+        );
+    }
+
+    /// The rule must not reject the trade it is meant to protect: in a real
+    /// swap the trader and the pool are the two largest movers, equal but for
+    /// fees, so both are read and they corroborate each other.
+    #[test]
+    fn both_sides_of_a_real_swap_are_still_read() {
+        let i = observed(
+            vec![bal("pool", "TOK", 1000.0), bal("pool", WSOL, 0.0),
+                 bal("trader", "TOK", 0.0), bal("trader", WSOL, 5.0)],
+            vec![bal("pool", "TOK", 0.0), bal("pool", WSOL, 5.0),
+                 bal("trader", "TOK", 1000.0), bal("trader", WSOL, 0.0)],
+        );
+        let p = i.price_sol("TOK", Duration::from_secs(60)).unwrap();
+        assert!((p.price_sol - 0.005).abs() < 1e-9, "got {}", p.price_sol);
+        assert_eq!(p.observations, 2, "trader and pool each corroborate the other");
     }
 
     /// Two owners in one transaction are two independent trades, not a route.
