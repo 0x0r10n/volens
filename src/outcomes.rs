@@ -130,6 +130,14 @@ pub struct OutcomeSample {
     /// but it is not a current mark, and the scorer needs to tell them apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_age_secs: Option<u64>,
+    /// How many observed fills stood behind the price.
+    ///
+    /// Diagnostic. An absurd valuation backed by two fills is a cold-start
+    /// artifact — nothing corroborated it. The same figure backed by nine says
+    /// the fills themselves are being misread, which is a different bug in a
+    /// different place. Recording it is how we tell those apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_obs: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fdv_usd: Option<f64>,
 }
@@ -280,6 +288,14 @@ fn ensure_parent(path: &str) {
     }
 }
 
+/// Above this, a valuation is an arithmetic artifact rather than a market.
+///
+/// Chosen to be unarguable rather than tight: $100bn exceeds the market cap of
+/// Solana itself, so nothing this crosses is a real token on it. A tighter
+/// ceiling would start making judgement calls about which tokens are allowed to
+/// be large, which is not this guard's job.
+const MAX_PLAUSIBLE_FDV_USD: f64 = 100_000_000_000.0;
+
 /// Poll for due horizons and record outcomes.
 ///
 /// Runs on its own task, independent of the conviction tracker: a token bought
@@ -379,20 +395,43 @@ pub fn spawn_sampler(
                     }
                 };
 
-                let multiple = if token.reference_sol > 0.0 {
-                    value / token.reference_sol
-                } else {
-                    0.0
-                };
-
-                let fdv_usd = if ok {
+                let mut value = value;
+                let mut ok = ok;
+                let mut fdv_usd = if ok {
                     live_fdv(&rpc, &token, value, &prices).await
                 } else {
                     Some(0.0)
                 };
 
+                // A valuation larger than entire real markets is not a token
+                // that mooned, it is a price we misread — and once written it is
+                // indistinguishable from data. Recorded as UNKNOWN rather than
+                // as a number, on the same principle as an unpriced token: the
+                // gap is visible, the fiction is not.
+                if ok && fdv_usd.is_some_and(|f| f > MAX_PLAUSIBLE_FDV_USD) {
+                    tracing::warn!(
+                        mint = %token.mint,
+                        fdv_usd = fdv_usd.unwrap_or(0.0),
+                        observations = observed.map(|p| p.observations).unwrap_or(0),
+                        price_age_secs = observed.map(|p| p.age.as_secs()).unwrap_or(0),
+                        "implausible valuation; recording as unpriced"
+                    );
+                    ok = false;
+                    value = 0.0;
+                    fdv_usd = Some(0.0);
+                    routed -= 1;
+                    dead += 1;
+                }
+
+                let multiple = if ok && token.reference_sol > 0.0 {
+                    value / token.reference_sol
+                } else {
+                    0.0
+                };
+
                 store.append_sample(&OutcomeSample {
                     price_age_secs: observed.map(|p| p.age.as_secs()),
+                    price_obs: observed.map(|p| p.observations),
                     mint: token.mint.clone(),
                     horizon_secs: horizon,
                     at: now,
@@ -596,6 +635,23 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// Verified on-chain: the tokens that produced multiples in the millions are
+    /// ordinary 6-decimal, ~1B-supply mints. Backing the price out of the
+    /// recorded FDV gave 1335 SOL per token — a valuation of $11 trillion, which
+    /// is not a market. The inflation ranged 63x to 13,000,000,000x across mints,
+    /// so it is a misread trade leg rather than a fixed scaling error.
+    #[test]
+    fn a_valuation_larger_than_any_real_market_is_refused() {
+        // Solana's own market cap is far below this, so nothing legitimate on it
+        // can cross the line.
+        assert!(11_226_921_120_197.0 > MAX_PLAUSIBLE_FDV_USD);
+        assert!(102_572_603_295.0 > MAX_PLAUSIBLE_FDV_USD);
+        // …while genuinely large tokens are untouched. The guard exists to catch
+        // arithmetic, not to rule on which tokens are allowed to be big.
+        assert!(9_000_000_000.0 < MAX_PLAUSIBLE_FDV_USD, "a $9bn token is plausible");
+        assert!(42_196_358.0 < MAX_PLAUSIBLE_FDV_USD);
+    }
+
     /// A token registered minutes ago has nothing due yet, and `register` only
     /// touches memory — so if persistence waited for a sample, the queue would
     /// exist nowhere but RAM until the first horizon came due. One restart in
@@ -633,6 +689,7 @@ mod tests {
         let store = OutcomeStore::load("/nonexistent/p4.jsonl", &s);
         store.append_sample(&OutcomeSample {
             price_age_secs: None,
+            price_obs: None,
             mint: "DEAD".into(),
             horizon_secs: 3600,
             at: Utc::now(),

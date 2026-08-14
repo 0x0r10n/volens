@@ -276,7 +276,11 @@ impl PriceIndex {
         if let Some(current) = self.price_sol(mint, Duration::from_secs(600)) {
             let ratio = price / current.price_sol;
             if !(1.0 / MAX_TOKEN_JUMP..=MAX_TOKEN_JUMP).contains(&ratio) {
-                tracing::debug!(
+                // warn, not debug: this is the only breadcrumb back to the
+                // transaction behind a bad price, and at debug it is invisible
+                // under the default filter — a diagnostic nobody can read is
+                // not a diagnostic.
+                tracing::warn!(
                     mint,
                     signature = %bs58::encode(sig).into_string(),
                     candidate = price,
