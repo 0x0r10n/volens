@@ -62,6 +62,14 @@ pub struct Bot {
     started: Instant,
     /// Highest update id seen; the offset that acknowledges it to Telegram.
     offset: i64,
+    /// Chats waiting to type a value for a setting: chat -> (field, asked_at).
+    ///
+    /// This is what makes the UI a form rather than a command line. A button
+    /// asks, the next plain message answers, and the operator never types a
+    /// command name. Entries expire so a forgotten prompt cannot silently
+    /// swallow an unrelated message half an hour later.
+    #[cfg(feature = "sniper")]
+    awaiting: std::sync::Mutex<std::collections::HashMap<i64, (String, Instant)>>,
     /// For `/balance`. Absent means the command reports "not configured"
     /// rather than a misleading zero.
     rpc: Option<Arc<crate::rpc::RpcClient>>,
@@ -132,6 +140,8 @@ impl Bot {
             kill_switch_file: kill_switch_file.into(),
             started: Instant::now(),
             offset: 0,
+            #[cfg(feature = "sniper")]
+            awaiting: std::sync::Mutex::new(std::collections::HashMap::new()),
             rpc: None,
             signals: None,
             track_for_secs: 86_400,
@@ -334,6 +344,17 @@ impl Bot {
             return;
         }
 
+        // A pending prompt takes precedence: the operator tapped a button and
+        // is answering it, so a bare "0.25" is a value, not an unknown command.
+        #[cfg(feature = "sniper")]
+        if !text.starts_with('/')
+            && let Some(field) = self.take_awaited(chat_id)
+        {
+            let (reply, kb) = self.apply_setting(&field, text.trim());
+            self.reply_with(chat_id, reply, kb).await;
+            return;
+        }
+
         let Some(cmd) = Command::parse(text) else {
             return;
         };
@@ -433,7 +454,7 @@ impl Bot {
             return;
         }
 
-        let Some((text, keyboard)) = self.screen_for(data).await else {
+        let Some((text, keyboard)) = self.screen_for(data, msg.chat.id).await else {
             return;
         };
         self.edit_message(msg.chat.id, msg.message_id, text, keyboard).await;
@@ -461,7 +482,7 @@ impl Bot {
     ///   buttons with a short title; runs no command.
     /// * `cmd:<name>` — executes the action and shows its result, with a Back
     ///   button to the menu it belongs to.
-    async fn screen_for(&self, data: &str) -> Option<(String, serde_json::Value)> {
+    async fn screen_for(&self, data: &str, chat_id: i64) -> Option<(String, serde_json::Value)> {
         // Per-wallet "set active" taps: `use:<name>`. Re-renders the list so the
         // new ✅ active marker is visible immediately.
         if let Some(name) = data.strip_prefix("use:") {
@@ -499,7 +520,21 @@ impl Bot {
         }
         // Settings: text + the Open/Guard strategy toggle.
         if data == "cmd:settings" {
+            #[cfg(feature = "sniper")]
+            self.cancel_awaited(chat_id);
             return Some(self.settings_screen());
+        }
+        // Wallets: text + a "select" button per wallet, so switching never
+        // requires typing a name.
+        #[cfg(feature = "sniper")]
+        if data == "cmd:wallets" {
+            return Some(self.wallets_screen().await);
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(name) = data.strip_prefix("usewallet:") {
+            let text = self.execute(Command::Use(Some(name.to_string()))).await;
+            let (list, kb) = self.wallets_screen().await;
+            return Some((format!("{text}\n\n{list}"), kb));
         }
         // Confirmed withdrawal: `wdgo:<sol>:<address>`. The amount is a float
         // (no colon) and the address is base58 (no colon), so one split works.
@@ -519,6 +554,25 @@ impl Bot {
                     return Some((text, kb));
                 }
             }
+        }
+        // Settings form: `set:<field>` opens an editor, `setv:<field>:<value>`
+        // applies a chosen preset.
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("setv:") {
+            if let Some((field, value)) = rest.split_once(':') {
+                return Some(self.apply_setting(field, value));
+            }
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(field) = data.strip_prefix("ask:") {
+            return Some(self.ask_screen(chat_id, field));
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(field) = data.strip_prefix("set:") {
+            // Opening any editor clears a stale prompt, so a half-finished
+            // "type a value" cannot capture the next unrelated message.
+            self.cancel_awaited(chat_id);
+            return Some(self.setting_editor(field));
         }
         // Flip the entry strategy: `mode:open` | `mode:guard`.
         #[cfg(feature = "sniper")]
@@ -1204,16 +1258,281 @@ impl Bot {
         #[cfg(feature = "sniper")]
         if let Some(sniper) = &self.sniper {
             use crate::sniper::SnipeMode;
-            let (label, target) = match sniper.snipe_mode() {
-                SnipeMode::Open => ("🛡 Switch to GUARD (secured LP only)", "guard"),
-                SnipeMode::Guard => ("⚡ Switch to OPEN (snipe at launch)", "open"),
+            let live = sniper.live();
+            let env = sniper.envelope();
+
+            // One button per setting, labelled with its CURRENT value, so the
+            // screen reads as a form rather than a list of commands to memorise.
+            let cap = |live_v: f64, hard: f64, unit: &str| -> String {
+                let eff = crate::settings::tightest(live_v, hard);
+                if eff > 0.0 { format!("{eff}{unit}") } else { "⚠️ none".into() }
+            };
+            let cap_u = |live_v: u32, hard: u32| -> String {
+                let eff = crate::settings::tightest_u32(live_v, hard);
+                if eff > 0 { eff.to_string() } else { "⚠️ none".into() }
+            };
+
+            let mode_label = match sniper.snipe_mode() {
+                SnipeMode::Open => "⚡ Open",
+                SnipeMode::Guard => "🛡 Guard",
             };
             rows.push(serde_json::json!([
-                {"text": label, "callback_data": format!("mode:{target}")}
+                {"text": format!("💰 Size · {} SOL", live.trade_size_sol), "callback_data": "set:size"},
+                {"text": format!("🎯 Mode · {mode_label}"), "callback_data": "set:mode"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("📉 Slippage · {} bps", live.slippage_bps), "callback_data": "set:slippage"},
+                {"text": format!("💧 Min liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("🧢 Max trade · {}", cap(live.max_trade_size_sol, env.max_trade_size_sol, " SOL")), "callback_data": "set:maxsize"},
+                {"text": format!("📆 Daily · {}", cap(live.daily_cap_sol, env.daily_cap_sol, " SOL")), "callback_data": "set:dailycap"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("🔢 Trades/day · {}", cap_u(live.max_trades_per_day, env.max_trades_per_day)), "callback_data": "set:maxtrades"},
+                {"text": format!("🏦 Max mcap · {}", cap(live.max_market_cap_usd, env.max_market_cap_usd, "")), "callback_data": "set:maxmcap"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("💥 Impact · {}", cap_u(live.max_price_impact_bps, env.max_price_impact_bps)), "callback_data": "set:maximpact"},
             ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// The wallet list, with a select button per wallet.
+    ///
+    /// Switching used to require typing `/use <name>` — the name copied from a
+    /// list above it. The information needed to act was on screen; the action
+    /// was not.
+    #[cfg(feature = "sniper")]
+    async fn wallets_screen(&self) -> (String, serde_json::Value) {
+        let text = self.render_wallets().await;
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        if let Some(store) = &self.store {
+            let active = store.active();
+            for (name, _addr) in store.list() {
+                if active.as_deref() == Some(&name) {
+                    continue; // already active — nothing to switch to
+                }
+                rows.push(serde_json::json!([{
+                    "text": format!("👛 Use {name}"),
+                    "callback_data": format!("usewallet:{name}"),
+                }]));
+            }
+        }
+        rows.push(serde_json::json!([
+            {"text": "🆕 New wallet", "callback_data": "cmd:new-wallet"},
+            {"text": "◀️ Back", "callback_data": "nav:wallet"},
+        ]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// How long a "send me a value" prompt stays open.
+    ///
+    /// Short on purpose. An abandoned prompt that never expires would quietly
+    /// reinterpret the next thing typed in the chat — possibly hours later,
+    /// possibly a number meant for a person — as a trading setting.
+    #[cfg(feature = "sniper")]
+    const AWAIT_TTL: std::time::Duration = std::time::Duration::from_secs(180);
+
+    /// Record that this chat is about to type a value for `field`.
+    #[cfg(feature = "sniper")]
+    fn await_value(&self, chat_id: i64, field: &str) {
+        let mut g = self.awaiting.lock().unwrap_or_else(|p| p.into_inner());
+        g.retain(|_, (_, at)| at.elapsed() < Self::AWAIT_TTL);
+        g.insert(chat_id, (field.to_string(), Instant::now()));
+    }
+
+    /// Take a pending prompt for this chat, if one is still open.
+    #[cfg(feature = "sniper")]
+    fn take_awaited(&self, chat_id: i64) -> Option<String> {
+        let mut g = self.awaiting.lock().unwrap_or_else(|p| p.into_inner());
+        match g.remove(&chat_id) {
+            Some((field, at)) if at.elapsed() < Self::AWAIT_TTL => Some(field),
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "sniper")]
+    fn cancel_awaited(&self, chat_id: i64) {
+        self.awaiting.lock().unwrap_or_else(|p| p.into_inner()).remove(&chat_id);
+    }
+
+    /// The "type a value" screen, reached from the ✏️ button.
+    #[cfg(feature = "sniper")]
+    fn ask_screen(&self, chat_id: i64, field: &str) -> (String, serde_json::Value) {
+        self.await_value(chat_id, field);
+        let (label, hint) = match field {
+            "size" => ("trade size", "e.g. <code>0.03</code> (SOL)"),
+            "slippage" => ("slippage", "e.g. <code>250</code> (bps)"),
+            "minliq" => ("minimum liquidity", "e.g. <code>20</code> (SOL)"),
+            "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
+            "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
+            "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
+            "maxmcap" => ("max market cap", "e.g. <code>75000</code> (USD)"),
+            "maximpact" => ("max price impact", "e.g. <code>400</code> (bps)"),
+            _ => ("value", "send a number"),
+        };
+        let text = format!(
+            "✏️ <b>Send the {label}</b>\n\n{hint}\n\n\
+             <i>Just the number — no command. Expires in 3 minutes.</i>"
+        );
+        let kb = serde_json::json!({"inline_keyboard": [[
+            {"text": "◀️ Cancel", "callback_data": format!("set:{field}")}
+        ]]});
+        (text, kb)
+    }
+
+    /// The editor for one setting: presets as buttons.
+    ///
+    /// Only values the envelope actually permits are offered. A button that
+    /// answers "refused" teaches the operator to distrust the buttons, so the
+    /// filtering happens here rather than in the error path.
+    #[cfg(feature = "sniper")]
+    fn setting_editor(&self, field: &str) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let env = sniper.envelope();
+
+        if field == "mode" {
+            let text = format!(
+                "🎯 <b>Entry strategy</b>\n\nCurrent: <b>{}</b>\n\n\
+                 <b>Open</b> — buy at pool creation. Fastest, but at t=0 every \
+                 pool's LP is still unlocked.\n\
+                 <b>Guard</b> — buy only once LP is burned/locked. Misses fast \
+                 runners, cuts the rug surface.",
+                escape_html(sniper.snipe_mode().label())
+            );
+            let kb = serde_json::json!({"inline_keyboard": [
+                [{"text": "⚡ Open", "callback_data": "setv:mode:open"},
+                 {"text": "🛡 Guard", "callback_data": "setv:mode:guard"}],
+                [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            ]});
+            return (text, kb);
+        }
+
+        // (title, note, current, presets, unit, clearable)
+        let (title, note, current, presets, unit, clearable): (&str, &str, String, Vec<f64>, &str, bool) =
+            match field {
+                "size" => ("💰 Trade size", "How much SOL each buy spends.",
+                    format!("{} SOL", live.trade_size_sol),
+                    vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", false),
+                "slippage" => ("📉 Slippage", "Tighten-only. Lower means fewer fills but less sandwich exposure.",
+                    format!("{} bps", live.slippage_bps),
+                    vec![50.0, 100.0, 200.0, 300.0, 500.0, 1000.0], " bps", false),
+                "minliq" => ("💧 Minimum liquidity", "Raise-only. Pools below this are refused.",
+                    format!("{} SOL", live.min_liquidity_sol),
+                    vec![5.0, 10.0, 15.0, 25.0, 50.0, 100.0], " SOL", false),
+                "maxsize" => ("🧢 Max trade size", "Per-trade ceiling. Lowering it also lowers the trade size.",
+                    fmt_eff(live.max_trade_size_sol, env.max_trade_size_sol, " SOL"),
+                    vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", true),
+                "dailycap" => ("📆 Daily spend cap", "Most SOL this bot may spend in a day.",
+                    fmt_eff(live.daily_cap_sol, env.daily_cap_sol, " SOL"),
+                    vec![0.1, 0.2, 0.5, 1.0, 2.0, 5.0], " SOL", true),
+                "maxtrades" => ("🔢 Trades per day", "Hard stop on how many buys happen in a day.",
+                    fmt_eff_u(live.max_trades_per_day, env.max_trades_per_day),
+                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0], "", true),
+                "maxmcap" => ("🏦 Max market cap", "Refuse entries valued at or above this.",
+                    fmt_eff(live.max_market_cap_usd, env.max_market_cap_usd, ""),
+                    vec![10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0], " USD", true),
+                "maximpact" => ("💥 Max price impact", "Refuse a trade that would move the pool more than this.",
+                    fmt_eff_u(live.max_price_impact_bps, env.max_price_impact_bps),
+                    vec![100.0, 200.0, 500.0, 1000.0, 2000.0], " bps", true),
+                _ => return ("Unknown setting.".to_string(), back_to_settings()),
+            };
+
+        // Envelope filtering: caps and slippage may only tighten, liquidity may
+        // only rise. Offering a value that would be refused is worse than
+        // offering fewer.
+        let ceiling = match field {
+            "size" | "maxsize" => env.max_trade_size_sol,
+            "slippage" => env.slippage_bps as f64,
+            "dailycap" => env.daily_cap_sol,
+            "maxtrades" => env.max_trades_per_day as f64,
+            "maxmcap" => env.max_market_cap_usd,
+            "maximpact" => env.max_price_impact_bps as f64,
+            _ => 0.0,
+        };
+        let floor = if field == "minliq" { env.min_liquidity_sol } else { 0.0 };
+        let allowed: Vec<f64> = presets
+            .into_iter()
+            .filter(|v| (ceiling <= 0.0 || *v <= ceiling) && *v >= floor)
+            .collect();
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for chunk in allowed.chunks(3) {
+            let row: Vec<serde_json::Value> = chunk
+                .iter()
+                .map(|v| {
+                    let shown = if *v >= 1000.0 {
+                        format!("{}k", (*v / 1000.0) as u64)
+                    } else {
+                        format!("{v}")
+                    };
+                    serde_json::json!({
+                        "text": format!("{shown}{unit}"),
+                        "callback_data": format!("setv:{field}:{v}"),
+                    })
+                })
+                .collect();
+            rows.push(serde_json::Value::Array(row));
+        }
+        if clearable {
+            rows.push(serde_json::json!([
+                {"text": "🚫 Clear (use host setting)", "callback_data": format!("setv:{field}:0")}
+            ]));
+        }
+        rows.push(serde_json::json!([
+            {"text": "✏️ Custom value", "callback_data": format!("ask:{field}")},
+            {"text": "◀️ Back", "callback_data": "cmd:settings"},
+        ]));
+
+        let text = format!(
+            "{title}\n\nCurrent: <b>{}</b>\n\n<i>{}</i>",
+            escape_html(&current),
+            escape_html(note)
+        );
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Apply a value chosen from a button, then re-render the editor so the new
+    /// value is visible immediately.
+    #[cfg(feature = "sniper")]
+    fn apply_setting(&self, field: &str, value: &str) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        if field == "mode" {
+            if let Some(m) = crate::sniper::SnipeMode::parse(value) {
+                sniper.set_snipe_mode(m);
+                info!(mode = value, "snipe mode changed from telegram");
+            }
+            return self.settings_screen();
+        }
+        let Ok(v) = value.parse::<f64>() else {
+            return ("⚠️ Bad value.".to_string(), back_to_settings());
+        };
+        let result = match field {
+            "size" => sniper.set_trade_size(v),
+            "slippage" => sniper.set_slippage_bps(v as u16),
+            "minliq" => sniper.set_min_liquidity(v),
+            "maxsize" => sniper.set_max_trade_size(v),
+            "dailycap" => sniper.set_daily_cap(v),
+            "maxtrades" => sniper.set_max_trades(v as u32),
+            "maxmcap" => sniper.set_max_market_cap(v),
+            "maximpact" => sniper.set_max_impact_bps(v as u32),
+            _ => Err("unknown setting".to_string()),
+        };
+        info!(field, value, ok = result.is_ok(), "setting changed from telegram");
+        let (text, kb) = self.setting_editor(field);
+        let banner = match result {
+            Ok(msg) => format!("✅ {}\n\n", escape_html(&msg)),
+            Err(e) => format!("⚠️ {}\n\n", escape_html(&e)),
+        };
+        (format!("{banner}{text}"), kb)
     }
 
     /// Two-tap confirmation before an armed sell — a sell moves the position.
@@ -2023,6 +2342,27 @@ fn sold_keyboard() -> serde_json::Value {
     ]]})
 }
 
+/// Keyboard that returns to the settings form.
+#[cfg(feature = "sniper")]
+fn back_to_settings() -> serde_json::Value {
+    serde_json::json!({"inline_keyboard": [[
+        {"text": "\u{25c0}\u{fe0f} Back", "callback_data": "cmd:settings"}
+    ]]})
+}
+
+/// Effective cap for display, or a plain statement that there is none.
+#[cfg(feature = "sniper")]
+fn fmt_eff(live: f64, hard: f64, unit: &str) -> String {
+    let eff = crate::settings::tightest(live, hard);
+    if eff > 0.0 { format!("{eff}{unit}") } else { "none \u{2014} UNLIMITED".into() }
+}
+
+#[cfg(feature = "sniper")]
+fn fmt_eff_u(live: u32, hard: u32) -> String {
+    let eff = crate::settings::tightest_u32(live, hard);
+    if eff > 0 { eff.to_string() } else { "none \u{2014} UNLIMITED".into() }
+}
+
 fn back_group(callback_data: &str) -> &'static str {
     match callback_data {
         // Wallet-group actions return to the wallet submenu.
@@ -2293,6 +2633,96 @@ mod tests {
             Arc::new(Metrics::default()),
             kill,
         )
+    }
+
+    /// A settings screen with no buttons is a command line with extra steps.
+    /// Every setting must be reachable by tapping.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn every_setting_is_reachable_by_button() {
+        use crate::config::{RpcConfig, SniperConfig};
+        let mut sc = SniperConfig::default();
+        sc.enabled = true;
+        sc.settings_path = String::new();
+        let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let b = bot(&["1"], "").unwrap().with_sniper(sniper);
+
+        let (_, kb) = b.settings_screen();
+        let blob = kb.to_string();
+        for field in ["size", "mode", "slippage", "minliq", "maxsize", "dailycap",
+                      "maxtrades", "maxmcap", "maximpact"] {
+            assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
+        }
+
+        // …and each editor offers presets plus a typed-entry escape hatch.
+        for field in ["size", "slippage", "dailycap", "maxtrades"] {
+            let (_, kb) = b.setting_editor(field);
+            let s = kb.to_string();
+            assert!(s.contains(&format!("setv:{field}:")), "{field} has no preset buttons");
+            assert!(s.contains(&format!("ask:{field}")), "{field} has no custom-value button");
+        }
+    }
+
+    /// Presets must never offer a value the envelope would refuse — a button
+    /// that answers "refused" teaches the operator to distrust the buttons.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn presets_never_offer_a_refused_value() {
+        use crate::config::{RpcConfig, SniperConfig};
+        let mut sc = SniperConfig::default();
+        sc.enabled = true;
+        sc.settings_path = String::new();
+        sc.slippage_bps = 300;
+        sc.max_trade_size_sol = 0.1;
+        let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let b = bot(&["1"], "").unwrap().with_sniper(sniper);
+
+        let s = b.setting_editor("slippage").1.to_string();
+        assert!(s.contains("setv:slippage:300"), "the ceiling itself is offerable");
+        assert!(!s.contains("setv:slippage:500"), "must not offer a looser value");
+        assert!(!s.contains("setv:slippage:1000"));
+
+        let s = b.setting_editor("size").1.to_string();
+        assert!(!s.contains("setv:size:0.25"), "must not offer above the trade ceiling");
+        assert!(s.contains("setv:size:0.05"));
+    }
+
+    /// Tap ✏️, type a bare number, and it lands on the right setting — no
+    /// command name typed anywhere.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn a_prompted_value_is_applied_without_a_command() {
+        use crate::config::{RpcConfig, SniperConfig};
+        let mut sc = SniperConfig::default();
+        sc.enabled = true;
+        sc.settings_path = String::new();
+        let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let b = bot(&["1"], "").unwrap().with_sniper(sniper);
+
+        b.ask_screen(1, "size");
+        assert_eq!(b.take_awaited(1).as_deref(), Some("size"));
+        // Consumed exactly once: a second bare message is not a setting.
+        assert_eq!(b.take_awaited(1), None);
+    }
+
+    /// An abandoned prompt must not reinterpret an unrelated message later, and
+    /// must not leak across chats.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn a_stale_prompt_does_not_swallow_a_later_message() {
+        let b = bot(&["1"], "").unwrap();
+        {
+            let mut g = b.awaiting.lock().unwrap();
+            g.insert(1, ("size".into(), Instant::now() - Bot::AWAIT_TTL - Duration::from_secs(1)));
+        }
+        assert_eq!(b.take_awaited(1), None, "expired prompts must not apply");
+
+        b.ask_screen(7, "dailycap");
+        assert_eq!(b.take_awaited(9), None, "a prompt belongs to one chat only");
+        assert_eq!(b.take_awaited(7).as_deref(), Some("dailycap"));
     }
 
     /// `unwrap_err` requires `Debug` on the Ok type, and `Bot` deliberately does

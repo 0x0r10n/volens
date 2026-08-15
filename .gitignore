@@ -31,3 +31,6 @@ __pycache__/
 
 # Live settings written by the bot (operational state, not code).
 settings.json
+config.local.toml
+local-settings.json
+local_*.jsonl
