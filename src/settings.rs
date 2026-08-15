@@ -55,6 +55,10 @@ pub struct LiveSettings {
     pub max_trades_per_day: u32,
     pub max_market_cap_usd: f64,
     pub max_price_impact_bps: u32,
+
+    /// When to sell a position. See `crate::exits`.
+    #[serde(default)]
+    pub exits: crate::exits::ExitRules,
 }
 
 /// The config-side ceilings this process may never exceed.
@@ -109,6 +113,7 @@ impl LiveSettings {
             max_trades_per_day: 0,
             max_market_cap_usd: 0.0,
             max_price_impact_bps: 0,
+            exits: crate::exits::ExitRules::default(),
         }
     }
 

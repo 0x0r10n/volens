@@ -15,6 +15,8 @@ mod detector;
 #[cfg(feature = "sniper")]
 mod execute;
 #[cfg(feature = "sniper")]
+mod exits;
+#[cfg(feature = "sniper")]
 mod jito;
 // Not sniper-gated: this module is pure HTTP + JSON with no Solana crates, and
 // the conviction performance tracker needs quotes in an alerts-only build.

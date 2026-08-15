@@ -577,12 +577,31 @@ impl Bot {
         #[cfg(feature = "sniper")]
         if let Some(rest) = data.strip_prefix("setv:") {
             if let Some((field, value)) = rest.split_once(':') {
+                if let Some(screen) = self.apply_exit_setting(field, value) {
+                    return Some(screen);
+                }
                 return Some(self.apply_setting(field, value));
             }
         }
         #[cfg(feature = "sniper")]
         if let Some(field) = data.strip_prefix("ask:") {
             return Some(self.ask_screen(chat_id, field));
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:exits" {
+            return Some(self.exits_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(n) = data.strip_prefix("set:rung") {
+            if let Ok(i) = n.parse::<usize>() {
+                if (1..=3).contains(&i) {
+                    return Some(self.rung_screen(i - 1));
+                }
+            }
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:stoploss" || data == "set:trailing" {
+            return Some(self.stop_screen(data.trim_start_matches("set:")));
         }
         #[cfg(feature = "sniper")]
         if let Some(field) = data.strip_prefix("set:") {
@@ -1289,28 +1308,19 @@ impl Bot {
                 if eff > 0 { eff.to_string() } else { "none".into() }
             };
 
-            let mode_label = match sniper.snipe_mode() {
-                SnipeMode::Open => "⚡ Open",
-                SnipeMode::Guard => "🛡 Guard",
-            };
+            // Deliberately NOT shown: the spend caps and the snipe mode.
+            //
+            // The caps still bind on every buy — they are set on the host and
+            // enforced from `config.toml`; hiding the buttons removes a way to
+            // TIGHTEN them, never the ceiling itself. Snipe mode is a new-pool
+            // strategy, and this bot is being pointed at smart money instead.
             rows.push(serde_json::json!([
                 {"text": format!("💰 Size · {} SOL", live.trade_size_sol), "callback_data": "set:size"},
-                {"text": format!("🎯 Mode · {mode_label}"), "callback_data": "set:mode"},
-            ]));
-            rows.push(serde_json::json!([
                 {"text": format!("📉 Slippage · {} bps", live.slippage_bps), "callback_data": "set:slippage"},
+            ]));
+            rows.push(serde_json::json!([
                 {"text": format!("💧 Min liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("🧢 Max trade · {}", cap(live.max_trade_size_sol, env.max_trade_size_sol, " SOL")), "callback_data": "set:maxsize"},
-                {"text": format!("📆 Daily · {}", cap(live.daily_cap_sol, env.daily_cap_sol, " SOL")), "callback_data": "set:dailycap"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("🔢 Trades/day · {}", cap_u(live.max_trades_per_day, env.max_trades_per_day)), "callback_data": "set:maxtrades"},
-                {"text": format!("🏦 Max mcap · {}", cap(live.max_market_cap_usd, env.max_market_cap_usd, "")), "callback_data": "set:maxmcap"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("💥 Impact · {}", cap_u(live.max_price_impact_bps, env.max_price_impact_bps)), "callback_data": "set:maximpact"},
+                {"text": format!("🎚 TP / SL · {}", crate::exits::describe(&live.exits)), "callback_data": "set:exits"},
             ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
@@ -1399,6 +1409,157 @@ impl Bot {
             {"text": "◀️ Cancel", "callback_data": format!("set:{field}")}
         ]]});
         (text, kb)
+    }
+
+
+    /// The auto-sell screen: a ladder and two protective stops, all tappable.
+    #[cfg(feature = "sniper")]
+    fn exits_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let e = sniper.live().exits;
+        let onoff = if e.enabled { "🟢 On" } else { "⚪ Off" };
+        let sl = if e.stop_loss_pct > 0 { format!("-{}%", e.stop_loss_pct) } else { "off".into() };
+        let tr = if e.trailing_pct > 0 { format!("-{}%", e.trailing_pct) } else { "off".into() };
+
+        let text = format!(
+            "🎚 <b>Auto-sell</b>\n\n             Sells a position without you watching. Percentages are of what is \
+             STILL held, so 50% at 2x then 50% at 3x leaves 25% running.\n\n             <i>Protective stops are checked before profit rungs: a position \
+             that gaps from 3x to 0.4x leaves rather than taking a rung on the \
+             way past.</i>"
+        );
+
+        let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
+            {"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}
+        ])];
+        for (i, r) in e.rungs.iter().enumerate() {
+            let label = if r.is_armed() {
+                format!("🎯 TP {} · sell {}% at +{}%", i + 1, r.sell_pct, r.at_gain_pct)
+            } else {
+                format!("🎯 Rung {} · off", i + 1)
+            };
+            rows.push(serde_json::json!([
+                {"text": label, "callback_data": format!("set:rung{}", i + 1)}
+            ]));
+        }
+        rows.push(serde_json::json!([
+            {"text": format!("🛑 Stop loss · {sl}"), "callback_data": "set:stoploss"},
+            {"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
+        ]));
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Editor for one ladder rung: the multiple, then the percentage.
+    #[cfg(feature = "sniper")]
+    fn rung_screen(&self, idx: usize) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let r = sniper.live().exits.rungs[idx];
+        let text = format!(
+            "🎯 <b>Rung {}</b>\n\nCurrently: <b>{}</b>\n\n             <i>Pick the multiple to sell at, then how much of the remaining \
+             position to sell.</i>",
+            idx + 1,
+            if r.is_armed() { format!("sell {}% at +{}%", r.sell_pct, r.at_gain_pct) } else { "off".into() }
+        );
+        let n = idx + 1;
+        // Gains, not multiples: "+100%" is how a trader states a target.
+        let mults: Vec<serde_json::Value> = [25u32, 50, 100, 200, 400, 900]
+            .iter()
+            .map(|g| serde_json::json!({
+                "text": format!("{}+{}%", if *g == r.at_gain_pct { "✓ " } else { "" }, g),
+                "callback_data": format!("setv:rung{n}m:{g}"),
+            }))
+            .collect();
+        let pcts: Vec<serde_json::Value> = [25u8, 33, 50, 75, 100]
+            .iter()
+            .map(|p| serde_json::json!({
+                "text": format!("{}{}%", if *p == r.sell_pct { "✓ " } else { "" }, p),
+                "callback_data": format!("setv:rung{n}p:{p}"),
+            }))
+            .collect();
+        let kb = serde_json::json!({"inline_keyboard": [
+            mults[..3].to_vec(), mults[3..].to_vec(),
+            pcts[..3].to_vec(), pcts[3..].to_vec(),
+            [{"text": "🚫 Turn this rung off", "callback_data": format!("setv:rung{n}p:0")}],
+            [{"text": "◀️ Back", "callback_data": "set:exits"}],
+        ]});
+        (text, kb)
+    }
+
+    /// Editor for a protective stop.
+    #[cfg(feature = "sniper")]
+    fn stop_screen(&self, which: &str) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let e = sniper.live().exits;
+        let (title, note, cur, key) = if which == "stoploss" {
+            ("🛑 Stop loss",
+             "Sell everything once the position is down this much from cost.",
+             e.stop_loss_pct, "sl")
+        } else {
+            ("📉 Trailing stop",
+             "Sell everything once the position falls this far from its PEAK. \
+              Only acts after the position has been in profit, so it cannot \
+              close a fresh entry on ordinary slippage.",
+             e.trailing_pct, "trail")
+        };
+        let text = format!(
+            "{title}\n\nCurrent: <b>{}</b>\n\n<i>{note}</i>",
+            if cur > 0 { format!("-{cur}%") } else { "off".into() }
+        );
+        let opts: Vec<serde_json::Value> = [20u8, 30, 40, 50, 60, 75]
+            .iter()
+            .map(|p| serde_json::json!({
+                "text": format!("{}-{}%", if *p == cur { "✓ " } else { "" }, p),
+                "callback_data": format!("setv:{key}:{p}"),
+            }))
+            .collect();
+        let kb = serde_json::json!({"inline_keyboard": [
+            opts[..3].to_vec(), opts[3..].to_vec(),
+            [{"text": "🚫 Off", "callback_data": format!("setv:{key}:0")}],
+            [{"text": "◀️ Back", "callback_data": "set:exits"}],
+        ]});
+        (text, kb)
+    }
+
+    /// Apply an auto-sell change. Returns None if `field` is not one of ours.
+    #[cfg(feature = "sniper")]
+    fn apply_exit_setting(&self, field: &str, value: &str) -> Option<(String, serde_json::Value)> {
+        let sniper = self.sniper.as_ref()?;
+        let res = match field {
+            "exits_on" => sniper.toggle_exits(),
+            "sl" => value.parse::<u8>().ok().map(|v| sniper.set_stop_loss(v))?,
+            "trail" => value.parse::<u8>().ok().map(|v| sniper.set_trailing(v))?,
+            f if f.starts_with("rung") && f.ends_with('m') => {
+                let idx = f[4..f.len() - 1].parse::<usize>().ok()?.checked_sub(1)?;
+                sniper.set_rung_gain(idx, value.parse::<u32>().ok()?)
+            }
+            f if f.starts_with("rung") && f.ends_with('p') => {
+                let idx = f[4..f.len() - 1].parse::<usize>().ok()?.checked_sub(1)?;
+                sniper.set_rung_pct(idx, value.parse::<u8>().ok()?)
+            }
+            _ => return None,
+        };
+        info!(field, value, "auto-sell setting changed from telegram");
+        let (text, kb) = if field.starts_with("rung") {
+            let idx: usize = field[4..field.len() - 1].parse::<usize>().ok()?.saturating_sub(1);
+            self.rung_screen(idx)
+        } else if field == "sl" {
+            self.stop_screen("stoploss")
+        } else if field == "trail" {
+            self.stop_screen("trailing")
+        } else {
+            self.exits_screen()
+        };
+        let banner = match res {
+            Ok(m) => format!("✅ {}\n\n", escape_html(&m)),
+            Err(e) => format!("⚠️ {}\n\n", escape_html(&e)),
+        };
+        Some((format!("{banner}{text}"), kb))
     }
 
     /// The editor for one setting: presets as buttons.
@@ -2665,13 +2826,29 @@ mod tests {
 
         let (_, kb) = b.settings_screen();
         let blob = kb.to_string();
-        for field in ["size", "mode", "slippage", "minliq", "maxsize", "dailycap",
-                      "maxtrades", "maxmcap", "maximpact"] {
+        for field in ["size", "slippage", "minliq", "exits"] {
             assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
         }
+        // Spend caps are enforced from config and deliberately have no button:
+        // hiding them removes a way to TIGHTEN, never the ceiling itself.
+        for gone in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
+                     "set:maximpact", "set:mode"] {
+            assert!(!blob.contains(gone), "{gone} should no longer be on the screen");
+        }
 
-        // …and each editor offers presets plus a typed-entry escape hatch.
-        for field in ["size", "slippage", "dailycap", "maxtrades"] {
+        // The whole exit policy is reachable by tapping, nothing typed.
+        let exits = b.exits_screen().1.to_string();
+        assert!(exits.contains("setv:exits_on:toggle"), "no on/off");
+        assert!(exits.contains("set:stoploss") && exits.contains("set:trailing"), "no stops");
+        for n in 1..=3 {
+            assert!(exits.contains(&format!("set:rung{n}")), "no TP {n}");
+            let rung = b.rung_screen(n - 1).1.to_string();
+            assert!(rung.contains(&format!("setv:rung{n}m:")), "TP {n} has no gain presets");
+            assert!(rung.contains(&format!("setv:rung{n}p:")), "TP {n} has no size presets");
+        }
+
+        // …and each remaining editor offers presets plus a typed escape hatch.
+        for field in ["size", "slippage", "minliq"] {
             let (_, kb) = b.setting_editor(field);
             let s = kb.to_string();
             assert!(s.contains(&format!("setv:{field}:")), "{field} has no preset buttons");
@@ -3220,17 +3397,7 @@ mod tests {
 
         let blob = kb.to_string();
         assert!(blob.contains("0.02"), "button must carry the working trade size");
-        assert!(blob.contains("0.1"), "button must carry the max trade cap");
-
-        // An absent cap is still stated plainly, never blank or a dash.
-        let mut open = SniperConfig::default();
-        open.enabled = true;
-        open.settings_path = String::new();
-        open.daily_cap_sol = 0.0;
-        open.max_trades_per_day = 0;
-        let s2 = Arc::new(crate::sniper::Sniper::new(open, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
-        let (_, kb2) = bot(&["1"], "").unwrap().with_sniper(s2).settings_screen();
-        assert!(kb2.to_string().contains("none"), "an uncapped limit must say so: {kb2}");
+        let _ = rpc;
     }
 
     #[test]

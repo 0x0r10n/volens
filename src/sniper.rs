@@ -769,6 +769,74 @@ impl Sniper {
         })
     }
 
+    /// Turn the whole exit policy on or off.
+    pub fn toggle_exits(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            s.exits.enabled = !s.exits.enabled;
+            Ok(if s.exits.enabled {
+                format!("auto-sell ON — {}", crate::exits::describe(&s.exits))
+            } else {
+                "auto-sell OFF — positions are yours to close".to_string()
+            })
+        })
+    }
+
+    /// Set a take-profit trigger, as a GAIN in percent. 0 disables it.
+    ///
+    /// A trigger of 0 would fire at break-even, which is not taking profit —
+    /// it is closing a position for no reason — so it reads as "off" instead.
+    pub fn set_rung_gain(&self, idx: usize, gain_pct: u32) -> Result<String, String> {
+        if idx >= 3 {
+            return Err("there are three take-profit levels".into());
+        }
+        self.settings.update(|s| {
+            s.exits.rungs[idx].at_gain_pct = gain_pct;
+            Ok(if gain_pct == 0 {
+                format!("TP {} off", idx + 1)
+            } else {
+                format!("TP {} triggers at +{gain_pct}%", idx + 1)
+            })
+        })
+    }
+
+    /// Set how much of the REMAINING position a rung sells. 0 disables it.
+    pub fn set_rung_pct(&self, idx: usize, pct: u8) -> Result<String, String> {
+        if idx >= 3 {
+            return Err("there are three take-profit levels".into());
+        }
+        if pct > 100 {
+            return Err("percentage cannot exceed 100".into());
+        }
+        self.settings.update(|s| {
+            s.exits.rungs[idx].sell_pct = pct;
+            Ok(if pct == 0 {
+                format!("TP {} off", idx + 1)
+            } else {
+                format!("TP {} sells {pct}% of what is left", idx + 1)
+            })
+        })
+    }
+
+    pub fn set_stop_loss(&self, pct: u8) -> Result<String, String> {
+        if pct >= 100 {
+            return Err("a 100% stop loss would never trigger before the position is worthless".into());
+        }
+        self.settings.update(|s| {
+            s.exits.stop_loss_pct = pct;
+            Ok(if pct == 0 { "stop loss off".into() } else { format!("stop loss at -{pct}%") })
+        })
+    }
+
+    pub fn set_trailing(&self, pct: u8) -> Result<String, String> {
+        if pct >= 100 {
+            return Err("a 100% trailing stop would never trigger".into());
+        }
+        self.settings.update(|s| {
+            s.exits.trailing_pct = pct;
+            Ok(if pct == 0 { "trailing stop off".into() } else { format!("trailing stop at -{pct}% from peak") })
+        })
+    }
+
     /// Is the kill switch file present? Checked per-decision so it takes effect
     /// immediately, with no restart and no signal handling.
     fn kill_switch_engaged(&self) -> bool {
