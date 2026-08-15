@@ -351,6 +351,40 @@ impl Bot {
             && let Some(field) = self.take_awaited(chat_id)
         {
             let value = text.trim();
+
+            // Withdraw is two prompts, because an address cannot be a preset
+            // and the amount decides whether the address matters. Each step
+            // re-arms the next, and the final screen is the existing two-tap
+            // confirmation — nothing moves without one more deliberate press.
+            if field == "wd_amount" {
+                match value.parse::<f64>() {
+                    Ok(sol) if sol > 0.0 && sol.is_finite() => {
+                        self.await_value(chat_id, &format!("wd_dest|{sol}"));
+                        let kb = serde_json::json!({"inline_keyboard": [[
+                            {"text": "◀️ Cancel", "callback_data": "nav:wallet"}
+                        ]]});
+                        self.reply_with(
+                            chat_id,
+                            format!(
+                                "📤 <b>Withdrawing {sol} SOL</b>\n\n                                 Now send the <b>destination address</b>.\n\n                                 <i>Nothing is sent until you confirm on the next screen.</i>"
+                            ),
+                            kb,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        self.reply(chat_id, "⚠️ That is not a valid amount. Try again from 📤 Withdraw.".into())
+                            .await;
+                    }
+                }
+                return;
+            }
+            if let Some(sol) = field.strip_prefix("wd_dest|") {
+                let (reply, kb) = self.withdraw_prompt_screen(Some(&format!("{sol} {value}")));
+                self.reply_with(chat_id, reply, kb).await;
+                return;
+            }
+
             let (reply, kb) = self
                 .apply_exit_setting(&field, value)
                 .unwrap_or_else(|| self.apply_setting(&field, value));
@@ -966,7 +1000,8 @@ impl Bot {
     #[cfg(feature = "sniper")]
     fn wallet_deposit_screen(&self, name: &str) -> (String, serde_json::Value) {
         let kb = serde_json::json!({ "inline_keyboard": [[
-            {"text": "◀️ Back", "callback_data": format!("w:{name}")}
+            {"text": "📤 Start withdrawal", "callback_data": "ask:wd_amount"},
+            {"text": "◀️ Back", "callback_data": format!("w:{name}")},
         ]]});
         let Some(addr) = self.store.as_ref().and_then(|s| s.pubkey_of(name)) else {
             return (format!("⚠️ Unknown wallet <b>{}</b>", escape_html(name)), kb);
@@ -992,8 +1027,7 @@ impl Bot {
         ]]});
         let text = format!(
             "💸 <b>Withdraw from {name}</b>\n\n\
-             Send this, replacing the amount and address:\n\n\
-             <code>/withdraw 0.05 ADDRESS {name}</code>\n\n\
+             Tap below, send the amount, then the destination address.\n\n\
              <i>You will get a confirmation showing the exact amount and \
              destination before anything is sent. Blocked while halted.</i>",
             name = escape_html(name),
@@ -1392,6 +1426,11 @@ impl Bot {
                 "e.g. <code>150</code> for a +150% target, or <code>-30</code> for a stop",
             ),
             f if f.starts_with("orda") => ("amount", "e.g. <code>35</code> (% of the original position)"),
+            "wd_amount" => ("amount to withdraw", "e.g. <code>0.25</code> (SOL)"),
+            f if f.starts_with("wd_dest") => (
+                "destination address",
+                "paste the Solana address to send to",
+            ),
             _ => ("value", "send a number"),
         };
         let text = format!(
@@ -2323,7 +2362,8 @@ impl Bot {
                  {"text": "📥 Deposit", "callback_data": "cmd:deposit"}],
                 [{"text": "📈 Positions", "callback_data": "cmd:positions"},
                  {"text": "👛 List wallets", "callback_data": "cmd:wallets"}],
-                [{"text": "🆕 New wallet", "callback_data": "cmd:new-wallet"}],
+                [{"text": "🆕 New wallet", "callback_data": "cmd:new-wallet"},
+                 {"text": "📤 Withdraw", "callback_data": "ask:wd_amount"}],
                 [{"text": "◀️ Back", "callback_data": "nav:main"}],
             ]
         })
@@ -2917,6 +2957,31 @@ mod tests {
         b.ask_screen(7, "dailycap");
         assert_eq!(b.take_awaited(9), None, "a prompt belongs to one chat only");
         assert_eq!(b.take_awaited(7).as_deref(), Some("dailycap"));
+    }
+
+
+    /// Withdraw is reachable by button, and takes its two values as prompts
+    /// rather than as a command the operator has to assemble by hand.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn withdrawing_is_a_button_flow() {
+        let b = bot(&["1"], "").unwrap();
+        assert!(Bot::wallet_menu().to_string().contains("ask:wd_amount"), "no withdraw button");
+
+        // Step one asks for the amount.
+        let (text, _) = b.ask_screen(1, "wd_amount");
+        assert!(text.contains("amount to withdraw"), "{text}");
+        assert_eq!(b.take_awaited(1).as_deref(), Some("wd_amount"));
+
+        // Step two carries the amount forward in the pending key.
+        b.await_value(1, "wd_dest|0.25");
+        assert_eq!(b.take_awaited(1).as_deref(), Some("wd_dest|0.25"));
+
+        // The assembled pair produces the existing two-tap confirmation, and
+        // nothing moves without that second press.
+        let (confirm, kb) = b.withdraw_prompt_screen(Some("0.25 4Nd1mBQtrMJVYVfKf2PJy9NCYYkJt1zY9CZK1Y9tYqRy"));
+        assert!(confirm.contains("Confirm withdrawal"), "{confirm}");
+        assert!(kb.to_string().contains("wdgo:0.25:"), "no confirm button: {kb}");
     }
 
     /// `unwrap_err` requires `Debug` on the Ok type, and `Bot` deliberately does

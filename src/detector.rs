@@ -784,6 +784,9 @@ impl Detector {
                     first_buy_utc: chrono::Utc::now(),
                     reference_tokens_raw: buy.token_amount_raw,
                     reference_sol: buy.sol_spent,
+                    // Pinned by the sampler on the first price it observes
+                    // AFTER this moment — a price a follower could act on.
+                    entry_price_sol: None,
                     decimals: buy.decimals,
                     first_wallet: buy.wallet.clone(),
                     sampled: Vec::new(),

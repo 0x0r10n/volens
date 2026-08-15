@@ -45,8 +45,27 @@ pub struct PendingToken {
     /// When the first tracked wallet bought it — the clock for every horizon.
     pub first_buy_utc: DateTime<Utc>,
     /// Reference fill: this many raw tokens cost this much SOL.
+    ///
+    /// Kept for FDV and for context, but NO LONGER the basis of the multiple.
+    /// It is the smart wallet's own fill — on one verified launch that was
+    /// $4,493 FDV inside the creation bundle, while the first price anyone else
+    /// could pay was $351,705. Scoring from it ranks wallets by who gets the
+    /// best entry, which selects for launch bundlers: the one behaviour a
+    /// follower cannot copy.
     pub reference_tokens_raw: u64,
     pub reference_sol: f64,
+    /// First price WE observed after the token was registered, in SOL per
+    /// whole token. This is the basis of the multiple.
+    ///
+    /// "Purchasable" cannot be known exactly — it depends on a follower's
+    /// latency and size. The first price we actually observed is the honest
+    /// proxy: it is achievable by definition, because it happened after the
+    /// call and we saw it trade there.
+    ///
+    /// `None` until a price exists. A token we never see trade yields no
+    /// multiple at all rather than a fabricated one.
+    #[serde(default)]
+    pub entry_price_sol: Option<f64>,
     #[serde(default)]
     pub decimals: u32,
     /// Wallet that got there first, so scoring can credit discovery.
@@ -115,7 +134,15 @@ pub struct OutcomeSample {
     /// SOL the reference quantity fetches at this horizon. 0 when unroutable.
     pub sol_value: f64,
     pub reference_sol: f64,
-    /// `sol_value / reference_sol`. 0 when unroutable.
+    /// Price, in SOL per whole token, that the multiple is measured FROM.
+    /// The first price observed after the call — see `PendingToken`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_price_sol: Option<f64>,
+    /// Price at this horizon, in SOL per whole token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_sol: Option<f64>,
+    /// `price_sol / entry_price_sol` — what a follower entering at the first
+    /// observable price would be holding. 0 when unpriced.
     pub multiple: f64,
     /// Did we have a usable price at this horizon?
     ///
@@ -193,6 +220,32 @@ impl OutcomeStore {
         self.lock()
             .values()
             .filter_map(|p| p.due(now, horizons).map(|h| (p.clone(), h)))
+            .collect()
+    }
+
+    /// Record the first price observed for a token, if it has none yet.
+    ///
+    /// Returns the entry price now in force. Set once and never revised: the
+    /// point is to pin the earliest price a follower could have acted on, and a
+    /// later, better one is not that.
+    pub fn set_entry_price(&self, mint: &str, price_sol: f64) -> Option<f64> {
+        if !price_sol.is_finite() || price_sol <= 0.0 {
+            return None;
+        }
+        let mut map = self.lock();
+        let p = map.get_mut(mint)?;
+        if p.entry_price_sol.is_none() {
+            p.entry_price_sol = Some(price_sol);
+        }
+        p.entry_price_sol
+    }
+
+    /// Tokens still waiting for their first observable price.
+    pub fn awaiting_entry_price(&self) -> Vec<String> {
+        self.lock()
+            .values()
+            .filter(|p| p.entry_price_sol.is_none())
+            .map(|p| p.mint.clone())
             .collect()
     }
 
@@ -339,6 +392,22 @@ pub fn spawn_sampler(
             // due existed nowhere else — one restart in that window silently
             // discarded every token being watched.
             store.persist_pending();
+            // Pin the first observable price for anything still without one.
+            // Done every tick, before sampling, so the entry is the earliest
+            // price we saw rather than whatever happened to be current at the
+            // first horizon.
+            let mut pinned = 0usize;
+            for mint in store.awaiting_entry_price() {
+                if let Some(p) = prices.price_sol(&mint, max_price_age)
+                    && store.set_entry_price(&mint, p.price_sol).is_some()
+                {
+                    pinned += 1;
+                }
+            }
+            if pinned > 0 {
+                tracing::debug!(pinned, "entry prices pinned");
+            }
+
             let batch = store.due(now, &horizons);
             if batch.is_empty() {
                 continue;
@@ -378,6 +447,12 @@ pub fn spawn_sampler(
                             )
                     })
                     .filter(|v| *v > 0.0);
+                // The entry may still be unset if the token has never traded
+                // where we can see it. Then there is no multiple to report —
+                // not a zero, which would read as a rug.
+                let entry = token.entry_price_sol.or_else(|| {
+                    observed.and_then(|p| store.set_entry_price(&token.mint, p.price_sol))
+                });
 
                 let (value, ok) = match sol_value {
                     Some(v) => {
@@ -423,15 +498,21 @@ pub fn spawn_sampler(
                     dead += 1;
                 }
 
-                let multiple = if ok && token.reference_sol > 0.0 {
-                    value / token.reference_sol
-                } else {
-                    0.0
+                // Measured from the first price WE observed after the call, not
+                // from the smart wallet's fill. Their fill is frequently inside
+                // a creation bundle and unreachable: on one verified launch the
+                // two differed by 78x, and scoring from theirs ranked launch
+                // bundlers top.
+                let multiple = match (ok, entry, observed) {
+                    (true, Some(entry), Some(p)) if entry > 0.0 => p.price_sol / entry,
+                    _ => 0.0,
                 };
 
                 store.append_sample(&OutcomeSample {
                     price_age_secs: observed.map(|p| p.age.as_secs()),
                     price_obs: observed.map(|p| p.observations),
+                    entry_price_sol: entry,
+                    price_sol: observed.map(|p| p.price_sol),
                     mint: token.mint.clone(),
                     horizon_secs: horizon,
                     at: now,
@@ -497,10 +578,56 @@ mod tests {
             first_buy_utc: Utc::now() - chrono::Duration::seconds(age_secs),
             reference_tokens_raw: 1_000_000,
             reference_sol: 1.0,
+            entry_price_sol: None,
             decimals: 6,
             first_wallet: "W1".into(),
             sampled: vec![],
         }
+    }
+
+
+    /// The entry is pinned ONCE, on the first price we see after the call, and
+    /// never revised. Revising it to a later, better price would recreate the
+    /// bug this fixes: measuring from an entry nobody could have taken.
+    #[test]
+    fn the_entry_price_is_pinned_once() {
+        let store = OutcomeStore::load("/nonexistent/p.jsonl", "/nonexistent/s.jsonl");
+        assert!(store.register(token("MINT", 0)));
+        assert_eq!(store.awaiting_entry_price(), vec!["MINT".to_string()]);
+
+        assert_eq!(store.set_entry_price("MINT", 0.005), Some(0.005));
+        assert_eq!(store.set_entry_price("MINT", 0.001), Some(0.005), "must not be revised");
+        assert!(store.awaiting_entry_price().is_empty());
+    }
+
+    /// A price we cannot use must not become an entry — a zero entry would make
+    /// every later multiple infinite.
+    #[test]
+    fn an_unusable_price_is_never_pinned_as_the_entry() {
+        let store = OutcomeStore::load("/nonexistent/p2.jsonl", "/nonexistent/s2.jsonl");
+        assert!(store.register(token("MINT", 0)));
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(store.set_entry_price("MINT", bad), None, "{bad}");
+        }
+        assert_eq!(store.awaiting_entry_price().len(), 1, "still waiting for a real price");
+    }
+
+    /// The distinction the whole fix exists for, in numbers taken from a
+    /// verified launch: the wallet filled inside the creation bundle at
+    /// 6.005e-8 SOL/token, and the first price anyone else could pay was 78x
+    /// higher. Measuring from theirs reports 177x; measuring from the first
+    /// observable price reports what a follower would actually be holding.
+    #[test]
+    fn a_bundle_fill_and_an_observable_entry_are_not_the_same_number() {
+        let wallet_fill = 6.005e-8_f64;
+        let first_observable = 4.691e-6_f64;
+        let price_now = 1.067e-5_f64;
+
+        let from_their_fill = price_now / wallet_fill;
+        let from_our_entry = price_now / first_observable;
+
+        assert!(from_their_fill > 170.0, "their entry flatters it: {from_their_fill:.0}x");
+        assert!(from_our_entry < 3.0, "an achievable entry is far more modest: {from_our_entry:.2}x");
     }
 
     #[test]
@@ -690,6 +817,8 @@ mod tests {
         store.append_sample(&OutcomeSample {
             price_age_secs: None,
             price_obs: None,
+            entry_price_sol: None,
+            price_sol: None,
             mint: "DEAD".into(),
             horizon_secs: 3600,
             at: Utc::now(),
