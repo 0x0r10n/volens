@@ -62,16 +62,14 @@ pub struct LiveSettings {
 
     /// Buy automatically on smart-money conviction.
     ///
-    /// Can only be true when config ALLOWS it. Config grants the capability;
-    /// this switch is how the operator stops it from a phone without an SSH
-    /// session. Enabling something the host never authorised would break the
-    /// inward-only rule the whole two-tier model rests on.
+    /// A full Telegram switch, unlike the spend caps. The caps bound how much
+    /// can be lost and so stay host-side; this only decides WHETHER to trade,
+    /// and everything it can spend is already bounded by them. It defaults off
+    /// and is never enabled by anything but a deliberate tap.
     #[serde(default)]
     pub auto_buy: bool,
-    /// Distinct eligible wallets required before buying. 0 = follow config.
-    ///
-    /// Raise-only against the config floor: more wallets is more evidence, and
-    /// therefore the safer direction.
+    /// Distinct eligible buyers required before buying. 0 = use the config
+    /// default.
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
 }
@@ -79,9 +77,7 @@ pub struct LiveSettings {
 /// The config-side ceilings this process may never exceed.
 #[derive(Debug, Clone, Copy)]
 pub struct Envelope {
-    /// Whether the HOST permits auto-buying at all. Telegram cannot grant this.
-    pub auto_buy_allowed: bool,
-    /// Fewest wallets the host will allow a buy on. Telegram may raise it.
+    /// Starting value for the buyer threshold, used until one is set.
     pub auto_buy_min_wallets: usize,
     pub max_trade_size_sol: f64,
     pub daily_cap_sol: f64,
@@ -115,14 +111,17 @@ pub fn tightest_u32(live: u32, hard: u32) -> u32 {
 }
 
 impl LiveSettings {
-    /// Auto-buy is on only if BOTH tiers say so.
-    pub fn auto_buy_active(&self, env: &Envelope) -> bool {
-        env.auto_buy_allowed && self.auto_buy
+    pub fn auto_buy_active(&self, _env: &Envelope) -> bool {
+        self.auto_buy
     }
 
-    /// The binding wallet threshold: the higher of the two.
+    /// Buyers required. Falls back to the config value until one is chosen.
     pub fn effective_auto_buy_min(&self, env: &Envelope) -> usize {
-        self.auto_buy_min_wallets.max(env.auto_buy_min_wallets).max(1)
+        if self.auto_buy_min_wallets > 0 {
+            self.auto_buy_min_wallets
+        } else {
+            env.auto_buy_min_wallets.max(2)
+        }
     }
 
     /// Start from config: live values equal the envelope, capping nothing
@@ -257,12 +256,7 @@ impl SettingsStore {
 
 /// Force every value back inside the envelope.
 fn clamp(s: &mut LiveSettings, env: &Envelope) {
-    // A stored `true` cannot outlive the host's permission: revoking it in
-    // config must take effect on the next start, not wait for someone to
-    // remember to untick it.
-    if !env.auto_buy_allowed {
-        s.auto_buy = false;
-    }
+
     if env.slippage_bps > 0 {
         s.slippage_bps = s.slippage_bps.min(env.slippage_bps);
     }
@@ -282,7 +276,6 @@ mod tests {
 
     fn env() -> Envelope {
         Envelope {
-            auto_buy_allowed: true,
             auto_buy_min_wallets: 4,
             max_trade_size_sol: 1.0,
             daily_cap_sol: 5.0,
@@ -299,54 +292,37 @@ mod tests {
     }
 
 
-    /// Telegram can switch auto-buy off and back on, but cannot grant itself a
-    /// permission the host withheld.
+    /// Auto-buy is a full Telegram switch, and it survives a restart. The
+    /// spend caps stay host-side because they bound how much can be LOST;
+    /// this only decides whether to trade, and what it can spend is already
+    /// bounded by them.
     #[test]
-    fn telegram_cannot_enable_what_the_host_forbids() {
-        let mut e = env();
-        e.auto_buy_allowed = false;
-        let mut s = live();
-        s.auto_buy = true; // as if a hand-edited file tried to turn it on
-        let store = SettingsStore::ephemeral(e, s);
-        assert!(!store.snapshot().auto_buy_active(&e), "config must win");
-
-        e.auto_buy_allowed = true;
-        let s2 = SettingsStore::ephemeral(e, live());
-        s2.update(|s| { s.auto_buy = true; Ok("on".into()) }).unwrap();
-        assert!(s2.snapshot().auto_buy_active(&e));
-    }
-
-    /// Revoking permission on the host must take effect at the next start, not
-    /// wait for someone to remember to untick it.
-    #[test]
-    fn a_stored_true_does_not_outlive_the_permission() {
+    fn auto_buy_is_toggled_from_telegram_and_persists() {
         let dir = std::env::temp_dir().join(format!("volens-ab-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join("settings.json").to_string_lossy().to_string();
         let _ = std::fs::remove_file(&p);
 
-        let mut allowed = env();
-        allowed.auto_buy_allowed = true;
-        let store = SettingsStore::load(&p, allowed, live());
+        let store = SettingsStore::load(&p, env(), live());
+        assert!(!store.snapshot().auto_buy, "off until deliberately enabled");
         store.update(|s| { s.auto_buy = true; Ok("on".into()) }).unwrap();
 
-        let mut revoked = env();
-        revoked.auto_buy_allowed = false;
-        let reloaded = SettingsStore::load(&p, revoked, live());
-        assert!(!reloaded.snapshot().auto_buy, "must be cleared on load");
+        let reloaded = SettingsStore::load(&p, env(), live());
+        assert!(reloaded.snapshot().auto_buy_active(&env()), "must survive a restart");
         let _ = std::fs::remove_file(&p);
     }
 
-    /// The threshold binds at whichever tier is stricter.
+    /// The threshold falls back to config until one is chosen, then the choice
+    /// stands — in either direction.
     #[test]
-    fn the_wallet_threshold_takes_the_higher_side() {
+    fn the_buyer_threshold_is_the_operators_choice() {
         let e = env();
         let mut s = live();
-        assert_eq!(s.effective_auto_buy_min(&e), 4, "inherits the host floor");
+        assert_eq!(s.effective_auto_buy_min(&e), 4, "config default until set");
         s.auto_buy_min_wallets = 8;
-        assert_eq!(s.effective_auto_buy_min(&e), 8, "raising is allowed");
+        assert_eq!(s.effective_auto_buy_min(&e), 8);
         s.auto_buy_min_wallets = 2;
-        assert_eq!(s.effective_auto_buy_min(&e), 4, "cannot go below the floor");
+        assert_eq!(s.effective_auto_buy_min(&e), 2, "lowering is the operator's call");
     }
 
     /// 0 means "this tier sets no cap", so the other tier decides. It must

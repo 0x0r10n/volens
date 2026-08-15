@@ -459,12 +459,9 @@ impl Sniper {
         rpc: Arc<RpcClient>,
         rpc_cfg: &RpcConfig,
         prices: Arc<crate::prices::PriceIndex>,
-        // From `[tracked]`: whether the host permits auto-buying, and the
-        // fewest wallets it will allow. Passed in rather than read from
-        // `SniperConfig` because the trigger lives in the tracked section —
-        // and the envelope should reflect where the permission is actually
-        // granted.
-        auto_buy_allowed: bool,
+        // From `[tracked]`: the starting buyer threshold. Passed in rather than
+        // read from `SniperConfig` because the trigger lives in the tracked
+        // section.
         auto_buy_min_wallets: usize,
     ) -> Result<Self> {
         // max_trade_size_sol == 0 means "no per-trade ceiling" (unlimited).
@@ -522,7 +519,6 @@ impl Sniper {
             )
         })?;
         let envelope = Envelope {
-            auto_buy_allowed,
             auto_buy_min_wallets,
             max_trade_size_sol: cfg.max_trade_size_sol,
             daily_cap_sol: cfg.daily_cap_sol,
@@ -998,39 +994,25 @@ impl Sniper {
     /// account could start the bot spending on a trigger nobody authorised.
     pub fn toggle_auto_buy(&self) -> Result<String, String> {
         let env = self.settings.envelope();
-        if !env.auto_buy_allowed {
-            return Err(
-                "auto-buy is not enabled on the host. Set `auto_buy = true` in \
-                 [tracked] and restart; this switch can then turn it off and on."
-                    .into(),
-            );
-        }
         self.settings.update(|s| {
             s.auto_buy = !s.auto_buy;
             Ok(if s.auto_buy {
-                format!(
-                    "auto-buy ON — {} wallets required",
-                    s.effective_auto_buy_min(&env)
-                )
+                format!("auto-buy ON — triggers on {} buyers", s.effective_auto_buy_min(&env))
             } else {
                 "auto-buy OFF — signals still alert, nothing is bought".to_string()
             })
         })
     }
 
-    /// Raise the wallet threshold for a buy. Never below the host's floor:
-    /// fewer wallets is less evidence, which is the riskier direction.
+    /// How many distinct tracked wallets must buy before we do.
     pub fn set_auto_buy_min(&self, n: usize) -> Result<String, String> {
         let env = self.settings.envelope();
-        if n > 0 && n < env.auto_buy_min_wallets {
-            return Err(format!(
-                "{n} is below the host floor of {} wallets — raise it in config to go lower",
-                env.auto_buy_min_wallets
-            ));
+        if !(2..=20).contains(&n) {
+            return Err("between 2 and 20 buyers".into());
         }
         self.settings.update(|s| {
             s.auto_buy_min_wallets = n;
-            Ok(format!("auto-buy needs {} wallets", s.effective_auto_buy_min(&env)))
+            Ok(format!("auto-buy triggers on {} buyers", s.effective_auto_buy_min(&env)))
         })
     }
 
@@ -2060,7 +2042,6 @@ mod tests {
             Arc::new(RpcClient::new(&rpc_cfg)),
             &rpc_cfg,
             Arc::new(crate::prices::PriceIndex::new()),
-            false,
             4,
         )
     }

@@ -92,7 +92,6 @@ impl Detector {
             rpc.clone(),
             &cfg.rpc,
             prices.clone(),
-            cfg.tracked.auto_buy,
             cfg.tracked.auto_buy_min_wallets,
         )?);
 
