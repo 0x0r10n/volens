@@ -1265,11 +1265,11 @@ impl Bot {
             // screen reads as a form rather than a list of commands to memorise.
             let cap = |live_v: f64, hard: f64, unit: &str| -> String {
                 let eff = crate::settings::tightest(live_v, hard);
-                if eff > 0.0 { format!("{eff}{unit}") } else { "⚠️ none".into() }
+                if eff > 0.0 { format!("{eff}{unit}") } else { "none".into() }
             };
             let cap_u = |live_v: u32, hard: u32| -> String {
                 let eff = crate::settings::tightest_u32(live_v, hard);
-                if eff > 0 { eff.to_string() } else { "⚠️ none".into() }
+                if eff > 0 { eff.to_string() } else { "none".into() }
             };
 
             let mode_label = match sniper.snipe_mode() {
@@ -2354,13 +2354,13 @@ fn back_to_settings() -> serde_json::Value {
 #[cfg(feature = "sniper")]
 fn fmt_eff(live: f64, hard: f64, unit: &str) -> String {
     let eff = crate::settings::tightest(live, hard);
-    if eff > 0.0 { format!("{eff}{unit}") } else { "none \u{2014} UNLIMITED".into() }
+    if eff > 0.0 { format!("{eff}{unit}") } else { "unlimited".into() }
 }
 
 #[cfg(feature = "sniper")]
 fn fmt_eff_u(live: u32, hard: u32) -> String {
     let eff = crate::settings::tightest_u32(live, hard);
-    if eff > 0 { eff.to_string() } else { "none \u{2014} UNLIMITED".into() }
+    if eff > 0 { eff.to_string() } else { "unlimited".into() }
 }
 
 fn back_group(callback_data: &str) -> &'static str {
@@ -3202,7 +3202,8 @@ mod tests {
         // a protection they do not have.
         assert!(msg.contains("from config"), "must attribute the inherited cap");
 
-        // An absent cap is stated, never left blank or shown as a dash.
+        // An absent cap is still stated plainly, never left blank or shown as
+        // a dash — the screen should always say what is actually in force.
         let mut open = SniperConfig::default();
         open.enabled = true;
         open.settings_path = String::new();
@@ -3210,7 +3211,7 @@ mod tests {
         open.max_trades_per_day = 0;
         let s2 = Arc::new(crate::sniper::Sniper::new(open, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
         let msg2 = bot(&["1"], "").unwrap().with_sniper(s2).render_settings();
-        assert!(msg2.contains("UNLIMITED"), "an uncapped limit must say so: {msg2}");
+        assert!(msg2.contains("unlimited"), "an uncapped limit must say so: {msg2}");
     }
 
     #[test]

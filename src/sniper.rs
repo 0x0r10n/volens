@@ -357,19 +357,18 @@ fn describe_cap(name: &str, v: f64, hard: f64, unit: &str) -> String {
     if hard > 0.0 {
         format!("{name} now follows config ({hard} {unit})")
     } else {
-        format!("⚠️ {name} cleared and config sets none — this is now UNLIMITED")
+        format!("{name} cleared — no ceiling set, this is now unlimited")
     }
 }
 
 /// One cap row: what binds, and which tier set it.
 ///
-/// "unlimited" is spelled out rather than shown as a dash. An operator glancing
-/// at this screen should never mistake an absent cap for a quiet default —
-/// these three lines are the only thing between a detection bug and the wallet.
+/// An absent cap is spelled out rather than shown as a dash, so the screen
+/// always says what is actually in force.
 fn cap_row(live: f64, hard: f64) -> String {
     let eff = crate::settings::tightest(live, hard);
     if eff <= 0.0 {
-        return "⚠️ UNLIMITED".into();
+        return "unlimited".into();
     }
     let src = if live > 0.0 && (hard <= 0.0 || live <= hard) { "set here" } else { "from config" };
     format!("{eff} SOL ({src})")
@@ -378,7 +377,7 @@ fn cap_row(live: f64, hard: f64) -> String {
 fn cap_row_u32(live: u32, hard: u32) -> String {
     let eff = crate::settings::tightest_u32(live, hard);
     if eff == 0 {
-        return "⚠️ UNLIMITED".into();
+        return "unlimited".into();
     }
     let src = if live > 0 && (hard == 0 || live <= hard) { "set here" } else { "from config" };
     format!("{eff} ({src})")
@@ -387,7 +386,7 @@ fn cap_row_u32(live: u32, hard: u32) -> String {
 fn cap_row_usd(live: f64, hard: f64) -> String {
     let eff = crate::settings::tightest(live, hard);
     if eff <= 0.0 {
-        return "⚠️ no ceiling".into();
+        return "none".into();
     }
     let src = if live > 0.0 && (hard <= 0.0 || live <= hard) { "set here" } else { "from config" };
     format!("${eff:.0} ({src})")
@@ -396,7 +395,7 @@ fn cap_row_usd(live: f64, hard: f64) -> String {
 fn cap_row_bps(live: u32, hard: u32) -> String {
     let eff = crate::settings::tightest_u32(live, hard);
     if eff == 0 {
-        return "⚠️ no ceiling".into();
+        return "none".into();
     }
     let src = if live > 0 && (hard == 0 || live <= hard) { "set here" } else { "from config" };
     format!("{eff} bps ({src})")
@@ -1693,7 +1692,7 @@ mod tests {
         open.daily_cap_sol = 0.0;
         let s2 = mk(open).unwrap();
         let msg2 = s2.set_daily_cap(0.0).unwrap();
-        assert!(msg2.contains("UNLIMITED"), "an absent cap must be stated: {msg2}");
+        assert!(msg2.contains("unlimited"), "an absent cap must be stated: {msg2}");
     }
 
     fn event() -> PoolEvent {
