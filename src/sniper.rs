@@ -638,6 +638,17 @@ impl Sniper {
         SnipeMode::parse(&self.settings.snapshot().snipe_mode).unwrap_or(SnipeMode::Guard)
     }
 
+    /// Where decisions are logged. Read by the Telegram layer to reconstruct
+    /// cost basis for a position screen.
+    pub fn audit_log_path(&self) -> &str {
+        &self.cfg.audit_log
+    }
+
+    /// The stream-derived price index, for display.
+    pub fn prices(&self) -> &Arc<crate::prices::PriceIndex> {
+        &self.prices
+    }
+
     /// Live settings snapshot, for display and for the Telegram layer.
     pub fn live(&self) -> LiveSettings {
         self.settings.snapshot()

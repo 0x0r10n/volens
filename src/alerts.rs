@@ -576,29 +576,28 @@ use crate::bot::escape_html;
 #[cfg(feature = "sniper")]
 pub fn render_smart_buy(
     mint: &str,
-    wallets: usize,
+    _wallets: usize,
     outcome: &crate::sniper::BuyOutcome,
 ) -> Option<String> {
     use crate::sniper::BuyOutcome;
     let short = crate::conviction::short_mint(mint);
     Some(match outcome {
         BuyOutcome::Refused { reason } => format!(
-            "⚪ <b>Smart buy skipped</b> · <code>{}</code>\n{} wallets\n{}",
-            escape_html(&short), wallets, escape_html(reason)
+            "⚪ <b>Smart buy skipped</b> · <code>{}</code>\n{}",
+            escape_html(&short), escape_html(reason)
         ),
         BuyOutcome::Failed { reason, .. } => format!(
-            "❌ <b>Smart buy FAILED</b> · <code>{}</code>\n{} wallets\n{}",
-            escape_html(&short), wallets, escape_html(reason)
+            "❌ <b>Smart buy FAILED</b> · <code>{}</code>\n{}",
+            escape_html(&short), escape_html(reason)
         ),
         BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
-            "🧪 <b>Smart buy rehearsed</b> · <code>{}</code>\n\
-             {wallets} wallets · {sol_in} SOL\n{}\n\
+            "🧪 <b>Smart buy rehearsed</b> · <code>{}</code>\n{sol_in} SOL\n{}\n\
              <i>Dry run — nothing was signed.</i>",
             escape_html(&short),
             if *would_succeed { "would succeed" } else { "would FAIL" }
         ),
         BuyOutcome::Submitted { sol_in, result, .. } => format!(
-            "🟢 <b>SMART BUY</b> · <code>{}</code>\n{wallets} wallets · {sol_in} SOL\n{}",
+            "🟢 <b>SMART BUY</b> · <code>{}</code>\n{sol_in} SOL\n{}",
             escape_html(&short),
             escape_html(&describe_submission(result))
         ),

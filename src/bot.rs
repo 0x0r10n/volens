@@ -568,7 +568,11 @@ impl Bot {
         if let Some(name) = data.strip_prefix("expask:") {
             return Some(self.export_confirm_screen(Some(name)));
         }
-        // Positions: text + a "Sell N%" button per holding.
+        #[cfg(feature = "sniper")]
+        if let Some(mint) = data.strip_prefix("pos:") {
+            return Some(self.position_screen(mint).await);
+        }
+        // Positions: text + one button per holding.
         if data == "cmd:positions" {
             return Some(self.positions_screen().await);
         }
@@ -1305,16 +1309,15 @@ impl Bot {
         if let (Some(sniper), Some(rpc)) = (&self.sniper, &self.rpc) {
             if let Some((address, _)) = sniper.trading_identity() {
                 if let Some(holdings) = rpc.token_holdings(&address).await {
-                    for (mint, _amt) in holdings.iter().take(8) {
-                        // Prefer the ticker on the button — "Sell 50% DOGEK" is
-                        // far easier to act on than "Sell 50% Gw12…pump".
+                    for (mint, _amt) in holdings.iter().take(10) {
+                        // The ticker, not the mint — "DOGEK" is actionable,
+                        // "Gw12…pump" is something you have to decode first.
                         let short = match rpc.token_metadata(mint).await {
                             Some((_, sym)) if !sym.is_empty() => sym,
                             _ => short_mint(mint),
                         };
                         rows.push(serde_json::json!([
-                            {"text": format!("Sell 50% {short}"), "callback_data": format!("sell:{mint}:50")},
-                            {"text": format!("Sell 100% {short}"), "callback_data": format!("sell:{mint}:100")},
+                            {"text": format!("📈 {short}"), "callback_data": format!("pos:{mint}")}
                         ]));
                     }
                 }
@@ -1322,6 +1325,87 @@ impl Bot {
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// One position: what it cost, what it is worth, and how to leave it.
+    ///
+    /// Market cap is shown at ENTRY and NOW because that is the pair a trader
+    /// actually reasons about — "in at 40k, now 180k" says more about whether
+    /// to take profit than any percentage does, and it is the number every
+    /// other tool in this space quotes.
+    #[cfg(feature = "sniper")]
+    async fn position_screen(&self, mint: &str) -> (String, serde_json::Value) {
+        let back = serde_json::json!({ "inline_keyboard": [[
+            {"text": "◀️ Positions", "callback_data": "cmd:positions"}
+        ]]});
+        let (Some(sniper), Some(rpc)) = (&self.sniper, &self.rpc) else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back);
+        };
+        let Some((owner, _)) = sniper.trading_identity() else {
+            return ("⚪ <b>No active wallet</b>".to_string(), back);
+        };
+        let Some((raw, decimals)) = rpc.token_balance_raw(&owner, mint).await else {
+            return ("📭 <b>No balance of this token</b>".to_string(), back);
+        };
+        let held = raw as f64 / 10f64.powi(decimals as i32);
+
+        let sym = match rpc.token_metadata(mint).await {
+            Some((_, s)) if !s.is_empty() => s,
+            _ => short_mint(mint),
+        };
+
+        // Cost basis counts only buys that truly moved funds, so a rehearsal
+        // never shows up here as a position with a price paid.
+        let audit = tokio::fs::read_to_string(sniper.audit_log_path()).await.unwrap_or_default();
+        let basis = crate::positions::cost_basis_from_audit(&audit);
+        let paid = basis.get(mint).map(|b| b.sol_spent);
+
+        let price_now = sniper.prices().price_sol(mint, std::time::Duration::from_secs(3600));
+        let sol_usd = sniper.prices().sol_usd(std::time::Duration::from_secs(600));
+        let supply = rpc.token_supply(mint).await;
+
+        // Entry price is what WE paid per token, not the signal's reference —
+        // this screen is about this position, not about the wallets that
+        // pointed at it.
+        let entry_price = match (paid, held) {
+            (Some(p), h) if h > 0.0 && p > 0.0 => Some(p / h),
+            _ => None,
+        };
+        let mcap = |price: f64| -> Option<f64> {
+            Some(price * supply? * sol_usd?)
+        };
+
+        let mut out = format!("📈 <b>{}</b>\n<code>{}</code>\n\n", escape_html(&sym), escape_html(mint));
+        out.push_str(&format!("Holding: <b>{}</b>\n", fmt_tokens(held)));
+        match (paid, price_now) {
+            (Some(paid), Some(p)) => {
+                let value = p.price_sol * held;
+                let pnl = if paid > 0.0 { (value / paid - 1.0) * 100.0 } else { 0.0 };
+                out.push_str(&format!(
+                    "Paid: <b>{paid:.4} SOL</b>\nValue: <b>{value:.4} SOL</b>\n\
+                     PnL: <b>{}{pnl:.1}%</b>\n",
+                    if pnl >= 0.0 { "+" } else { "" }
+                ));
+            }
+            (None, Some(p)) => {
+                out.push_str(&format!("Value: <b>{:.4} SOL</b>\n", p.price_sol * held));
+                out.push_str("<i>No cost basis — this token was not bought by the bot.</i>\n");
+            }
+            _ => out.push_str("<i>No current price — nobody has traded it in our window.</i>\n"),
+        }
+        match (entry_price.and_then(mcap), price_now.map(|p| p.price_sol).and_then(mcap)) {
+            (Some(a), Some(b)) => out.push_str(&format!(
+                "\nMC entry: <b>{}</b>\nMC now: <b>{}</b>\n",
+                fmt_usd_short(a), fmt_usd_short(b)
+            )),
+            (None, Some(b)) => out.push_str(&format!("\nMC now: <b>{}</b>\n", fmt_usd_short(b))),
+            _ => out.push_str("\n<i>Market cap unavailable (no price or supply).</i>\n"),
+        }
+        if let Some(p) = price_now {
+            out.push_str(&format!("<i>price {}s old, {} fills</i>\n", p.age.as_secs(), p.observations));
+        }
+
+        (out, sell_size_keyboard(mint))
     }
 
     /// Settings screen with the Open/Guard entry-strategy toggle. The button
@@ -2641,6 +2725,45 @@ fn fmt_eff_u(live: u32, hard: u32) -> String {
     if eff > 0 { eff.to_string() } else { "unlimited".into() }
 }
 
+/// Sell sizes for one position. Each taps through to the existing two-tap
+/// confirmation, so a mis-tap here still cannot move funds on its own.
+#[cfg(feature = "sniper")]
+fn sell_size_keyboard(mint: &str) -> serde_json::Value {
+    serde_json::json!({"inline_keyboard": [
+        [{"text": "Sell 10%", "callback_data": format!("sell:{mint}:10")},
+         {"text": "Sell 25%", "callback_data": format!("sell:{mint}:25")},
+         {"text": "Sell 50%", "callback_data": format!("sell:{mint}:50")}],
+        [{"text": "Sell 75%", "callback_data": format!("sell:{mint}:75")},
+         {"text": "Sell 100%", "callback_data": format!("sell:{mint}:100")}],
+        [{"text": "◀️ Positions", "callback_data": "cmd:positions"}],
+    ]})
+}
+
+/// Token quantities, at a readability that suits their size.
+///
+/// Memecoin balances span nine orders of magnitude; a fixed precision is
+/// unreadable at one end and misleading at the other.
+#[cfg(feature = "sniper")]
+fn fmt_tokens(v: f64) -> String {
+    match v {
+        v if v >= 1e9 => format!("{:.2}B", v / 1e9),
+        v if v >= 1e6 => format!("{:.2}M", v / 1e6),
+        v if v >= 1e3 => format!("{:.1}K", v / 1e3),
+        v => format!("{v:.4}"),
+    }
+}
+
+/// Market caps the way a trader says them: "40K", "1.8M".
+#[cfg(feature = "sniper")]
+fn fmt_usd_short(v: f64) -> String {
+    match v {
+        v if v >= 1e9 => format!("${:.2}B", v / 1e9),
+        v if v >= 1e6 => format!("${:.2}M", v / 1e6),
+        v if v >= 1e3 => format!("${:.1}K", v / 1e3),
+        v => format!("${v:.0}"),
+    }
+}
+
 fn back_group(callback_data: &str) -> &'static str {
     match callback_data {
         // Wallet-group actions return to the wallet submenu.
@@ -3054,6 +3177,50 @@ mod tests {
         let (confirm, kb) = b.withdraw_prompt_screen(Some("0.25 4Nd1mBQtrMJVYVfKf2PJy9NCYYkJt1zY9CZK1Y9tYqRy"));
         assert!(confirm.contains("Confirm withdrawal"), "{confirm}");
         assert!(kb.to_string().contains("wdgo:0.25:"), "no confirm button: {kb}");
+    }
+
+
+    /// Each position gets its own button, and its screen offers a range of
+    /// sell sizes rather than only 50/100.
+    #[cfg(feature = "sniper")]
+    #[tokio::test]
+    async fn a_position_has_its_own_screen_and_sell_sizes() {
+        use crate::config::{RpcConfig, SniperConfig};
+        let mut sc = SniperConfig::default();
+        sc.enabled = true;
+        sc.settings_path = String::new();
+        sc.sell_routes_path = String::new();
+        let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let b = bot(&["1"], "").unwrap().with_sniper(sniper).with_rpc(rpc);
+
+        let mint = "AByynfTALEVQFkE3i52oiSbJNDV61PzrXMNffX4pump";
+        // With no wallet and no live RPC there is no position — and a screen
+        // for a token you do not hold must never offer to sell it.
+        let (text, kb) = b.position_screen(mint).await;
+        assert!(!kb.to_string().contains("sell:"), "offered to sell nothing: {text}");
+
+        let blob = sell_size_keyboard(mint).to_string();
+        // Every size taps straight through to the existing two-tap confirm.
+        for pct in [10, 25, 50, 75, 100] {
+            assert!(blob.contains(&format!("sell:{mint}:{pct}")), "no {pct}% button");
+        }
+        assert!(blob.contains("cmd:positions"), "no way back");
+    }
+
+    /// Balances span nine orders of magnitude; one fixed precision cannot serve
+    /// both ends.
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn quantities_and_market_caps_read_the_way_traders_say_them() {
+        assert_eq!(fmt_tokens(1_250_000_000.0), "1.25B");
+        assert_eq!(fmt_tokens(2_400_000.0), "2.40M");
+        assert_eq!(fmt_tokens(1_500.0), "1.5K");
+        assert_eq!(fmt_tokens(0.5), "0.5000");
+
+        assert_eq!(fmt_usd_short(4_493.0), "$4.5K");
+        assert_eq!(fmt_usd_short(351_705.0), "$351.7K");
+        assert_eq!(fmt_usd_short(1_800_000.0), "$1.80M");
     }
 
     /// `unwrap_err` requires `Debug` on the Ok type, and `Bot` deliberately does
