@@ -361,6 +361,23 @@ impl Bot {
 
         info!(chat_id, command = cmd.name(), "telegram command");
 
+        // Screens that ARE a form open with their buttons attached, whether
+        // reached by typing or by tapping — otherwise typing the command gives
+        // a strictly worse version of the same screen.
+        #[cfg(feature = "sniper")]
+        if matches!(cmd, Command::Settings) {
+            self.cancel_awaited(chat_id);
+            let (text, kb) = self.settings_screen();
+            self.reply_with(chat_id, text, kb).await;
+            return;
+        }
+        #[cfg(feature = "sniper")]
+        if matches!(cmd, Command::Wallets) {
+            let (text, kb) = self.wallets_screen().await;
+            self.reply_with(chat_id, text, kb).await;
+            return;
+        }
+
         // Withdraw is the one command that opens a confirm dialog (a button),
         // because it moves funds out. Everything else replies with plain text.
         // Private key export: PRIVATE CHAT ONLY. Telegram group ids are
@@ -2023,16 +2040,14 @@ impl Bot {
             let Some(sniper) = &self.sniper else {
                 return "⚪ <b>Sniper not configured</b>".to_string();
             };
+            // One compact context line, then the buttons do the talking.
+            let ctx: Vec<String> = sniper
+                .settings_rows()
+                .into_iter()
+                .map(|(k, v)| if k == "Mode" { v } else { format!("{}: {}", k.to_lowercase(), v) })
+                .collect();
             let mut out = String::from("⚙️ <b>Trading settings</b>\n");
-            for (label, value) in sniper.settings_rows() {
-                out.push_str(&format!("{}: <b>{}</b>\n", escape_html(label), escape_html(&value)));
-            }
-            out.push_str(
-                "\n<i>set here</i> = changed from Telegram and saved. \
-                 <i>from config</i> = the host-side ceiling.\n\
-                 Caps can only be TIGHTENED from here; raising one needs host access.\n\n\
-                 <code>/maxsize /dailycap /maxtrades /maxmcap /maximpact /mode</code>",
-            );
+            out.push_str(&escape_html(&ctx.join("  ·  ")));
             out
         }
     }
@@ -3193,25 +3208,29 @@ mod tests {
         let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
 
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
-        let msg = b.render_settings();
-        assert!(msg.contains("Trading settings"), "got: {msg}");
-        assert!(msg.contains("0.02"), "must show working trade size");
-        assert!(msg.contains("0.1"), "must show the max trade cap");
-        // Where a cap came from is part of the reading. An operator who cannot
-        // tell a limit they set from one they inherited will eventually assume
-        // a protection they do not have.
-        assert!(msg.contains("from config"), "must attribute the inherited cap");
+        let (msg, kb) = b.settings_screen();
 
-        // An absent cap is still stated plainly, never left blank or shown as
-        // a dash — the screen should always say what is actually in force.
+        // The header carries only what has no button: armed state and the
+        // fixed host-side context. Values live on the buttons, and are asserted
+        // there — printing them twice is how the two copies drift apart.
+        assert!(msg.contains("Trading settings"), "got: {msg}");
+        assert!(msg.contains("dry run"), "armed state is the one thing that must be unmissable");
+        assert!(!msg.contains("Trade size:"), "values belong on the buttons, not restated: {msg}");
+        assert!(!msg.contains("/maxsize"), "no command list — the buttons replace it: {msg}");
+
+        let blob = kb.to_string();
+        assert!(blob.contains("0.02"), "button must carry the working trade size");
+        assert!(blob.contains("0.1"), "button must carry the max trade cap");
+
+        // An absent cap is still stated plainly, never blank or a dash.
         let mut open = SniperConfig::default();
         open.enabled = true;
         open.settings_path = String::new();
         open.daily_cap_sol = 0.0;
         open.max_trades_per_day = 0;
         let s2 = Arc::new(crate::sniper::Sniper::new(open, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
-        let msg2 = bot(&["1"], "").unwrap().with_sniper(s2).render_settings();
-        assert!(msg2.contains("unlimited"), "an uncapped limit must say so: {msg2}");
+        let (_, kb2) = bot(&["1"], "").unwrap().with_sniper(s2).settings_screen();
+        assert!(kb2.to_string().contains("none"), "an uncapped limit must say so: {kb2}");
     }
 
     #[test]

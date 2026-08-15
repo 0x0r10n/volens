@@ -597,22 +597,12 @@ impl Sniper {
     pub fn settings_rows(&self) -> Vec<(&'static str, String)> {
         let armed = matches!(self.mode, Mode::Armed(_));
         let c = &self.cfg;
-        let t = self.settings.snapshot();
-        let env = self.settings.envelope();
+        // Deliberately does NOT repeat the tunables. Every one of those is a
+        // button on this screen, labelled with its own value — printing them
+        // again above the buttons is the same information twice, and the copy
+        // that cannot be tapped is the one that goes stale first.
         vec![
             ("Mode", if armed { "🔴 ARMED (live)".into() } else { "🧪 dry run".into() }),
-            ("Snipe mode", self.snipe_mode().label().to_string()),
-            ("Trade size", format!("{} SOL", t.trade_size_sol)),
-            ("Slippage", format!("{} bps ({:.1}%)", t.slippage_bps, t.slippage_bps as f64 / 100.0)),
-            ("Min liquidity", format!("{} SOL (floor {})", t.min_liquidity_sol, c.min_liquidity_sol)),
-            // Each cap shows what actually binds, and where it came from. An
-            // operator who cannot tell a limit they set from one they merely
-            // inherited will eventually assume a protection they do not have.
-            ("Max trade", cap_row(t.max_trade_size_sol, env.max_trade_size_sol)),
-            ("Daily spend", cap_row(t.daily_cap_sol, env.daily_cap_sol)),
-            ("Trades/day", cap_row_u32(t.max_trades_per_day, env.max_trades_per_day)),
-            ("Max market cap", cap_row_usd(t.max_market_cap_usd, env.max_market_cap_usd)),
-            ("Max price impact", cap_row_bps(t.max_price_impact_bps, env.max_price_impact_bps)),
             ("Pool cooldown", format!("{}s", c.pool_cooldown_secs)),
             ("Preflight", if c.preflight { "on".into() } else { "OFF".into() }),
             ("Jito bundles", if c.jito_enabled { "on".into() } else { "off".into() }),
