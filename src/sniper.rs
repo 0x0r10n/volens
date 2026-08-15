@@ -815,14 +815,23 @@ impl Sniper {
             let value_sol = priced.price_sol * tokens;
             let multiple = value_sol / cost.sol_spent;
 
-            match state.decide(&rules, &mint, multiple) {
-                crate::exits::ExitAction::Hold => {}
-                crate::exits::ExitAction::Sell { pct, reason } => {
-                    warn!(%mint, pct, multiple, %reason, "auto-sell firing");
-                    let outcome = self.sell(&mint, pct).await;
-                    info!(%mint, ?outcome, "auto-sell result");
-                    sold += 1;
+            // `decide` also converts the order's share of the ORIGINAL
+            // position into a share of what is held now, which is what a sell
+            // can act on.
+            let (action, pct_now) = state.decide(&rules, &mint, multiple, raw);
+            if let crate::exits::ExitAction::Sell { amount_pct_of_original, reason } = action {
+                if pct_now == 0 {
+                    continue;
                 }
+                warn!(
+                    %mint, multiple, %reason,
+                    of_original = amount_pct_of_original,
+                    of_current = pct_now,
+                    "auto-sell firing"
+                );
+                let outcome = self.sell(&mint, pct_now).await;
+                info!(%mint, ?outcome, "auto-sell result");
+                sold += 1;
             }
         }
         (considered, sold)
@@ -840,49 +849,65 @@ impl Sniper {
         })
     }
 
-    /// Set a take-profit trigger, as a GAIN in percent. 0 disables it.
-    ///
-    /// A trigger of 0 would fire at break-even, which is not taking profit —
-    /// it is closing a position for no reason — so it reads as "off" instead.
-    pub fn set_rung_gain(&self, idx: usize, gain_pct: u32) -> Result<String, String> {
-        if idx >= 3 {
-            return Err("there are three take-profit levels".into());
+    /// Add an empty order for the operator to configure.
+    pub fn add_order(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            if s.exits.orders.len() >= crate::exits::MAX_ORDERS {
+                return Err(format!("at most {} orders", crate::exits::MAX_ORDERS));
+            }
+            // Added disarmed: an order that started live would begin selling on
+            // a trigger nobody chose.
+            s.exits.orders.push(crate::exits::SellOrder { at_pct: 0, amount_pct: 0 });
+            Ok(format!("order {} added — set its trigger", s.exits.orders.len()))
+        })
+    }
+
+    pub fn remove_order(&self, idx: usize) -> Result<String, String> {
+        self.settings.update(|s| {
+            if idx >= s.exits.orders.len() {
+                return Err("no such order".into());
+            }
+            let gone = s.exits.orders.remove(idx);
+            Ok(format!("removed {}", gone.label()))
+        })
+    }
+
+    /// Set an order's trigger, as a percent move from cost. Negative is a stop.
+    pub fn set_order_trigger(&self, idx: usize, at_pct: i32) -> Result<String, String> {
+        if !(-99..=100_000).contains(&at_pct) {
+            return Err("trigger must be between -99% and +100000%".into());
         }
         self.settings.update(|s| {
-            s.exits.rungs[idx].at_gain_pct = gain_pct;
-            Ok(if gain_pct == 0 {
-                format!("TP {} off", idx + 1)
+            let Some(o) = s.exits.orders.get_mut(idx) else { return Err("no such order".into()) };
+            o.at_pct = at_pct;
+            Ok(if at_pct == 0 {
+                format!("order {} off", idx + 1)
+            } else if at_pct < 0 {
+                format!("order {} is a stop at {at_pct}%", idx + 1)
             } else {
-                format!("TP {} triggers at +{gain_pct}%", idx + 1)
+                format!("order {} targets +{at_pct}%", idx + 1)
             })
         })
     }
 
-    /// Set how much of the REMAINING position a rung sells. 0 disables it.
-    pub fn set_rung_pct(&self, idx: usize, pct: u8) -> Result<String, String> {
-        if idx >= 3 {
-            return Err("there are three take-profit levels".into());
-        }
-        if pct > 100 {
-            return Err("percentage cannot exceed 100".into());
+    /// Set how much of the ORIGINAL position an order sells.
+    pub fn set_order_amount(&self, idx: usize, amount_pct: u8) -> Result<String, String> {
+        if amount_pct > 100 {
+            return Err("amount cannot exceed 100%".into());
         }
         self.settings.update(|s| {
-            s.exits.rungs[idx].sell_pct = pct;
-            Ok(if pct == 0 {
-                format!("TP {} off", idx + 1)
+            let Some(o) = s.exits.orders.get_mut(idx) else { return Err("no such order".into()) };
+            o.amount_pct = amount_pct;
+            let total = s.exits.target_total_pct();
+            Ok(if amount_pct == 0 {
+                format!("order {} off", idx + 1)
+            } else if total > 100 {
+                // Said plainly rather than refused: over-allocating is a real
+                // choice, it just means later orders find less than they asked.
+                format!("order {} sells {amount_pct}% — targets now total {total}%", idx + 1)
             } else {
-                format!("TP {} sells {pct}% of what is left", idx + 1)
+                format!("order {} sells {amount_pct}% of the original position", idx + 1)
             })
-        })
-    }
-
-    pub fn set_stop_loss(&self, pct: u8) -> Result<String, String> {
-        if pct >= 100 {
-            return Err("a 100% stop loss would never trigger before the position is worthless".into());
-        }
-        self.settings.update(|s| {
-            s.exits.stop_loss_pct = pct;
-            Ok(if pct == 0 { "stop loss off".into() } else { format!("stop loss at -{pct}%") })
         })
     }
 

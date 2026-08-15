@@ -1,64 +1,89 @@
 //! When to sell a position, decided without touching the network.
 //!
-//! # Why the rules are a pure function
+//! # One list, not two kinds of rule
 //!
-//! This is the code that decides whether real money leaves a position while
-//! nobody is watching. Everything here is a pure function of (rules, state,
-//! current multiple) so it can be tested exhaustively — the task that drives it
-//! only reads prices and calls `sell`.
+//! A stop and a target are the same thing: a percentage move from cost, and how
+//! much to sell when it happens. A negative trigger is a stop, a positive one a
+//! target. Modelling them separately made "add a second stop" impossible and
+//! left the amounts unaddable.
+//!
+//! # Amounts are percentages of the ORIGINAL position
+//!
+//! This is what makes a ladder legible:
+//!
+//! ```text
+//!   -25% → 100%     stop: close the position
+//!   +100% →  50%    takes out your initials, exactly
+//!   +250% →  20%
+//!   +400% →  20%
+//!   +900% →  10%
+//!                   ── targets total 100%
+//! ```
+//!
+//! Percent-of-REMAINING was the first design here and it was wrong: those same
+//! numbers would leave 28.8% held forever, and "sums to 100%" would mean
+//! nothing. Of-original is what makes the column addable and makes "takes out
+//! your initials" true rather than approximately true.
 //!
 //! # The order of checks is the design
 //!
-//! Protective exits are evaluated BEFORE profit rungs, and at most one action
-//! fires per tick. A position that gaps from 3x to 0.4x between ticks should
-//! leave, not take a profit rung on the way past — the rung's premise (that the
-//! token is worth 3x) is already false by the time we see it.
+//! Stops are evaluated before targets, and at most one order fires per tick. A
+//! position that gaps from +300% to −60% between ticks should leave, not take a
+//! target on the way past — the target's premise is already false by the time
+//! we see it.
 //!
 //! # What a "multiple" means here
 //!
 //! `value_now / cost_basis`, both in SOL. 1.0 is break-even before fees. It is
-//! NOT the figure shown on a call alert, which is measured from the smart
-//! wallet's own fill — a price a follower could never have paid.
+//! NOT the figure on a call alert, which is measured from the smart wallet's
+//! own fill — a price a follower could never have paid.
 
 use serde::{Deserialize, Serialize};
 
-/// One rung of the take-profit ladder: once the position is up `at_gain_pct`,
-/// sell `sell_pct` of what is still held.
-///
-/// Both numbers are percentages, and they mean different things:
-///
-/// * `at_gain_pct` is the GAIN from cost. 100 means the position has doubled.
-/// * `sell_pct` is of the REMAINING balance, not the original. Selling 50% at
-///   +100% and 50% at +200% leaves 25% running, which is what a ladder is
-///   normally understood to do.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Rung {
-    /// Gain from cost, in percent. 0 disables the rung.
-    pub at_gain_pct: u32,
-    pub sell_pct: u8,
+/// Most orders one profile may hold. Enough for a stop plus a four-rung ladder
+/// with room to spare; small enough that the screen stays tappable.
+pub const MAX_ORDERS: usize = 6;
+
+/// One sell order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SellOrder {
+    /// Trigger, as a percent move from cost. `-25` is a stop at −25%, `100` a
+    /// target at +100% (a double).
+    pub at_pct: i32,
+    /// How much of the ORIGINAL position to sell, in percent.
+    pub amount_pct: u8,
 }
 
-impl Rung {
+impl SellOrder {
     pub fn is_armed(&self) -> bool {
-        self.at_gain_pct > 0 && (1..=100).contains(&self.sell_pct)
+        self.at_pct != 0 && (1..=100).contains(&self.amount_pct)
     }
 
-    /// The value/cost ratio this rung triggers at.
+    pub fn is_stop(&self) -> bool {
+        self.at_pct < 0
+    }
+
+    /// The value/cost ratio this order triggers at.
     pub fn trigger_multiple(&self) -> f64 {
-        1.0 + self.at_gain_pct as f64 / 100.0
+        1.0 + self.at_pct as f64 / 100.0
+    }
+
+    pub fn label(&self) -> String {
+        let sign = if self.at_pct > 0 { "+" } else { "" };
+        format!("{sign}{}% → sell {}%", self.at_pct, self.amount_pct)
     }
 }
 
-/// The full exit policy for every position.
+/// The exit policy applied to every position.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExitRules {
     /// Master switch. Off means this module observes and never acts.
     pub enabled: bool,
-    /// Three take-profit rungs, evaluated lowest-first.
-    pub rungs: [Rung; 3],
-    /// Sell everything once down this many percent from cost. 0 = off.
-    pub stop_loss_pct: u8,
-    /// Sell everything once down this many percent from the PEAK seen. 0 = off.
+    pub orders: Vec<SellOrder>,
+    /// Sell everything once the position falls this far from its PEAK. 0 = off.
+    ///
+    /// Kept separate because a list of fixed triggers cannot express it: the
+    /// level it fires at moves with the position.
     pub trailing_pct: u8,
     /// Sell everything when the pool's liquidity is pulled.
     pub exit_on_liquidity_pull: bool,
@@ -67,43 +92,70 @@ pub struct ExitRules {
 impl Default for ExitRules {
     fn default() -> Self {
         Self {
-            // Off until the operator turns it on. An exit policy that starts
-            // enabled with values nobody chose would sell real positions on
-            // defaults picked by a config author.
+            // Off until the operator turns it on. A policy that started enabled
+            // would sell real positions on values a config author chose.
             enabled: false,
-            rungs: [
-                Rung { at_gain_pct: 100, sell_pct: 50 },
-                Rung { at_gain_pct: 200, sell_pct: 50 },
-                Rung { at_gain_pct: 400, sell_pct: 100 },
+            orders: vec![
+                SellOrder { at_pct: -25, amount_pct: 100 },
+                SellOrder { at_pct: 100, amount_pct: 50 },
+                SellOrder { at_pct: 250, amount_pct: 20 },
+                SellOrder { at_pct: 400, amount_pct: 20 },
+                SellOrder { at_pct: 900, amount_pct: 10 },
             ],
-            stop_loss_pct: 50,
             trailing_pct: 0,
             exit_on_liquidity_pull: true,
         }
     }
 }
 
-/// Per-position memory: which rungs have fired, and the best multiple seen.
+impl ExitRules {
+    /// Total of the TARGET amounts. Stops are excluded: a stop closes the
+    /// position, so counting it would always read as over 100.
+    pub fn target_total_pct(&self) -> u32 {
+        self.orders
+            .iter()
+            .filter(|o| o.is_armed() && !o.is_stop())
+            .map(|o| o.amount_pct as u32)
+            .sum()
+    }
+
+    /// Orders in evaluation order: stops first, then targets lowest-first.
+    fn evaluation_order(&self) -> Vec<SellOrder> {
+        let mut v: Vec<SellOrder> = self.orders.iter().copied().filter(|o| o.is_armed()).collect();
+        v.sort_by_key(|o| (!o.is_stop(), o.at_pct));
+        v
+    }
+}
+
+/// Per-position memory.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PositionState {
     /// Highest multiple observed. The trailing stop measures from this.
     pub peak_multiple: f64,
-    /// Indices of rungs already taken, so each fires once.
-    pub fired: Vec<usize>,
+    /// Triggers already taken, by their `at_pct`.
+    ///
+    /// Keyed by trigger rather than by list position so that editing the
+    /// profile does not silently re-arm an order that already fired, or
+    /// suppress a new one because it inherited a used slot.
+    pub fired_at: Vec<i32>,
+    /// Largest balance seen, in raw units — the base for percent-of-original.
+    ///
+    /// Largest-ever rather than first-seen because a position can be added to,
+    /// and the ladder should measure against the full size rather than whatever
+    /// happened to be held the first time it was observed.
+    pub original_raw: u64,
 }
 
 /// What to do about a position right now.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExitAction {
     Hold,
-    Sell { pct: u8, reason: String },
+    /// Sell this percentage of the ORIGINAL position. The caller converts it to
+    /// a share of the current balance, which is what a sell can act on.
+    Sell { amount_pct_of_original: u8, reason: String },
 }
 
 /// Decide, and record what was decided.
-///
-/// `multiple` is value/cost. Updating `state` is part of the call: the peak has
-/// to move even on a tick where nothing sells, or a trailing stop measured on
-/// the next tick would use a stale high.
 pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> ExitAction {
     if !multiple.is_finite() || multiple <= 0.0 {
         // No usable price is not a reason to sell. An unpriced token looks
@@ -118,49 +170,39 @@ pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> 
         return ExitAction::Hold;
     }
 
-    // --- Protective exits first. See the module note on ordering.
-    if rules.stop_loss_pct > 0 {
-        let floor = 1.0 - (rules.stop_loss_pct as f64 / 100.0);
-        if multiple <= floor {
-            return ExitAction::Sell {
-                pct: 100,
-                reason: format!("stop loss: {multiple:.2}x, floor {floor:.2}x"),
-            };
-        }
-    }
+    // Trailing is checked with the stops: it is protective, and its trigger
+    // moves, so a target must never pre-empt it.
     if rules.trailing_pct > 0 && state.peak_multiple > 1.0 {
         let trigger = state.peak_multiple * (1.0 - rules.trailing_pct as f64 / 100.0);
-        // Only trails once the position has been in profit: a trailing stop
-        // measured from a peak of 1.0 is just a second, looser stop loss, and
-        // would close new positions on ordinary entry slippage.
+        // Only trails once the position has been in profit: measured from a
+        // peak of 1.0 it is just a second, looser stop, and would close fresh
+        // entries on ordinary slippage.
         if multiple <= trigger {
             return ExitAction::Sell {
-                pct: 100,
+                amount_pct_of_original: 100,
                 reason: format!(
-                    "trailing stop: {multiple:.2}x, peak {:.2}x, trigger {trigger:.2}x",
-                    state.peak_multiple
+                    "trailing stop −{}% (peak {:.2}x, now {multiple:.2}x)",
+                    rules.trailing_pct, state.peak_multiple
                 ),
             };
         }
     }
 
-    // --- Then profit rungs, lowest first, one per tick.
-    //
-    // Lowest-first matters on a gap: a jump straight to +500% takes the +100%
-    // rung now and the higher ones on later ticks, so a position cannot skip
-    // past its own ladder and sell everything at once on a single print.
-    let mut order: Vec<usize> = (0..rules.rungs.len()).collect();
-    order.sort_by_key(|i| rules.rungs[*i].at_gain_pct);
-    for i in order {
-        let rung = rules.rungs[i];
-        if !rung.is_armed() || state.fired.contains(&i) {
+    for order in rules.evaluation_order() {
+        if state.fired_at.contains(&order.at_pct) {
             continue;
         }
-        if multiple >= rung.trigger_multiple() {
-            state.fired.push(i);
+        let hit = if order.is_stop() {
+            multiple <= order.trigger_multiple()
+        } else {
+            multiple >= order.trigger_multiple()
+        };
+        if hit {
+            state.fired_at.push(order.at_pct);
+            let kind = if order.is_stop() { "stop" } else { "target" };
             return ExitAction::Sell {
-                pct: rung.sell_pct,
-                reason: format!("take profit +{}% (rung {})", rung.at_gain_pct, i + 1),
+                amount_pct_of_original: order.amount_pct,
+                reason: format!("{kind} {}", order.label()),
             };
         }
     }
@@ -168,38 +210,47 @@ pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> 
     ExitAction::Hold
 }
 
+/// Convert "x% of the original position" into "y% of what is held now", which
+/// is what a sell can actually act on.
+///
+/// Rounds UP and saturates at 100: the alternative leaves a sliver behind on
+/// every order, and a ladder that never quite closes its share is worse than
+/// one that closes a hair more.
+pub fn share_of_current(amount_pct_of_original: u8, original_raw: u64, current_raw: u64) -> u8 {
+    if current_raw == 0 || original_raw == 0 {
+        return 0;
+    }
+    let want = (original_raw as u128 * amount_pct_of_original as u128) / 100;
+    if want == 0 {
+        return 0;
+    }
+    let pct = (want * 100).div_ceil(current_raw as u128);
+    pct.clamp(1, 100) as u8
+}
+
 /// A one-line summary for the settings screen.
 pub fn describe(rules: &ExitRules) -> String {
     if !rules.enabled {
         return "off".into();
     }
-    let rungs: Vec<String> = rules
-        .rungs
-        .iter()
-        .filter(|r| r.is_armed())
-        .map(|r| format!("{}%@+{}%", r.sell_pct, r.at_gain_pct))
-        .collect();
-    let mut parts = Vec::new();
-    if !rungs.is_empty() {
-        parts.push(rungs.join(" "));
+    let armed = rules.orders.iter().filter(|o| o.is_armed()).count();
+    if armed == 0 && rules.trailing_pct == 0 {
+        // Enabled with nothing configured does nothing, and should read as
+        // nothing rather than as protection.
+        return "on, no orders".into();
     }
-    if rules.stop_loss_pct > 0 {
-        parts.push(format!("SL -{}%", rules.stop_loss_pct));
+    let mut parts = Vec::new();
+    if armed > 0 {
+        parts.push(format!("{armed} order{}", if armed == 1 { "" } else { "s" }));
     }
     if rules.trailing_pct > 0 {
-        parts.push(format!("trail -{}%", rules.trailing_pct));
-    }
-    if parts.is_empty() {
-        // Enabled with every rule disabled does nothing, and should read as
-        // nothing rather than as protection.
-        return "on, but no rules set".into();
+        parts.push(format!("trail −{}%", rules.trailing_pct));
     }
     parts.join(" · ")
 }
 
-
-/// Per-position exit memory, persisted so a restart does not re-take rungs the
-/// ladder has already taken or forget a peak the trailing stop measures from.
+/// Per-position exit memory, persisted so a restart does not re-take an order
+/// already taken or forget the peak a trailing stop measures from.
 pub struct ExitStateStore {
     path: String,
     inner: std::sync::Mutex<std::collections::HashMap<String, PositionState>>,
@@ -218,23 +269,45 @@ impl ExitStateStore {
         Self { path: String::new(), inner: std::sync::Mutex::new(Default::default()) }
     }
 
-    /// Evaluate one position and persist whatever the decision changed.
-    pub fn decide(&self, rules: &ExitRules, mint: &str, multiple: f64) -> ExitAction {
-        let action = {
+    /// Evaluate one position, remembering the balance it is measured against.
+    ///
+    /// Returns the action together with the share of the CURRENT balance to
+    /// sell, so the caller never has to redo the of-original arithmetic.
+    pub fn decide(
+        &self,
+        rules: &ExitRules,
+        mint: &str,
+        multiple: f64,
+        current_raw: u64,
+    ) -> (ExitAction, u8) {
+        let (action, pct_now) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let st = g.entry(mint.to_string()).or_default();
-            evaluate(rules, st, multiple)
+            if current_raw > st.original_raw {
+                st.original_raw = current_raw;
+            }
+            let action = evaluate(rules, st, multiple);
+            let pct_now = match &action {
+                ExitAction::Sell { amount_pct_of_original, .. } => {
+                    share_of_current(*amount_pct_of_original, st.original_raw, current_raw)
+                }
+                ExitAction::Hold => 0,
+            };
+            (action, pct_now)
         };
-        // Persist on any state change. A rung recorded as fired but never saved
-        // would fire again after a restart and sell the position twice.
+        // Persist on any state change. An order recorded as fired but never
+        // saved would fire again after a restart and sell the position twice.
         self.save();
-        action
+        (action, pct_now)
     }
 
     /// Forget a position, e.g. once fully sold.
     pub fn forget(&self, mint: &str) {
-        self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(mint);
-        self.save();
+        let existed =
+            self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(mint).is_some();
+        if existed {
+            self.save();
+        }
     }
 
     pub fn peak(&self, mint: &str) -> f64 {
@@ -270,117 +343,73 @@ mod tests {
         ExitRules { enabled: true, ..Default::default() }
     }
 
-
-    /// A rung recorded as fired but never saved would fire again after a
-    /// restart and sell the position a second time.
-    #[test]
-    fn a_fired_rung_survives_a_restart() {
-        let dir = std::env::temp_dir().join(format!("volens-exits-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("exit_state.json").to_string_lossy().to_string();
-        let _ = std::fs::remove_file(&p);
-
-        let store = ExitStateStore::load(&p);
-        let r = rules();
-        assert!(matches!(store.decide(&r, "MINT", 2.5), ExitAction::Sell { .. }));
-
-        let reloaded = ExitStateStore::load(&p);
-        assert_eq!(reloaded.decide(&r, "MINT", 2.5), ExitAction::Hold, "must not re-fire");
-        assert_eq!(reloaded.peak("MINT"), 2.5, "and the peak is remembered");
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn forgetting_a_position_clears_its_ladder() {
-        let store = ExitStateStore::ephemeral();
-        let r = rules();
-        assert!(matches!(store.decide(&r, "M", 2.5), ExitAction::Sell { .. }));
-        store.forget("M");
-        assert!(matches!(store.decide(&r, "M", 2.5), ExitAction::Sell { .. }), "fresh again");
-    }
-
     #[test]
     fn nothing_happens_while_disabled() {
         let mut s = PositionState::default();
-        let off = ExitRules { enabled: false, ..Default::default() };
+        let off = ExitRules::default();
         assert_eq!(evaluate(&off, &mut s, 10.0), ExitAction::Hold);
         assert_eq!(evaluate(&off, &mut s, 0.01), ExitAction::Hold);
-        // …but the peak is still tracked, so enabling it later is not blind.
-        assert_eq!(s.peak_multiple, 10.0);
+        assert_eq!(s.peak_multiple, 10.0, "the peak is still tracked");
     }
 
     /// An unpriced token looks identical to a worthless one. Treating the two
-    /// the same is how a provider outage becomes a liquidation — the same
-    /// confusion that once wrote live tokens into the dataset as rugs.
+    /// the same is how a provider outage becomes a liquidation.
     #[test]
     fn an_unusable_price_never_sells() {
         let mut s = PositionState::default();
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(evaluate(&rules(), &mut s, bad), ExitAction::Hold, "{bad}");
         }
-        assert_eq!(s.peak_multiple, 0.0, "a bad print must not move the peak either");
+        assert_eq!(s.peak_multiple, 0.0, "a bad print must not move the peak");
+    }
+
+    /// The default profile is the worked example, and its target column has to
+    /// add to exactly 100 or the ladder leaves a remainder.
+    #[test]
+    fn the_default_ladder_sells_the_whole_position() {
+        assert_eq!(rules().target_total_pct(), 100);
     }
 
     #[test]
-    fn each_rung_fires_once() {
+    fn targets_fire_lowest_first_and_only_once() {
         let mut s = PositionState::default();
         let r = rules();
-        match evaluate(&r, &mut s, 2.1) {
-            ExitAction::Sell { pct, .. } => assert_eq!(pct, 50),
-            a => panic!("expected the 2x rung, got {a:?}"),
-        }
-        assert_eq!(evaluate(&r, &mut s, 2.2), ExitAction::Hold, "must not re-fire");
-        match evaluate(&r, &mut s, 3.5) {
-            ExitAction::Sell { pct, .. } => assert_eq!(pct, 50),
-            a => panic!("expected the 3x rung, got {a:?}"),
-        }
-        match evaluate(&r, &mut s, 5.0) {
-            ExitAction::Sell { pct, .. } => assert_eq!(pct, 100),
-            a => panic!("expected the 5x rung, got {a:?}"),
-        }
-        assert_eq!(evaluate(&r, &mut s, 9.0), ExitAction::Hold, "ladder exhausted");
-    }
-
-    /// A token that gaps past several rungs takes them in order rather than
-    /// dumping the whole position on one print.
-    #[test]
-    fn a_gap_up_takes_the_lowest_rung_first() {
-        let mut s = PositionState::default();
-        let r = rules();
-        for expected in [50u8, 50, 100] {
-            match evaluate(&r, &mut s, 6.0) {
-                ExitAction::Sell { pct, .. } => assert_eq!(pct, expected),
-                a => panic!("expected a rung, got {a:?}"),
+        for expected in [50u8, 20, 20, 10] {
+            match evaluate(&r, &mut s, 11.0) {
+                ExitAction::Sell { amount_pct_of_original, .. } => {
+                    assert_eq!(amount_pct_of_original, expected)
+                }
+                a => panic!("expected a target, got {a:?}"),
             }
         }
-        assert_eq!(evaluate(&r, &mut s, 6.0), ExitAction::Hold);
+        assert_eq!(evaluate(&r, &mut s, 11.0), ExitAction::Hold, "ladder exhausted");
     }
 
     #[test]
-    fn the_stop_loss_sells_everything() {
+    fn a_stop_closes_the_position() {
         let mut s = PositionState::default();
-        let r = rules(); // 50% stop
-        assert_eq!(evaluate(&r, &mut s, 0.6), ExitAction::Hold, "above the floor");
-        match evaluate(&r, &mut s, 0.5) {
-            ExitAction::Sell { pct, reason } => {
-                assert_eq!(pct, 100);
-                assert!(reason.contains("stop loss"), "{reason}");
+        let r = rules(); // −25% stop
+        assert_eq!(evaluate(&r, &mut s, 0.80), ExitAction::Hold, "above the stop");
+        match evaluate(&r, &mut s, 0.75) {
+            ExitAction::Sell { amount_pct_of_original, reason } => {
+                assert_eq!(amount_pct_of_original, 100);
+                assert!(reason.contains("stop"), "{reason}");
             }
-            a => panic!("expected a stop loss, got {a:?}"),
+            a => panic!("expected a stop, got {a:?}"),
         }
     }
 
-    /// The case the ordering exists for: a position that gaps from profit to
-    /// deep loss between ticks must leave, not take a profit rung on the way.
+    /// The case the ordering exists for: a collapse must exit rather than take
+    /// a target on the way past.
     #[test]
-    fn a_collapse_exits_rather_than_taking_profit() {
+    fn a_collapse_exits_rather_than_taking_a_target() {
         let mut s = PositionState::default();
         let r = rules();
-        evaluate(&r, &mut s, 4.0); // fires the 2x rung, peak now 4
+        evaluate(&r, &mut s, 4.0);
         match evaluate(&r, &mut s, 0.3) {
-            ExitAction::Sell { pct, reason } => {
-                assert_eq!(pct, 100);
-                assert!(reason.contains("stop loss"), "expected protection first: {reason}");
+            ExitAction::Sell { amount_pct_of_original, reason } => {
+                assert_eq!(amount_pct_of_original, 100);
+                assert!(reason.contains("stop"), "expected protection first: {reason}");
             }
             a => panic!("expected an exit, got {a:?}"),
         }
@@ -389,73 +418,135 @@ mod tests {
     #[test]
     fn the_trailing_stop_measures_from_the_peak() {
         let mut s = PositionState::default();
-        let r = ExitRules {
-            enabled: true,
-            trailing_pct: 30,
-            stop_loss_pct: 0,
-            rungs: [Rung { at_gain_pct: 0, sell_pct: 0 }; 3], // ladder off
-            ..Default::default()
-        };
+        let r = ExitRules { enabled: true, orders: vec![], trailing_pct: 30, ..Default::default() };
         evaluate(&r, &mut s, 4.0);
-        assert_eq!(s.peak_multiple, 4.0);
         assert_eq!(evaluate(&r, &mut s, 3.0), ExitAction::Hold, "25% off the peak");
         match evaluate(&r, &mut s, 2.8) {
-            ExitAction::Sell { pct, reason } => {
-                assert_eq!(pct, 100);
+            ExitAction::Sell { amount_pct_of_original, reason } => {
+                assert_eq!(amount_pct_of_original, 100);
                 assert!(reason.contains("trailing"), "{reason}");
             }
             a => panic!("expected a trailing stop, got {a:?}"),
         }
     }
 
-    /// A trailing stop that acted before any profit would just be a second,
-    /// looser stop loss — and would close fresh positions on entry slippage.
     #[test]
     fn the_trailing_stop_waits_for_profit() {
         let mut s = PositionState::default();
-        let r = ExitRules {
-            enabled: true,
-            trailing_pct: 10,
-            stop_loss_pct: 0,
-            rungs: [Rung { at_gain_pct: 0, sell_pct: 0 }; 3],
-            ..Default::default()
-        };
+        let r = ExitRules { enabled: true, orders: vec![], trailing_pct: 10, ..Default::default() };
         assert_eq!(evaluate(&r, &mut s, 0.95), ExitAction::Hold);
         assert_eq!(evaluate(&r, &mut s, 0.85), ExitAction::Hold, "never been in profit");
     }
 
+    /// Editing a profile must not re-arm an order that already fired, nor
+    /// suppress a new one because it landed in a used slot.
     #[test]
-    fn disarmed_rungs_are_skipped() {
+    fn fired_orders_are_tracked_by_trigger_not_by_slot() {
+        let mut s = PositionState::default();
+        let mut r = ExitRules {
+            enabled: true,
+            orders: vec![SellOrder { at_pct: 100, amount_pct: 50 }],
+            ..Default::default()
+        };
+        assert!(matches!(evaluate(&r, &mut s, 2.5), ExitAction::Sell { .. }));
+        assert_eq!(evaluate(&r, &mut s, 2.5), ExitAction::Hold);
+
+        r.orders[0] = SellOrder { at_pct: 120, amount_pct: 25 };
+        match evaluate(&r, &mut s, 2.5) {
+            ExitAction::Sell { amount_pct_of_original, .. } => {
+                assert_eq!(amount_pct_of_original, 25)
+            }
+            a => panic!("an edited order should be live again, got {a:?}"),
+        }
+    }
+
+    #[test]
+    fn disarmed_orders_are_skipped() {
         let mut s = PositionState::default();
         let r = ExitRules {
             enabled: true,
-            stop_loss_pct: 0,
-            rungs: [
-                Rung { at_gain_pct: 0, sell_pct: 50 },    // no trigger set
-                Rung { at_gain_pct: 100, sell_pct: 0 },   // sells nothing
-                Rung { at_gain_pct: 200, sell_pct: 50 },
+            orders: vec![
+                SellOrder { at_pct: 0, amount_pct: 50 },   // no trigger
+                SellOrder { at_pct: 100, amount_pct: 0 },  // sells nothing
+                SellOrder { at_pct: 200, amount_pct: 50 },
             ],
             ..Default::default()
         };
         assert_eq!(evaluate(&r, &mut s, 2.5), ExitAction::Hold);
-        assert!(matches!(evaluate(&r, &mut s, 3.0), ExitAction::Sell { pct: 50, .. }));
+        assert!(matches!(evaluate(&r, &mut s, 3.0), ExitAction::Sell { .. }));
+    }
+
+    /// The conversion that makes percent-of-original work against a shrinking
+    /// balance. After selling half, "20% of original" is 40% of what is left.
+    #[test]
+    fn a_share_of_the_original_converts_to_a_share_of_what_is_left() {
+        assert_eq!(share_of_current(50, 1_000, 1_000), 50, "untouched position");
+        assert_eq!(share_of_current(20, 1_000, 500), 40, "half already sold");
+        assert_eq!(share_of_current(10, 1_000, 100), 100, "the rest is all there is");
+        assert_eq!(share_of_current(100, 1_000, 250), 100, "saturates, never over-asks");
+        assert_eq!(share_of_current(50, 0, 100), 0, "no basis, no order");
+        assert_eq!(share_of_current(50, 100, 0), 0, "nothing held");
+    }
+
+    #[test]
+    fn the_conversion_rounds_up_rather_than_leaving_dust() {
+        assert_eq!(share_of_current(1, 1_000, 999), 2);
+        assert!(share_of_current(33, 1_000, 999) >= 33);
+    }
+
+    #[test]
+    fn stops_do_not_count_toward_the_target_total() {
+        let r = ExitRules {
+            enabled: true,
+            orders: vec![
+                SellOrder { at_pct: -25, amount_pct: 100 },
+                SellOrder { at_pct: 100, amount_pct: 60 },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(r.target_total_pct(), 60, "a stop closes the position, it is not a rung");
     }
 
     #[test]
     fn describe_reads_like_a_policy() {
         assert_eq!(describe(&ExitRules::default()), "off");
-        let d = describe(&rules());
-        assert!(d.contains("50%@+100%"), "{d}");
-        assert!(d.contains("SL -50%"), "{d}");
+        assert_eq!(describe(&rules()), "5 orders");
+        let t = ExitRules { enabled: true, orders: vec![], trailing_pct: 30, ..Default::default() };
+        assert_eq!(describe(&t), "trail −30%");
+        let hollow = ExitRules { enabled: true, orders: vec![], ..Default::default() };
+        assert_eq!(describe(&hollow), "on, no orders");
+    }
 
-        // Enabled with nothing configured must not read as protection.
-        let hollow = ExitRules {
-            enabled: true,
-            stop_loss_pct: 0,
-            trailing_pct: 0,
-            rungs: [Rung { at_gain_pct: 0, sell_pct: 0 }; 3],
-            ..Default::default()
-        };
-        assert_eq!(describe(&hollow), "on, but no rules set");
+    /// An order recorded as fired but never saved would fire again after a
+    /// restart and sell the position a second time.
+    #[test]
+    fn a_fired_order_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("volens-exits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("exit_state.json").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&p);
+
+        let store = ExitStateStore::load(&p);
+        let r = rules();
+        let (a, pct) = store.decide(&r, "MINT", 2.5, 1_000);
+        assert!(matches!(a, ExitAction::Sell { .. }));
+        assert_eq!(pct, 50, "a full position: of-original and of-current agree");
+
+        let reloaded = ExitStateStore::load(&p);
+        // Half sold, so the +250% order's 20%-of-original is 40% of the rest.
+        let (a2, pct2) = reloaded.decide(&r, "MINT", 3.5, 500);
+        assert!(matches!(a2, ExitAction::Sell { .. }), "the next target should fire");
+        assert_eq!(pct2, 40);
+        assert_eq!(reloaded.peak("MINT"), 3.5);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn forgetting_a_position_clears_its_ladder() {
+        let store = ExitStateStore::ephemeral();
+        let r = rules();
+        assert!(matches!(store.decide(&r, "M", 2.5, 100).0, ExitAction::Sell { .. }));
+        store.forget("M");
+        assert!(matches!(store.decide(&r, "M", 2.5, 100).0, ExitAction::Sell { .. }), "fresh again");
     }
 }

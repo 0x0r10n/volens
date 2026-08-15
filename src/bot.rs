@@ -350,7 +350,10 @@ impl Bot {
         if !text.starts_with('/')
             && let Some(field) = self.take_awaited(chat_id)
         {
-            let (reply, kb) = self.apply_setting(&field, text.trim());
+            let value = text.trim();
+            let (reply, kb) = self
+                .apply_exit_setting(&field, value)
+                .unwrap_or_else(|| self.apply_setting(&field, value));
             self.reply_with(chat_id, reply, kb).await;
             return;
         }
@@ -592,16 +595,14 @@ impl Bot {
             return Some(self.exits_screen());
         }
         #[cfg(feature = "sniper")]
-        if let Some(n) = data.strip_prefix("set:rung") {
+        if let Some(n) = data.strip_prefix("set:order") {
             if let Ok(i) = n.parse::<usize>() {
-                if (1..=3).contains(&i) {
-                    return Some(self.rung_screen(i - 1));
-                }
+                return Some(self.order_screen(i));
             }
         }
         #[cfg(feature = "sniper")]
-        if data == "set:stoploss" || data == "set:trailing" {
-            return Some(self.stop_screen(data.trim_start_matches("set:")));
+        if data == "set:trailing" {
+            return Some(self.stop_screen("trailing"));
         }
         #[cfg(feature = "sniper")]
         if let Some(field) = data.strip_prefix("set:") {
@@ -1386,6 +1387,11 @@ impl Bot {
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
             "maxmcap" => ("max market cap", "e.g. <code>75000</code> (USD)"),
             "maximpact" => ("max price impact", "e.g. <code>400</code> (bps)"),
+            f if f.starts_with("ordt") => (
+                "trigger",
+                "e.g. <code>150</code> for a +150% target, or <code>-30</code> for a stop",
+            ),
+            f if f.starts_with("orda") => ("amount", "e.g. <code>35</code> (% of the original position)"),
             _ => ("value", "send a number"),
         };
         let text = format!(
@@ -1399,115 +1405,122 @@ impl Bot {
     }
 
 
-    /// The auto-sell screen: a ladder and two protective stops, all tappable.
+    /// The auto-sell screen: one list of orders, plus the trailing stop.
     #[cfg(feature = "sniper")]
     fn exits_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
         let e = sniper.live().exits;
+        let total = e.target_total_pct();
         let onoff = if e.enabled { "🟢 On" } else { "⚪ Off" };
-        let sl = if e.stop_loss_pct > 0 { format!("-{}%", e.stop_loss_pct) } else { "off".into() };
-        let tr = if e.trailing_pct > 0 { format!("-{}%", e.trailing_pct) } else { "off".into() };
 
+        // The running total is shown because the amounts are of the ORIGINAL
+        // position: under 100 leaves a remainder running, over 100 means later
+        // orders will find less than they asked for.
+        let verdict = match total {
+            100 => "✅ exactly 100%".to_string(),
+            t if t < 100 => format!("{}% — {}% keeps running", t, 100 - t),
+            t => format!("{t}% — over 100%, later orders will find less than they ask for"),
+        };
         let text = format!(
-            "🎚 <b>Auto-sell</b>\n\n             Sells a position without you watching. Percentages are of what is \
-             STILL held, so 50% at 2x then 50% at 3x leaves 25% running.\n\n             <i>Protective stops are checked before profit rungs: a position \
-             that gaps from 3x to 0.4x leaves rather than taking a rung on the \
-             way past.</i>"
+            "🎚 <b>Auto-sell</b>\n\n             A negative trigger is a <b>stop</b>, a positive one a <b>target</b>. \
+             Amounts are percentages of the <b>original</b> position, so a \
+             target column adding to 100% sells all of it.\n\n             Targets total: <b>{verdict}</b>\n\n             <i>Stops are checked before targets: a position that gaps from \
+             +300% to −60% leaves rather than taking a target on the way past.</i>"
         );
 
         let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
             {"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}
         ])];
-        for (i, r) in e.rungs.iter().enumerate() {
-            let label = if r.is_armed() {
-                format!("🎯 TP {} · sell {}% at +{}%", i + 1, r.sell_pct, r.at_gain_pct)
-            } else {
-                format!("🎯 Rung {} · off", i + 1)
-            };
+        for (i, o) in e.orders.iter().enumerate() {
+            let icon = if !o.is_armed() { "⚪" } else if o.is_stop() { "🛑" } else { "🎯" };
             rows.push(serde_json::json!([
-                {"text": label, "callback_data": format!("set:rung{}", i + 1)}
+                {"text": format!("{icon} {}", o.label()), "callback_data": format!("set:order{i}")},
+                {"text": "✕", "callback_data": format!("setv:delorder:{i}")},
             ]));
         }
+        if e.orders.len() < crate::exits::MAX_ORDERS {
+            rows.push(serde_json::json!([
+                {"text": "➕ Add order", "callback_data": "setv:addorder:1"}
+            ]));
+        }
+        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
         rows.push(serde_json::json!([
-            {"text": format!("🛑 Stop loss · {sl}"), "callback_data": "set:stoploss"},
             {"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
+            {"text": "◀️ Back", "callback_data": "cmd:settings"},
         ]));
-        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
-    /// Editor for one ladder rung: the multiple, then the percentage.
+    /// Editor for one order: the trigger, then the amount.
     #[cfg(feature = "sniper")]
-    fn rung_screen(&self, idx: usize) -> (String, serde_json::Value) {
+    fn order_screen(&self, idx: usize) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let r = sniper.live().exits.rungs[idx];
+        let orders = sniper.live().exits.orders;
+        let Some(o) = orders.get(idx).copied() else {
+            return self.exits_screen();
+        };
         let text = format!(
-            "🎯 <b>Rung {}</b>\n\nCurrently: <b>{}</b>\n\n             <i>Pick the multiple to sell at, then how much of the remaining \
-             position to sell.</i>",
+            "📋 <b>Order {}</b>\n\nCurrently: <b>{}</b>\n\n             <i>Negative triggers are stops, positive ones targets. The amount \
+             is a share of the original position.</i>",
             idx + 1,
-            if r.is_armed() { format!("sell {}% at +{}%", r.sell_pct, r.at_gain_pct) } else { "off".into() }
+            if o.is_armed() { o.label() } else { "off".into() }
         );
-        let n = idx + 1;
-        // Gains, not multiples: "+100%" is how a trader states a target.
-        let mults: Vec<serde_json::Value> = [25u32, 50, 100, 200, 400, 900]
+        let trig: Vec<serde_json::Value> = [-50i32, -35, -25, -15, 50, 100, 250, 400, 900, 2000]
             .iter()
-            .map(|g| serde_json::json!({
-                "text": format!("{}+{}%", if *g == r.at_gain_pct { "✓ " } else { "" }, g),
-                "callback_data": format!("setv:rung{n}m:{g}"),
+            .map(|t| serde_json::json!({
+                "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
+                                if *t > 0 { "+" } else { "" }, t),
+                "callback_data": format!("setv:ordt{idx}:{t}"),
             }))
             .collect();
-        let pcts: Vec<serde_json::Value> = [25u8, 33, 50, 75, 100]
+        let amts: Vec<serde_json::Value> = [10u8, 20, 25, 33, 50, 100]
             .iter()
-            .map(|p| serde_json::json!({
-                "text": format!("{}{}%", if *p == r.sell_pct { "✓ " } else { "" }, p),
-                "callback_data": format!("setv:rung{n}p:{p}"),
+            .map(|a| serde_json::json!({
+                "text": format!("{}{}%", if *a == o.amount_pct { "✓ " } else { "" }, a),
+                "callback_data": format!("setv:orda{idx}:{a}"),
             }))
             .collect();
         let kb = serde_json::json!({"inline_keyboard": [
-            mults[..3].to_vec(), mults[3..].to_vec(),
-            pcts[..3].to_vec(), pcts[3..].to_vec(),
-            [{"text": "🚫 Turn this rung off", "callback_data": format!("setv:rung{n}p:0")}],
-            [{"text": "◀️ Back", "callback_data": "set:exits"}],
+            trig[..4].to_vec(),
+            trig[4..7].to_vec(),
+            trig[7..].to_vec(),
+            amts[..3].to_vec(),
+            amts[3..].to_vec(),
+            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:ordt{idx}")},
+             {"text": "✏️ Custom amount", "callback_data": format!("ask:orda{idx}")}],
+            [{"text": "✕ Remove", "callback_data": format!("setv:delorder:{idx}")},
+             {"text": "◀️ Back", "callback_data": "set:exits"}],
         ]});
         (text, kb)
     }
 
-    /// Editor for a protective stop.
+    /// Editor for the trailing stop.
     #[cfg(feature = "sniper")]
-    fn stop_screen(&self, which: &str) -> (String, serde_json::Value) {
+    fn stop_screen(&self, _which: &str) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let e = sniper.live().exits;
-        let (title, note, cur, key) = if which == "stoploss" {
-            ("🛑 Stop loss",
-             "Sell everything once the position is down this much from cost.",
-             e.stop_loss_pct, "sl")
-        } else {
-            ("📉 Trailing stop",
-             "Sell everything once the position falls this far from its PEAK. \
-              Only acts after the position has been in profit, so it cannot \
-              close a fresh entry on ordinary slippage.",
-             e.trailing_pct, "trail")
-        };
+        let cur = sniper.live().exits.trailing_pct;
         let text = format!(
-            "{title}\n\nCurrent: <b>{}</b>\n\n<i>{note}</i>",
-            if cur > 0 { format!("-{cur}%") } else { "off".into() }
+            "📉 <b>Trailing stop</b>\n\nCurrent: <b>{}</b>\n\n             <i>Sells everything once the position falls this far from its PEAK. \
+             Only acts after the position has been in profit, so it cannot close \
+             a fresh entry on ordinary slippage.</i>",
+            if cur > 0 { format!("−{cur}%") } else { "off".into() }
         );
         let opts: Vec<serde_json::Value> = [20u8, 30, 40, 50, 60, 75]
             .iter()
             .map(|p| serde_json::json!({
-                "text": format!("{}-{}%", if *p == cur { "✓ " } else { "" }, p),
-                "callback_data": format!("setv:{key}:{p}"),
+                "text": format!("{}−{}%", if *p == cur { "✓ " } else { "" }, p),
+                "callback_data": format!("setv:trail:{p}"),
             }))
             .collect();
         let kb = serde_json::json!({"inline_keyboard": [
             opts[..3].to_vec(), opts[3..].to_vec(),
-            [{"text": "🚫 Off", "callback_data": format!("setv:{key}:0")}],
+            [{"text": "🚫 Off", "callback_data": "setv:trail:0"}],
             [{"text": "◀️ Back", "callback_data": "set:exits"}],
         ]});
         (text, kb)
@@ -1517,27 +1530,25 @@ impl Bot {
     #[cfg(feature = "sniper")]
     fn apply_exit_setting(&self, field: &str, value: &str) -> Option<(String, serde_json::Value)> {
         let sniper = self.sniper.as_ref()?;
-        let res = match field {
-            "exits_on" => sniper.toggle_exits(),
-            "sl" => value.parse::<u8>().ok().map(|v| sniper.set_stop_loss(v))?,
-            "trail" => value.parse::<u8>().ok().map(|v| sniper.set_trailing(v))?,
-            f if f.starts_with("rung") && f.ends_with('m') => {
-                let idx = f[4..f.len() - 1].parse::<usize>().ok()?.checked_sub(1)?;
-                sniper.set_rung_gain(idx, value.parse::<u32>().ok()?)
+        let (res, screen): (Result<String, String>, String) = match field {
+            "exits_on" => (sniper.toggle_exits(), "exits".into()),
+            "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
+            "addorder" => (sniper.add_order(), "exits".into()),
+            "delorder" => (sniper.remove_order(value.parse().ok()?), "exits".into()),
+            f if f.starts_with("ordt") => {
+                let i: usize = f[4..].parse().ok()?;
+                (sniper.set_order_trigger(i, value.parse().ok()?), format!("order{i}"))
             }
-            f if f.starts_with("rung") && f.ends_with('p') => {
-                let idx = f[4..f.len() - 1].parse::<usize>().ok()?.checked_sub(1)?;
-                sniper.set_rung_pct(idx, value.parse::<u8>().ok()?)
+            f if f.starts_with("orda") => {
+                let i: usize = f[4..].parse().ok()?;
+                (sniper.set_order_amount(i, value.parse().ok()?), format!("order{i}"))
             }
             _ => return None,
         };
-        info!(field, value, "auto-sell setting changed from telegram");
-        let (text, kb) = if field.starts_with("rung") {
-            let idx: usize = field[4..field.len() - 1].parse::<usize>().ok()?.saturating_sub(1);
-            self.rung_screen(idx)
-        } else if field == "sl" {
-            self.stop_screen("stoploss")
-        } else if field == "trail" {
+        info!(field, value, ok = res.is_ok(), "auto-sell setting changed from telegram");
+        let (text, kb) = if let Some(n) = screen.strip_prefix("order") {
+            self.order_screen(n.parse().unwrap_or(0))
+        } else if screen == "trailing" {
             self.stop_screen("trailing")
         } else {
             self.exits_screen()
@@ -2826,12 +2837,16 @@ mod tests {
         // The whole exit policy is reachable by tapping, nothing typed.
         let exits = b.exits_screen().1.to_string();
         assert!(exits.contains("setv:exits_on:toggle"), "no on/off");
-        assert!(exits.contains("set:stoploss") && exits.contains("set:trailing"), "no stops");
-        for n in 1..=3 {
-            assert!(exits.contains(&format!("set:rung{n}")), "no TP {n}");
-            let rung = b.rung_screen(n - 1).1.to_string();
-            assert!(rung.contains(&format!("setv:rung{n}m:")), "TP {n} has no gain presets");
-            assert!(rung.contains(&format!("setv:rung{n}p:")), "TP {n} has no size presets");
+        assert!(exits.contains("set:trailing"), "no trailing stop");
+        assert!(exits.contains("setv:addorder:"), "cannot add an order");
+        assert!(exits.contains("setv:delorder:"), "cannot remove an order");
+        // Every default order opens an editor with presets and a typed option.
+        for i in 0..5 {
+            assert!(exits.contains(&format!("set:order{i}")), "order {i} not tappable");
+            let ord = b.order_screen(i).1.to_string();
+            assert!(ord.contains(&format!("setv:ordt{i}:")), "order {i} has no trigger presets");
+            assert!(ord.contains(&format!("setv:orda{i}:")), "order {i} has no amount presets");
+            assert!(ord.contains(&format!("ask:ordt{i}")), "order {i} has no custom trigger");
         }
 
         // …and each remaining editor offers presets plus a typed escape hatch.
