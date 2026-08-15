@@ -35,6 +35,7 @@ mod routes;
 mod rpc;
 #[cfg(feature = "sniper")]
 mod sniper;
+#[cfg(feature = "sniper")]
 mod settings;
 mod signals;
 mod socials;
