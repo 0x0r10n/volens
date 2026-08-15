@@ -407,6 +407,10 @@ slippage_bps = 300
 kill_switch_file = "HALT"
 # Append-only record of every decision, allowed or denied.
 audit_log = "sniper_audit.jsonl"
+# Settings changed from Telegram are saved here and reloaded on start.
+# This file can only ever TIGHTEN the limits set in this section — it is
+# re-clamped to them on load, so hand-editing it cannot widen a ceiling.
+settings_path = "settings.json"
 
 # Keypair file (Solana CLI JSON array). REQUIRED to arm.
 # Use a DEDICATED wallet, never your main one.

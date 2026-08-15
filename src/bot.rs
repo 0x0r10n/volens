@@ -607,6 +607,12 @@ impl Bot {
             Command::SetSize(arg) => self.render_set(Tunable::Size, arg.as_deref()),
             Command::SetSlippage(arg) => self.render_set(Tunable::Slippage, arg.as_deref()),
             Command::SetMinLiquidity(arg) => self.render_set(Tunable::MinLiquidity, arg.as_deref()),
+            Command::SetMaxSize(arg) => self.render_set(Tunable::MaxSize, arg.as_deref()),
+            Command::SetDailyCap(arg) => self.render_set(Tunable::DailyCap, arg.as_deref()),
+            Command::SetMaxTrades(arg) => self.render_set(Tunable::MaxTrades, arg.as_deref()),
+            Command::SetMaxMcap(arg) => self.render_set(Tunable::MaxMcap, arg.as_deref()),
+            Command::SetMaxImpact(arg) => self.render_set(Tunable::MaxImpact, arg.as_deref()),
+            Command::SetMode(arg) => self.render_set_mode(arg.as_deref()),
             Command::Withdraw(args) => self.render_withdraw_prompt(args.as_deref()),
             // Reached only for the non-sniper build or a stray call; the real
             // path is the DM-guarded confirm in `handle_message`.
@@ -1637,10 +1643,52 @@ impl Bot {
                     .and_then(|v| sniper.set_min_liquidity(v)),
                 Tunable::Slippage => arg.parse::<u16>().map_err(|_| "not an integer (bps)".to_string())
                     .and_then(|v| sniper.set_slippage_bps(v)),
+                Tunable::MaxSize => arg.parse::<f64>().map_err(|_| "not a number".to_string())
+                    .and_then(|v| sniper.set_max_trade_size(v)),
+                Tunable::DailyCap => arg.parse::<f64>().map_err(|_| "not a number".to_string())
+                    .and_then(|v| sniper.set_daily_cap(v)),
+                Tunable::MaxTrades => arg.parse::<u32>().map_err(|_| "not a whole number".to_string())
+                    .and_then(|v| sniper.set_max_trades(v)),
+                Tunable::MaxMcap => arg.parse::<f64>().map_err(|_| "not a number (USD)".to_string())
+                    .and_then(|v| sniper.set_max_market_cap(v)),
+                Tunable::MaxImpact => arg.parse::<u32>().map_err(|_| "not an integer (bps)".to_string())
+                    .and_then(|v| sniper.set_max_impact_bps(v)),
             };
             match result {
                 Ok(msg) => format!("✅ {}", escape_html(&msg)),
                 Err(e) => format!("⚠️ {}", escape_html(&e)),
+            }
+        }
+    }
+
+    /// Switch entry strategy. Unlike the risk knobs this is not tighten-only —
+    /// it is a genuine strategy choice, and refusing an unknown word beats
+    /// guessing which one was meant when the answer decides what gets bought.
+    fn render_set_mode(&self, arg: Option<&str>) -> String {
+        #[cfg(not(feature = "sniper"))]
+        {
+            let _ = arg;
+            return "⚪ <b>Not available</b> (no <code>sniper</code> feature).".to_string();
+        }
+        #[cfg(feature = "sniper")]
+        {
+            let Some(sniper) = &self.sniper else {
+                return "⚪ <b>Sniper not configured</b>".to_string();
+            };
+            let Some(arg) = arg else {
+                return format!(
+                    "Current: <b>{}</b>\n\nUsage: <code>/mode open</code> or \
+                     <code>/mode guard</code>\n\n\
+                     <b>open</b> — buy at pool creation. Fastest, but LP is still \
+                     unlocked at t=0.\n\
+                     <b>guard</b> — buy only once LP is burned/locked. Misses fast \
+                     runners, cuts the rug surface.",
+                    escape_html(sniper.snipe_mode().label())
+                );
+            };
+            match crate::sniper::SnipeMode::parse(arg) {
+                Some(m) => format!("✅ {}", escape_html(&sniper.set_snipe_mode(m))),
+                None => "⚠️ Unknown mode. Use <code>open</code> or <code>guard</code>.".to_string(),
             }
         }
     }
@@ -1661,8 +1709,10 @@ impl Bot {
                 out.push_str(&format!("{}: <b>{}</b>\n", escape_html(label), escape_html(&value)));
             }
             out.push_str(
-                "\nLines marked <code>— hard cap</code> are set on the host and \
-                 cannot be changed from here.",
+                "\n<i>set here</i> = changed from Telegram and saved. \
+                 <i>from config</i> = the host-side ceiling.\n\
+                 Caps can only be TIGHTENED from here; raising one needs host access.\n\n\
+                 <code>/maxsize /dailycap /maxtrades /maxmcap /maximpact /mode</code>",
             );
             out
         }
@@ -1675,17 +1725,26 @@ impl Bot {
          <b>Buttons:</b> Status · Settings · Balance · Positions · Wallets · \
          New wallet · Metrics · Halt.\n\n\
          <code>/calls</code> — how announced smart-money calls have performed.\n\n\
-         <b>Typed (take a value):</b>\n\
-         • <code>/use name</code> — pick the active wallet (applies on restart)\n\
-         • <code>/size 0.01</code> — set the trade size (SOL)\n\
+         <b>Trading:</b>\n\
+         • <code>/size 0.01</code> — trade size (SOL)\n\
+         • <code>/mode open|guard</code> — entry strategy\n\
          • <code>/slippage 200</code> — tighten slippage\n\
          • <code>/min-liquidity 25</code> — raise the liquidity floor\n\n\
+         <b>Risk caps:</b>\n\
+         • <code>/maxsize 0.05</code> — per-trade ceiling\n\
+         • <code>/dailycap 0.2</code> — SOL spendable per day\n\
+         • <code>/maxtrades 4</code> — trades per day\n\
+         • <code>/maxmcap 50000</code> — market-cap ceiling for entries\n\
+         • <code>/maximpact 500</code> — price-impact limit (bps)\n\n\
+         • <code>/use name</code> — pick the active wallet (applies on restart)\n\n\
          <code>/halt</code> and <code>/resume</code> toggle the kill switch.\n\n\
-         <code>/slippage</code> and <code>/min-liquidity</code> are \
-         <b>tighten-only</b>. <code>/size</code> can be raised (up to the host \
-         ceiling), so it can increase spend. <code>/resume</code> clears the \
-         pause but does NOT arm — there is no <code>/arm</code> and no withdraw. \
-         Going live (arming) requires host access."
+         Every setting here is <b>saved</b> and survives a restart. Caps and \
+         limits can only be <b>tightened</b> from Telegram — raising a ceiling \
+         needs host access, so a compromised bot account cannot widen its own \
+         limits. Passing <code>0</code> to a cap clears it and falls back to the \
+         host setting; it never means unlimited.\n\n\
+         <code>/resume</code> clears the pause but does NOT arm — there is no \
+         <code>/arm</code>. Going live requires host access."
             .to_string()
     }
 
@@ -1995,6 +2054,11 @@ enum Tunable {
     Size,
     Slippage,
     MinLiquidity,
+    MaxSize,
+    DailyCap,
+    MaxTrades,
+    MaxMcap,
+    MaxImpact,
 }
 
 impl Tunable {
@@ -2003,6 +2067,11 @@ impl Tunable {
             Tunable::Size => "size",
             Tunable::Slippage => "slippage",
             Tunable::MinLiquidity => "min-liquidity",
+            Tunable::MaxSize => "maxsize",
+            Tunable::DailyCap => "dailycap",
+            Tunable::MaxTrades => "maxtrades",
+            Tunable::MaxMcap => "maxmcap",
+            Tunable::MaxImpact => "maximpact",
         }
     }
 }
@@ -2025,6 +2094,12 @@ enum Command {
     SetSize(Option<String>),
     SetSlippage(Option<String>),
     SetMinLiquidity(Option<String>),
+    SetMaxSize(Option<String>),
+    SetDailyCap(Option<String>),
+    SetMaxTrades(Option<String>),
+    SetMaxMcap(Option<String>),
+    SetMaxImpact(Option<String>),
+    SetMode(Option<String>),
     /// Raw args after `/withdraw` ("<amount> <address>"), parsed in the handler.
     Withdraw(Option<String>),
     /// Reveal the active wallet's private key. Private chat only.
@@ -2063,6 +2138,12 @@ impl Command {
             "min-liquidity" | "min_liquidity" | "minliq" | "minliquidity" => {
                 Command::SetMinLiquidity(arg)
             }
+            "maxsize" | "max-size" | "max_size" => Command::SetMaxSize(arg),
+            "dailycap" | "daily-cap" | "daily_cap" => Command::SetDailyCap(arg),
+            "maxtrades" | "max-trades" | "max_trades" => Command::SetMaxTrades(arg),
+            "maxmcap" | "max-mcap" | "maxmarketcap" => Command::SetMaxMcap(arg),
+            "maximpact" | "max-impact" | "impact" => Command::SetMaxImpact(arg),
+            "mode" | "strategy" => Command::SetMode(arg),
             "withdraw" | "send" => Command::Withdraw(rest),
             "export" | "exportkey" | "privatekey" | "key" => Command::Export,
             "help" | "start" => Command::Help,
@@ -2087,6 +2168,12 @@ impl Command {
             Command::SetSize(_) => "size",
             Command::SetSlippage(_) => "slippage",
             Command::SetMinLiquidity(_) => "min-liquidity",
+            Command::SetMaxSize(_) => "maxsize",
+            Command::SetDailyCap(_) => "dailycap",
+            Command::SetMaxTrades(_) => "maxtrades",
+            Command::SetMaxMcap(_) => "maxmcap",
+            Command::SetMaxImpact(_) => "maximpact",
+            Command::SetMode(_) => "mode",
             Command::Withdraw(_) => "withdraw",
             Command::Export => "export",
             Command::Help => "help",
@@ -2670,6 +2757,8 @@ mod tests {
         sc.enabled = true;
         sc.trade_size_sol = 0.02;
         sc.max_trade_size_sol = 0.1;
+        // Never let a test write the operator's real settings file.
+        sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
         let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
 
@@ -2677,8 +2766,21 @@ mod tests {
         let msg = b.render_settings();
         assert!(msg.contains("Trading settings"), "got: {msg}");
         assert!(msg.contains("0.02"), "must show working trade size");
-        assert!(msg.contains("hard cap"), "must label the local caps");
         assert!(msg.contains("0.1"), "must show the max trade cap");
+        // Where a cap came from is part of the reading. An operator who cannot
+        // tell a limit they set from one they inherited will eventually assume
+        // a protection they do not have.
+        assert!(msg.contains("from config"), "must attribute the inherited cap");
+
+        // An absent cap is stated, never left blank or shown as a dash.
+        let mut open = SniperConfig::default();
+        open.enabled = true;
+        open.settings_path = String::new();
+        open.daily_cap_sol = 0.0;
+        open.max_trades_per_day = 0;
+        let s2 = Arc::new(crate::sniper::Sniper::new(open, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let msg2 = bot(&["1"], "").unwrap().with_sniper(s2).render_settings();
+        assert!(msg2.contains("UNLIMITED"), "an uncapped limit must say so: {msg2}");
     }
 
     #[test]

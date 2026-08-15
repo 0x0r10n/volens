@@ -302,6 +302,14 @@ impl SnipeMode {
         }
     }
 
+    /// The word this mode round-trips through settings storage as.
+    pub fn key(&self) -> &'static str {
+        match self {
+            SnipeMode::Open => "open",
+            SnipeMode::Guard => "guard",
+        }
+    }
+
     /// Parse from config/command. Unrecognized input is rejected rather than
     /// silently defaulting: picking the wrong one changes what gets bought.
     pub fn parse(s: &str) -> Option<Self> {
@@ -313,13 +321,10 @@ impl SnipeMode {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Tunable {
-    trade_size_sol: f64,
-    slippage_bps: u16,
-    min_liquidity_sol: f64,
-    snipe_mode: SnipeMode,
-}
+/// Working values now live in [`crate::settings::SettingsStore`], which
+/// persists them. They used to sit in a plain in-memory struct here, so every
+/// value set from Telegram was silently reverted to `config.toml` on restart.
+pub use crate::settings::{Envelope, LiveSettings};
 
 /// Render a SOL ceiling for display: 0 means the cap is disabled (unlimited).
 fn fmt_cap_sol(v: f64) -> String {
@@ -330,6 +335,73 @@ fn fmt_cap_sol(v: f64) -> String {
     }
 }
 
+/// Refuse a cap that would be looser than the config envelope.
+fn check_tighten(v: f64, hard: f64, unit: &str) -> Result<(), String> {
+    if v < 0.0 || v.is_nan() || v.is_infinite() {
+        return Err("value must be zero or positive".into());
+    }
+    if hard > 0.0 && v > hard {
+        return Err(format!(
+            "{v} {unit} exceeds the configured limit of {hard} {unit}. \
+             Only the host can raise a ceiling — this can only tighten one."
+        ));
+    }
+    Ok(())
+}
+
+/// Say plainly what a cap now is, including when clearing it leaves nothing.
+fn describe_cap(name: &str, v: f64, hard: f64, unit: &str) -> String {
+    if v > 0.0 {
+        return format!("{name} set to {v} {unit}");
+    }
+    if hard > 0.0 {
+        format!("{name} now follows config ({hard} {unit})")
+    } else {
+        format!("⚠️ {name} cleared and config sets none — this is now UNLIMITED")
+    }
+}
+
+/// One cap row: what binds, and which tier set it.
+///
+/// "unlimited" is spelled out rather than shown as a dash. An operator glancing
+/// at this screen should never mistake an absent cap for a quiet default —
+/// these three lines are the only thing between a detection bug and the wallet.
+fn cap_row(live: f64, hard: f64) -> String {
+    let eff = crate::settings::tightest(live, hard);
+    if eff <= 0.0 {
+        return "⚠️ UNLIMITED".into();
+    }
+    let src = if live > 0.0 && (hard <= 0.0 || live <= hard) { "set here" } else { "from config" };
+    format!("{eff} SOL ({src})")
+}
+
+fn cap_row_u32(live: u32, hard: u32) -> String {
+    let eff = crate::settings::tightest_u32(live, hard);
+    if eff == 0 {
+        return "⚠️ UNLIMITED".into();
+    }
+    let src = if live > 0 && (hard == 0 || live <= hard) { "set here" } else { "from config" };
+    format!("{eff} ({src})")
+}
+
+fn cap_row_usd(live: f64, hard: f64) -> String {
+    let eff = crate::settings::tightest(live, hard);
+    if eff <= 0.0 {
+        return "⚠️ no ceiling".into();
+    }
+    let src = if live > 0.0 && (hard <= 0.0 || live <= hard) { "set here" } else { "from config" };
+    format!("${eff:.0} ({src})")
+}
+
+fn cap_row_bps(live: u32, hard: u32) -> String {
+    let eff = crate::settings::tightest_u32(live, hard);
+    if eff == 0 {
+        return "⚠️ no ceiling".into();
+    }
+    let src = if live > 0 && (hard == 0 || live <= hard) { "set here" } else { "from config" };
+    format!("{eff} bps ({src})")
+}
+
 pub struct Sniper {
     cfg: SniperConfig,
     mode: Mode,
@@ -337,8 +409,8 @@ pub struct Sniper {
     /// Cached (price_usd, fetched_at) for SOL. Refreshed on a TTL so the market
     /// cap check does not re-quote Jupiter on every pool.
     #[cfg(feature = "sniper")]
-    /// See `Tunable`. Behind its own lock; read once per decision.
-    tunable: Mutex<Tunable>,
+    /// Live settings, persisted. Snapshotted once per decision.
+    settings: Arc<crate::settings::SettingsStore>,
     rpc: Arc<RpcClient>,
     /// Stream-derived prices. Replaces the external quote API that was
     /// IP-blocked, and which — while the market-cap gate still failed open —
@@ -429,18 +501,38 @@ impl Sniper {
                 cfg.mode
             )
         })?;
-        let tunable = Tunable {
-            trade_size_sol: cfg.trade_size_sol,
+        let envelope = Envelope {
+            max_trade_size_sol: cfg.max_trade_size_sol,
+            daily_cap_sol: cfg.daily_cap_sol,
+            max_trades_per_day: cfg.max_trades_per_day,
             slippage_bps: cfg.slippage_bps,
             min_liquidity_sol: cfg.min_liquidity_sol,
-            snipe_mode,
+            max_market_cap_usd: cfg.max_market_cap_usd,
+            max_price_impact_bps: cfg.max_price_impact_bps,
         };
+        let defaults =
+            LiveSettings::from_envelope(&envelope, cfg.trade_size_sol, snipe_mode.key());
+        let settings = Arc::new(crate::settings::SettingsStore::load(
+            &cfg.settings_path,
+            envelope,
+            defaults,
+        ));
+        let live = settings.snapshot();
+        info!(
+            trade_size_sol = live.trade_size_sol,
+            slippage_bps = live.slippage_bps,
+            min_liquidity_sol = live.min_liquidity_sol,
+            snipe_mode = %live.snipe_mode,
+            path = %cfg.settings_path,
+            "live settings loaded"
+        );
+
         Ok(Self {
             cfg,
             mode,
             prices,
             state: Mutex::new(DailyState::default()),
-            tunable: Mutex::new(tunable),
+            settings,
             rpc,
             submitter,
             jito,
@@ -506,17 +598,22 @@ impl Sniper {
     pub fn settings_rows(&self) -> Vec<(&'static str, String)> {
         let armed = matches!(self.mode, Mode::Armed(_));
         let c = &self.cfg;
-        let t = *self.tunable.lock().unwrap();
+        let t = self.settings.snapshot();
+        let env = self.settings.envelope();
         vec![
             ("Mode", if armed { "🔴 ARMED (live)".into() } else { "🧪 dry run".into() }),
-            ("Snipe mode", t.snipe_mode.label().to_string()),
+            ("Snipe mode", self.snipe_mode().label().to_string()),
             ("Trade size", format!("{} SOL", t.trade_size_sol)),
             ("Slippage", format!("{} bps ({:.1}%)", t.slippage_bps, t.slippage_bps as f64 / 100.0)),
             ("Min liquidity", format!("{} SOL (floor {})", t.min_liquidity_sol, c.min_liquidity_sol)),
-            ("Max price impact", format!("{} bps", c.max_price_impact_bps)),
-            ("— hard cap: max trade", fmt_cap_sol(c.max_trade_size_sol)),
-            ("— hard cap: daily spend", fmt_cap_sol(c.daily_cap_sol)),
-            ("— hard cap: trades/day", if c.max_trades_per_day == 0 { "unlimited".into() } else { c.max_trades_per_day.to_string() }),
+            // Each cap shows what actually binds, and where it came from. An
+            // operator who cannot tell a limit they set from one they merely
+            // inherited will eventually assume a protection they do not have.
+            ("Max trade", cap_row(t.max_trade_size_sol, env.max_trade_size_sol)),
+            ("Daily spend", cap_row(t.daily_cap_sol, env.daily_cap_sol)),
+            ("Trades/day", cap_row_u32(t.max_trades_per_day, env.max_trades_per_day)),
+            ("Max market cap", cap_row_usd(t.max_market_cap_usd, env.max_market_cap_usd)),
+            ("Max price impact", cap_row_bps(t.max_price_impact_bps, env.max_price_impact_bps)),
             ("Pool cooldown", format!("{}s", c.pool_cooldown_secs)),
             ("Preflight", if c.preflight { "on".into() } else { "OFF".into() }),
             ("Jito bundles", if c.jito_enabled { "on".into() } else { "off".into() }),
@@ -525,15 +622,31 @@ impl Sniper {
 
     /// Which entry strategy is active right now.
     pub fn snipe_mode(&self) -> SnipeMode {
-        self.tunable.lock().unwrap().snipe_mode
+        // An unparseable stored mode falls back to the cautious one rather than
+        // the fast one: if we cannot tell which strategy is meant, the wrong
+        // guess should be the one that buys less.
+        SnipeMode::parse(&self.settings.snapshot().snipe_mode).unwrap_or(SnipeMode::Guard)
+    }
+
+    /// Live settings snapshot, for display and for the Telegram layer.
+    pub fn live(&self) -> LiveSettings {
+        self.settings.snapshot()
+    }
+
+    pub fn envelope(&self) -> Envelope {
+        self.settings.envelope()
     }
 
     /// Switch between Open (buy at launch) and Guard (buy only once LP is
     /// secured). Unlike the risk knobs this is not tighten-only in either
     /// direction — it is a strategy choice, and Guard is the safer one.
     pub fn set_snipe_mode(&self, m: SnipeMode) -> String {
-        self.tunable.lock().unwrap().snipe_mode = m;
-        format!("snipe mode: {}", m.label())
+        self.settings
+            .update(|s| {
+                s.snipe_mode = m.key().to_string();
+                Ok(format!("snipe mode: {}", m.label()))
+            })
+            .unwrap_or_else(|e| e)
     }
 
     /// Set the working trade size from Telegram. Accepts any positive value up
@@ -545,15 +658,18 @@ impl Sniper {
         if v <= 0.0 || v.is_nan() || v.is_infinite() {
             return Err("trade size must be greater than 0".into());
         }
-        if self.cfg.max_trade_size_sol > 0.0 && v > self.cfg.max_trade_size_sol {
+        let env = self.settings.envelope();
+        let ceiling = self.settings.snapshot().effective_max_trade_size(&env);
+        if ceiling > 0.0 && v > ceiling {
             return Err(format!(
-                "trade size {v} exceeds max_trade_size_sol {} — raise it in \
-                 config on the host.",
-                self.cfg.max_trade_size_sol
+                "trade size {v} exceeds the {ceiling} SOL ceiling. Lower it with \
+                 /maxsize, or raise max_trade_size_sol in config on the host."
             ));
         }
-        self.tunable.lock().unwrap().trade_size_sol = v;
-        Ok(format!("trade size set to {v} SOL"))
+        self.settings.update(|s| {
+            s.trade_size_sol = v;
+            Ok(format!("trade size set to {v} SOL"))
+        })
     }
 
     /// Tighten slippage. Refuses any value above the configured `slippage_bps`,
@@ -568,8 +684,10 @@ impl Sniper {
                 self.cfg.slippage_bps
             ));
         }
-        self.tunable.lock().unwrap().slippage_bps = bps;
-        Ok(format!("slippage set to {bps} bps"))
+        self.settings.update(|s| {
+            s.slippage_bps = bps;
+            Ok(format!("slippage set to {bps} bps"))
+        })
     }
 
     /// Raise the minimum liquidity. Refuses any value below the configured
@@ -585,8 +703,77 @@ impl Sniper {
                 self.cfg.min_liquidity_sol
             ));
         }
-        self.tunable.lock().unwrap().min_liquidity_sol = v;
-        Ok(format!("minimum liquidity set to {v} SOL"))
+        self.settings.update(|s| {
+            s.min_liquidity_sol = v;
+            Ok(format!("minimum liquidity set to {v} SOL"))
+        })
+    }
+
+    /// Tighten the per-trade ceiling. `0` clears the local cap and falls back
+    /// to the config envelope — it never means "unlimited".
+    pub fn set_max_trade_size(&self, v: f64) -> Result<String, String> {
+        let hard = self.settings.envelope().max_trade_size_sol;
+        check_tighten(v, hard, "SOL")?;
+        self.settings.update(|s| {
+            s.max_trade_size_sol = v;
+            Ok(describe_cap("max trade size", v, hard, "SOL"))
+        })
+    }
+
+    /// Tighten the daily spend cap.
+    pub fn set_daily_cap(&self, v: f64) -> Result<String, String> {
+        let hard = self.settings.envelope().daily_cap_sol;
+        check_tighten(v, hard, "SOL")?;
+        self.settings.update(|s| {
+            s.daily_cap_sol = v;
+            Ok(describe_cap("daily spend cap", v, hard, "SOL"))
+        })
+    }
+
+    /// Tighten the daily trade count.
+    pub fn set_max_trades(&self, v: u32) -> Result<String, String> {
+        let hard = self.settings.envelope().max_trades_per_day;
+        if hard > 0 && v > hard {
+            return Err(format!(
+                "{v} exceeds the configured limit of {hard}. Only the host can raise it."
+            ));
+        }
+        self.settings.update(|s| {
+            s.max_trades_per_day = v;
+            Ok(if v == 0 {
+                format!("trades/day now follows config ({})", if hard == 0 { "unlimited".into() } else { hard.to_string() })
+            } else {
+                format!("trades/day capped at {v}")
+            })
+        })
+    }
+
+    /// Tighten the market-cap ceiling for entries.
+    pub fn set_max_market_cap(&self, v: f64) -> Result<String, String> {
+        let hard = self.settings.envelope().max_market_cap_usd;
+        check_tighten(v, hard, "USD")?;
+        self.settings.update(|s| {
+            s.max_market_cap_usd = v;
+            Ok(describe_cap("max market cap", v, hard, "USD"))
+        })
+    }
+
+    /// Tighten the tolerated price impact.
+    pub fn set_max_impact_bps(&self, v: u32) -> Result<String, String> {
+        let hard = self.settings.envelope().max_price_impact_bps;
+        if hard > 0 && v > hard {
+            return Err(format!(
+                "{v} bps exceeds the configured limit of {hard} bps. Only the host can raise it."
+            ));
+        }
+        self.settings.update(|s| {
+            s.max_price_impact_bps = v;
+            Ok(if v == 0 {
+                "price impact limit now follows config".to_string()
+            } else {
+                format!("price impact capped at {v} bps")
+            })
+        })
     }
 
     /// Is the kill switch file present? Checked per-decision so it takes effect
@@ -604,7 +791,8 @@ impl Sniper {
     pub fn consider(&self, ev: &PoolEvent, now: DateTime<Utc>) -> Result<TradePlan, Denial> {
         // Snapshot the tuned working values once, so a mid-decision change from
         // Telegram cannot make the checks and the plan disagree.
-        let tuned = *self.tunable.lock().unwrap();
+        let tuned = self.settings.snapshot();
+        let env = self.settings.envelope();
 
         if !self.cfg.enabled {
             return Err(Denial::Disabled);
@@ -662,9 +850,18 @@ impl Sniper {
             }
         }
 
+        // Caps are the TIGHTER of the config envelope and whatever the operator
+        // set from Telegram, so a limit narrowed by command genuinely binds.
+        let max_size = tuned.effective_max_trade_size(&env);
+        let daily_cap = tuned.effective_daily_cap(&env);
+        let max_trades = tuned.effective_max_trades(&env);
+
         let size = tuned.trade_size_sol;
-        if self.cfg.max_trade_size_sol > 0.0 && size > self.cfg.max_trade_size_sol {
-            return Err(Denial::TradeSizeExceedsMax { size, max: self.cfg.max_trade_size_sol });
+        if size <= 0.0 {
+            return Err(Denial::TradeSizeExceedsMax { size, max: max_size });
+        }
+        if max_size > 0.0 && size > max_size {
+            return Err(Denial::TradeSizeExceedsMax { size, max: max_size });
         }
 
         // Daily limits and per-pool cooldown share one lock: they are checked
@@ -677,18 +874,14 @@ impl Sniper {
             {
                 return Err(Denial::PoolCoolingDown { seconds_remaining });
             }
-            // 0 disables each daily limit (unlimited).
-            if self.cfg.max_trades_per_day > 0 && st.trades >= self.cfg.max_trades_per_day {
-                return Err(Denial::DailyTradeCountReached {
-                    count: st.trades,
-                    max: self.cfg.max_trades_per_day,
-                });
+            // 0 means neither tier set this limit, and that is genuinely
+            // uncapped — the operator is told so plainly by /caps rather than
+            // being given a reassuring default that does not exist.
+            if max_trades > 0 && st.trades >= max_trades {
+                return Err(Denial::DailyTradeCountReached { count: st.trades, max: max_trades });
             }
-            if self.cfg.daily_cap_sol > 0.0 && st.spent + size > self.cfg.daily_cap_sol {
-                return Err(Denial::DailyCapReached {
-                    spent: st.spent,
-                    cap: self.cfg.daily_cap_sol,
-                });
+            if daily_cap > 0.0 && st.spent + size > daily_cap {
+                return Err(Denial::DailyCapReached { spent: st.spent, cap: daily_cap });
             }
         }
 
@@ -1425,6 +1618,8 @@ mod tests {
             // Off in tests: the gate needs live RPC + Jupiter, and existing
             // cases assert on the other guards. Covered by its own pure test.
             max_market_cap_usd: 0.0,
+            // Tests must never touch a real settings file.
+            settings_path: String::new(),
             jupiter_base_url: "https://lite-api.jup.ag/swap/v1".into(),
             sell_slippage_bps: 500,
         }
@@ -1441,6 +1636,64 @@ mod tests {
             &rpc_cfg,
             Arc::new(crate::prices::PriceIndex::new()),
         )
+    }
+
+    /// A cap set from Telegram has to actually refuse a trade. Storing it and
+    /// still buying would be worse than not offering the command at all.
+    #[test]
+    fn a_cap_tightened_from_telegram_binds_on_the_next_decision() {
+        let s = mk(cfg()).unwrap();
+        let now = Utc::now();
+        assert!(s.consider(&event(), now).is_ok(), "baseline should pass");
+
+        s.set_max_trades(0).unwrap();
+        s.set_daily_cap(0.05).unwrap(); // below the 0.1 trade size
+        match s.consider(&event(), now) {
+            Err(Denial::DailyCapReached { cap, .. }) => assert_eq!(cap, 0.05),
+            other => panic!("expected the tightened daily cap to bind, got {other:?}"),
+        }
+    }
+
+    /// Lowering the ceiling below the working size pulls the SIZE down with it
+    /// rather than refusing every trade. Jamming the bot into permanent denial
+    /// would be a worse answer to "be more careful" than simply buying less.
+    #[test]
+    fn tightening_the_ceiling_shrinks_the_trade() {
+        let s = mk(cfg()).unwrap(); // trade size 0.1
+        s.set_max_trade_size(0.05).unwrap();
+        assert_eq!(s.live().trade_size_sol, 0.05, "working size follows the ceiling down");
+        let plan = s.consider(&event(), Utc::now()).expect("should still trade, just smaller");
+        assert_eq!(plan.size, 0.05);
+    }
+
+    /// Telegram may tighten a ceiling, never raise one past the host's.
+    #[test]
+    fn telegram_cannot_widen_the_envelope() {
+        let s = mk(cfg()).unwrap(); // max_trade_size 1.0, daily 1.0, trades 5
+        assert!(s.set_max_trade_size(5.0).is_err(), "must refuse a wider per-trade cap");
+        assert!(s.set_daily_cap(50.0).is_err(), "must refuse a wider daily cap");
+        assert!(s.set_max_trades(500).is_err(), "must refuse more trades than config allows");
+        assert!(s.set_slippage_bps(5000).is_err(), "slippage is tighten-only");
+
+        // …and tightening is accepted.
+        assert!(s.set_max_trade_size(0.5).is_ok());
+        assert!(s.set_daily_cap(0.5).is_ok());
+        assert!(s.set_max_trades(2).is_ok());
+    }
+
+    /// Clearing a live cap falls back to config, and when config sets none the
+    /// operator is told the limit is gone rather than left to assume it holds.
+    #[test]
+    fn clearing_a_cap_says_what_is_left() {
+        let s = mk(cfg()).unwrap();
+        let msg = s.set_daily_cap(0.0).unwrap();
+        assert!(msg.contains("follows config"), "got: {msg}");
+
+        let mut open = cfg();
+        open.daily_cap_sol = 0.0;
+        let s2 = mk(open).unwrap();
+        let msg2 = s2.set_daily_cap(0.0).unwrap();
+        assert!(msg2.contains("UNLIMITED"), "an absent cap must be stated: {msg2}");
     }
 
     fn event() -> PoolEvent {

@@ -31,6 +31,7 @@ mod quote;
 mod rpc;
 #[cfg(feature = "sniper")]
 mod sniper;
+mod settings;
 mod signals;
 mod socials;
 mod storage;

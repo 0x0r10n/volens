@@ -28,3 +28,6 @@ tracked_wallets.json.*
 .claude/
 __pycache__/
 *.pyc
+
+# Live settings written by the bot (operational state, not code).
+settings.json
