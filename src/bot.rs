@@ -1295,19 +1295,6 @@ impl Bot {
         if let Some(sniper) = &self.sniper {
             use crate::sniper::SnipeMode;
             let live = sniper.live();
-            let env = sniper.envelope();
-
-            // One button per setting, labelled with its CURRENT value, so the
-            // screen reads as a form rather than a list of commands to memorise.
-            let cap = |live_v: f64, hard: f64, unit: &str| -> String {
-                let eff = crate::settings::tightest(live_v, hard);
-                if eff > 0.0 { format!("{eff}{unit}") } else { "none".into() }
-            };
-            let cap_u = |live_v: u32, hard: u32| -> String {
-                let eff = crate::settings::tightest_u32(live_v, hard);
-                if eff > 0 { eff.to_string() } else { "none".into() }
-            };
-
             // Deliberately NOT shown: the spend caps and the snipe mode.
             //
             // The caps still bind on every buy — they are set on the host and

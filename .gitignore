@@ -35,3 +35,4 @@ config.local.toml
 local-settings.json
 local_*.jsonl
 sell_routes.jsonl
+exit_state.json

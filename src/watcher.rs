@@ -187,6 +187,22 @@ pub fn spawn_watch(
                     before, after, drop_pct, after_secs = elapsed, announced = secured,
                     "🚨 liquidity pulled"
                 );
+                // Get out FIRST, before storage and alerting. A rug is the one
+                // event where latency is the whole game: the pool is draining
+                // while we decide, and a sell that lands after the liquidity is
+                // gone is not a sell. Logging can wait; the position cannot.
+                #[cfg(feature = "sniper")]
+                if let Some(s) = &sniper
+                    && let Some(mint) = event.new_token_mint.as_deref()
+                {
+                    let rules = s.live().exits;
+                    if rules.enabled && rules.exit_on_liquidity_pull {
+                        warn!(token = mint, drop_pct, "liquidity pulled — emergency exit");
+                        let outcome = s.sell(mint, 100).await;
+                        warn!(token = mint, ?outcome, "emergency exit result");
+                    }
+                }
+
                 let verdict = Verdict::LiquidityPulled { before, after, drop_pct };
                 let mut f = event.clone();
                 f.quote_liquidity = liquidity_now;

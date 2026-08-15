@@ -769,6 +769,65 @@ impl Sniper {
         })
     }
 
+    /// One pass of the exit policy over every position the bot opened.
+    ///
+    /// Returns (considered, sold). Deliberately sequential and one action per
+    /// position per pass: selling is the irreversible half of trading, and a
+    /// burst of concurrent sells on a bad price tick is exactly the failure
+    /// this is meant to prevent rather than cause.
+    pub async fn sweep_exits(&self, state: &Arc<crate::exits::ExitStateStore>) -> (usize, usize) {
+        let rules = self.settings.snapshot().exits;
+        if !rules.enabled || self.kill_switch_engaged() {
+            return (0, 0);
+        }
+        let Some(owner) = self.owner() else { return (0, 0) };
+        let owner = owner.to_string();
+
+        // Cost basis counts only buys that truly moved funds, so a dry-run
+        // rehearsal never produces a position the ladder would act on.
+        let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.unwrap_or_default();
+        let basis = crate::positions::cost_basis_from_audit(&audit);
+        let (mut considered, mut sold) = (0usize, 0usize);
+
+        for (mint, cost) in basis {
+            if cost.sol_spent <= 0.0 {
+                continue;
+            }
+            let Some((raw, decimals)) = self.rpc.token_balance_raw(&owner, &mint).await else {
+                continue;
+            };
+            if raw == 0 {
+                // Position closed by hand or fully sold: drop its ladder so a
+                // re-entry starts fresh rather than inheriting old rungs.
+                state.forget(&mint);
+                continue;
+            }
+            considered += 1;
+
+            // Price from our own stream. A missing price yields no action at
+            // all — see `exits::evaluate`, which refuses to read "unpriced" as
+            // "worthless".
+            let Some(priced) = self.prices.price_sol(&mint, std::time::Duration::from_secs(3600))
+            else {
+                continue;
+            };
+            let tokens = raw as f64 / 10f64.powi(decimals as i32);
+            let value_sol = priced.price_sol * tokens;
+            let multiple = value_sol / cost.sol_spent;
+
+            match state.decide(&rules, &mint, multiple) {
+                crate::exits::ExitAction::Hold => {}
+                crate::exits::ExitAction::Sell { pct, reason } => {
+                    warn!(%mint, pct, multiple, %reason, "auto-sell firing");
+                    let outcome = self.sell(&mint, pct).await;
+                    info!(%mint, ?outcome, "auto-sell result");
+                    sold += 1;
+                }
+            }
+        }
+        (considered, sold)
+    }
+
     /// Turn the whole exit policy on or off.
     pub fn toggle_exits(&self) -> Result<String, String> {
         self.settings.update(|s| {
@@ -1762,6 +1821,8 @@ mod tests {
             // Tests must never touch a real settings or routes file.
             settings_path: String::new(),
             sell_routes_path: String::new(),
+            exit_state_path: String::new(),
+            exit_check_secs: 15,
             jupiter_base_url: "https://lite-api.jup.ag/swap/v1".into(),
             sell_slippage_bps: 500,
         }

@@ -381,6 +381,15 @@ pub struct SniperConfig {
     /// API, which has blocked this host before.
     #[serde(default = "default_routes_path")]
     pub sell_routes_path: String,
+    /// Per-position exit memory: fired take-profit levels and peak seen.
+    ///
+    /// Persisted so a restart does not re-take a level the ladder already took,
+    /// nor forget the peak a trailing stop measures from.
+    #[serde(default = "default_exit_state_path")]
+    pub exit_state_path: String,
+    /// How often the auto-sell watcher re-prices open positions, in seconds.
+    #[serde(default = "default_exit_check")]
+    pub exit_check_secs: u64,
     /// Where live settings changed from Telegram are persisted.
     ///
     /// These are working values INSIDE the ceilings set here; the file can
@@ -604,6 +613,8 @@ fn default_export_ttl() -> u64 { 60 }
 fn default_max_mcap() -> f64 { 50_000.0 }
 fn default_settings_path() -> String { "settings.json".to_string() }
 fn default_routes_path() -> String { "sell_routes.jsonl".to_string() }
+fn default_exit_state_path() -> String { "exit_state.json".to_string() }
+fn default_exit_check() -> u64 { 15 }
 fn default_recheck_interval() -> u64 { 120 }
 fn default_max_watch() -> u64 { 600 }
 fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
@@ -692,6 +703,8 @@ impl Default for SniperConfig {
             audit_log: default_audit_log(),
             settings_path: default_settings_path(),
             sell_routes_path: default_routes_path(),
+            exit_state_path: default_exit_state_path(),
+            exit_check_secs: default_exit_check(),
             keypair_path: String::new(),
             simulate_as: String::new(),
             max_price_impact_bps: default_max_impact(),

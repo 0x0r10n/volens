@@ -197,12 +197,106 @@ pub fn describe(rules: &ExitRules) -> String {
     parts.join(" · ")
 }
 
+
+/// Per-position exit memory, persisted so a restart does not re-take rungs the
+/// ladder has already taken or forget a peak the trailing stop measures from.
+pub struct ExitStateStore {
+    path: String,
+    inner: std::sync::Mutex<std::collections::HashMap<String, PositionState>>,
+}
+
+impl ExitStateStore {
+    pub fn load(path: &str) -> Self {
+        let map = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default();
+        Self { path: path.to_string(), inner: std::sync::Mutex::new(map) }
+    }
+
+    pub fn ephemeral() -> Self {
+        Self { path: String::new(), inner: std::sync::Mutex::new(Default::default()) }
+    }
+
+    /// Evaluate one position and persist whatever the decision changed.
+    pub fn decide(&self, rules: &ExitRules, mint: &str, multiple: f64) -> ExitAction {
+        let action = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let st = g.entry(mint.to_string()).or_default();
+            evaluate(rules, st, multiple)
+        };
+        // Persist on any state change. A rung recorded as fired but never saved
+        // would fire again after a restart and sell the position twice.
+        self.save();
+        action
+    }
+
+    /// Forget a position, e.g. once fully sold.
+    pub fn forget(&self, mint: &str) {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).remove(mint);
+        self.save();
+    }
+
+    pub fn peak(&self, mint: &str) -> f64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(mint)
+            .map(|s| s.peak_multiple)
+            .unwrap_or(0.0)
+    }
+
+    fn save(&self) {
+        if self.path.is_empty() {
+            return;
+        }
+        let snapshot = { self.inner.lock().unwrap_or_else(|p| p.into_inner()).clone() };
+        let tmp = format!("{}.tmp", self.path);
+        let written = serde_json::to_string_pretty(&snapshot)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+            .and_then(|body| std::fs::write(&tmp, body))
+            .and_then(|_| std::fs::rename(&tmp, &self.path));
+        if let Err(e) = written {
+            tracing::warn!(path = %self.path, error = %e, "could not persist exit state");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn rules() -> ExitRules {
         ExitRules { enabled: true, ..Default::default() }
+    }
+
+
+    /// A rung recorded as fired but never saved would fire again after a
+    /// restart and sell the position a second time.
+    #[test]
+    fn a_fired_rung_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("volens-exits-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("exit_state.json").to_string_lossy().to_string();
+        let _ = std::fs::remove_file(&p);
+
+        let store = ExitStateStore::load(&p);
+        let r = rules();
+        assert!(matches!(store.decide(&r, "MINT", 2.5), ExitAction::Sell { .. }));
+
+        let reloaded = ExitStateStore::load(&p);
+        assert_eq!(reloaded.decide(&r, "MINT", 2.5), ExitAction::Hold, "must not re-fire");
+        assert_eq!(reloaded.peak("MINT"), 2.5, "and the peak is remembered");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn forgetting_a_position_clears_its_ladder() {
+        let store = ExitStateStore::ephemeral();
+        let r = rules();
+        assert!(matches!(store.decide(&r, "M", 2.5), ExitAction::Sell { .. }));
+        store.forget("M");
+        assert!(matches!(store.decide(&r, "M", 2.5), ExitAction::Sell { .. }), "fresh again");
     }
 
     #[test]

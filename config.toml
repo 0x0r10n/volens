@@ -418,6 +418,14 @@ settings_path = "settings.json"
 # position whose route was not captured can never be sold DIRECTLY — only via
 # the quote API, which has IP-blocked this host before.
 sell_routes_path = "sell_routes.jsonl"
+# Per-position exit memory: which take-profit levels have fired and the peak
+# seen. Persisted so a restart does not re-take a level already taken, nor
+# forget the peak a trailing stop measures from.
+exit_state_path = "exit_state.json"
+# How often open positions are re-priced for take-profit / stop-loss, seconds.
+# The rules themselves (levels, stop loss, trailing) live in settings.json and
+# are set from Telegram; auto-sell starts OFF.
+exit_check_secs = 15
 
 # Keypair file (Solana CLI JSON array). REQUIRED to arm.
 # Use a DEDICATED wallet, never your main one.

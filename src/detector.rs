@@ -317,6 +317,37 @@ impl Detector {
             );
         }
 
+        // Auto-sell. Spawned unconditionally when the sniper is compiled in:
+        // the policy's own `enabled` flag decides whether it acts, and that
+        // flag is toggled from Telegram at runtime, so gating the task on a
+        // startup value would make the button silently do nothing until the
+        // next restart.
+        #[cfg(feature = "sniper")]
+        {
+            let sniper = self.sniper.clone();
+            let state = Arc::new(crate::exits::ExitStateStore::load(
+                &self.cfg.sniper.exit_state_path,
+            ));
+            let every = Duration::from_secs(self.cfg.sniper.exit_check_secs.max(5));
+            let mut shutdown = shutdown.clone();
+            info!(every_secs = every.as_secs(), "auto-sell watcher started");
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(every) => {}
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return; }
+                            continue;
+                        }
+                    }
+                    let (considered, sold) = sniper.sweep_exits(&state).await;
+                    if sold > 0 {
+                        info!(considered, sold, "auto-sell sweep");
+                    }
+                }
+            });
+        }
+
         let min = Duration::from_secs(self.cfg.grpc.backoff_min_secs.max(1));
         let max = Duration::from_secs(self.cfg.grpc.backoff_max_secs.max(1));
         let mut backoff = min;
