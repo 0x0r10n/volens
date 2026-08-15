@@ -845,6 +845,18 @@ impl Detector {
                             })
                             .collect()
                     };
+                    // Logged whenever a token is at least halfway to the
+                    // threshold. "No trades" and "no signals strong enough"
+                    // look identical from outside, and telling them apart
+                    // should not require reading the source.
+                    if eligible.len() * 2 >= need {
+                        info!(
+                            mint = %buy.mint,
+                            eligible = eligible.len(),
+                            need,
+                            "auto-buy progress"
+                        );
+                    }
                     if eligible.len() >= need {
                         self.spawn_smart_buy(&buy.mint, eligible.len()).await;
                     }

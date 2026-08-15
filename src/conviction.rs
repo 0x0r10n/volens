@@ -166,15 +166,22 @@ impl ConvictionTracker {
             self.sweep(now);
         }
 
-        // Already called. Keep recording buys so the window stays accurate,
-        // but say nothing.
+        // Already called: stay quiet, but KEEP RECORDING.
+        //
+        // This used to `return None` here, before the buyer was pushed — so a
+        // token's buyer list froze at the alert threshold the moment it called.
+        // Anything reading that list for a stricter decision (auto-buy needs
+        // more buyers than an alert does) could never see enough, and silently
+        // never fired.
         let ttl = self.announce_ttl;
-        if let Some(at) = self.announced.get(mint) {
-            if now.duration_since(*at) < ttl {
-                return None;
+        let suppressed = match self.announced.get(mint) {
+            Some(at) if now.duration_since(*at) < ttl => true,
+            Some(_) => {
+                self.announced.remove(mint);
+                false
             }
-            self.announced.remove(mint);
-        }
+            None => false,
+        };
 
         let window = self.window;
         let entries = self.tokens.entry(mint.to_string()).or_default();
@@ -194,7 +201,7 @@ impl ConvictionTracker {
             fees,
         });
 
-        if entries.len() < self.threshold {
+        if suppressed || entries.len() < self.threshold {
             return None;
         }
 
@@ -478,6 +485,54 @@ fn html_escape(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A called token must keep accumulating buyers.
+    ///
+    /// It did not: `record` returned before pushing once the token had
+    /// announced, so the buyer list froze at the alert threshold. Anything
+    /// wanting a STRICTER rule than the alert — auto-buy needs more buyers than
+    /// an alert does — could never see enough, and failed silently: no error,
+    /// no log, simply no trades, forever.
+    #[test]
+    fn buyers_keep_accumulating_after_the_call() {
+        let mut t = ConvictionTracker::new(
+            Duration::from_secs(600),
+            3,
+            Duration::from_secs(3600),
+        );
+        let now = Instant::now();
+        let utc = Utc::now();
+
+        assert!(t.record("MINT", "w1", "a", 1.0, 0.0, now, utc).is_none());
+        assert!(t.record("MINT", "w2", "b", 1.0, 0.0, now, utc).is_none());
+        assert!(t.record("MINT", "w3", "c", 1.0, 0.0, now, utc).is_some(), "should call at 3");
+        assert_eq!(t.buyers_in_window("MINT", now).len(), 3);
+
+        // Two more buyers arrive. Silent — the token already called — but they
+        // must still be counted.
+        assert!(t.record("MINT", "w4", "d", 1.0, 0.0, now, utc).is_none(), "must not re-announce");
+        assert!(t.record("MINT", "w5", "e", 1.0, 0.0, now, utc).is_none());
+        assert_eq!(
+            t.buyers_in_window("MINT", now).len(),
+            5,
+            "a stricter rule than the alert must be able to see the later buyers"
+        );
+    }
+
+    /// The same wallet buying twice is still one buyer.
+    #[test]
+    fn a_repeat_buyer_is_counted_once() {
+        let mut t = ConvictionTracker::new(
+            Duration::from_secs(600),
+            3,
+            Duration::from_secs(3600),
+        );
+        let now = Instant::now();
+        let utc = Utc::now();
+        t.record("MINT", "w1", "a", 1.0, 0.0, now, utc);
+        t.record("MINT", "w1", "a", 1.0, 0.0, now, utc);
+        assert_eq!(t.buyers_in_window("MINT", now).len(), 1);
+    }
     use super::*;
 
     const MINT: &str = "TokenMint111111111111111111111111111111111";
