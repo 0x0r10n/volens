@@ -73,6 +73,9 @@ pub struct Detector {
     outcomes: Arc<crate::outcomes::OutcomeStore>,
     #[cfg(feature = "sniper")]
     sniper: Arc<Sniper>,
+    /// Mints already auto-bought, so one signal opens one position.
+    #[cfg(feature = "sniper")]
+    smart_bought: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
 impl Detector {
@@ -100,7 +103,26 @@ impl Detector {
             let book = WalletBook::from_export_json(&raw)
                 .with_context(|| format!("parsing tracked wallets from {path}"))?;
             anyhow::ensure!(!book.is_empty(), "{path} contained no usable addresses");
-            info!(wallets = book.len(), path = %path, "tracked wallets loaded");
+            let groups = &cfg.tracked.auto_buy_groups;
+            let eligible = book.count_in_groups(groups);
+            info!(
+                wallets = book.len(),
+                auto_buy = cfg.tracked.auto_buy,
+                auto_buy_eligible = eligible,
+                auto_buy_min = cfg.tracked.auto_buy_min_wallets,
+                cohorts = ?groups,
+                path = %path,
+                "tracked wallets loaded"
+            );
+            // A cohort name that matches nothing fails SILENTLY: the bot runs,
+            // logs normally, alerts normally, and never buys.
+            if cfg.tracked.auto_buy && !groups.is_empty() && eligible == 0 {
+                anyhow::bail!(
+                    "auto_buy_groups {groups:?} matched none of the {} tracked wallets — \
+                     check the cohort names against the `groups` field in {path}",
+                    book.len()
+                );
+            }
             book
         } else {
             WalletBook::default()
@@ -136,6 +158,8 @@ impl Detector {
             )),
             #[cfg(feature = "sniper")]
             sniper,
+            #[cfg(feature = "sniper")]
+            smart_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 
@@ -325,6 +349,7 @@ impl Detector {
         #[cfg(feature = "sniper")]
         {
             let sniper = self.sniper.clone();
+            let alerter = self.alerter.clone();
             let state = Arc::new(crate::exits::ExitStateStore::load(
                 &self.cfg.sniper.exit_state_path,
             ));
@@ -340,7 +365,7 @@ impl Detector {
                             continue;
                         }
                     }
-                    let (considered, sold) = sniper.sweep_exits(&state).await;
+                    let (considered, sold) = sniper.sweep_exits(&state, &alerter).await;
                     if sold > 0 {
                         info!(considered, sold, "auto-sell sweep");
                     }
@@ -793,6 +818,30 @@ impl Detector {
                 });
             }
 
+            // --- Auto-buy. Evaluated on EVERY tracked buy, not only when a
+            // call fires: the trading threshold is higher than the alert
+            // threshold, so the buy that crosses it usually arrives after the
+            // alert has already gone out.
+            #[cfg(feature = "sniper")]
+            if self.cfg.tracked.auto_buy {
+                let eligible: Vec<String> = {
+                    let tracker = match self.conviction.lock() {
+                        Ok(t) => t,
+                        Err(p) => p.into_inner(),
+                    };
+                    tracker
+                        .buyers_in_window(&buy.mint, Instant::now())
+                        .into_iter()
+                        .filter(|w| {
+                            self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
+                        })
+                        .collect()
+                };
+                if eligible.len() >= self.cfg.tracked.auto_buy_min_wallets {
+                    self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                }
+            }
+
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
                 // The triggering buy becomes the reference trade for every
@@ -800,6 +849,27 @@ impl Detector {
                 // because it cannot be reconstructed afterwards.
                 self.spawn_conviction_alert(signal, buy);
             }
+        }
+    }
+
+    /// Fire a smart-money buy, once per token, and tell the group either way.
+    ///
+    /// Deduped by mint for the process lifetime: a signal keeps accumulating
+    /// buys after it crosses the threshold, and each one would otherwise
+    /// trigger another entry into the same position.
+    #[cfg(feature = "sniper")]
+    async fn spawn_smart_buy(&self, mint: &str, wallets: usize) {
+        {
+            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(mint.to_string()) {
+                return;
+            }
+        }
+        let reason = format!("{wallets} tracked wallets in window");
+        let outcome = self.sniper.buy_mint(mint, &reason).await;
+        info!(%mint, wallets, ?outcome, "smart-money buy");
+        if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome) {
+            self.alerter.send_html(msg).await;
         }
     }
 

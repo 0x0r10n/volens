@@ -133,6 +133,25 @@ impl ConvictionTracker {
     ///   into a position is one opinion, not two;
     /// * a token already announced never announces again — the 4th and 5th
     ///   buyer are the same call getting louder, not a new one.
+    /// Wallets that have bought this token inside the current window.
+    ///
+    /// Exposed so the caller can apply its OWN filter — the tracker knows
+    /// nothing about cohorts, and should not. Alerting counts every tracked
+    /// wallet; trading may want a subset, and keeping that decision outside
+    /// here stops the two from drifting into one another.
+    pub fn buyers_in_window(&self, mint: &str, now: Instant) -> Vec<String> {
+        let window = self.window;
+        self.tokens
+            .get(mint)
+            .map(|e| {
+                e.iter()
+                    .filter(|b| now.duration_since(b.at) < window)
+                    .map(|b| b.wallet.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn record(
         &mut self,
         mint: &str,

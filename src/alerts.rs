@@ -565,3 +565,96 @@ mod execution_tests {
         assert!(msg.contains("&lt;b&gt;PUMP&lt;/b&gt;"), "got: {msg}");
     }
 }
+
+use crate::bot::escape_html;
+
+/// Announce a smart-money entry to the group.
+///
+/// Every buy and sell is announced, including refusals and failures. A trading
+/// bot that only speaks up when things go well leaves the operator unable to
+/// tell "no signal" from "signal, and the buy failed".
+#[cfg(feature = "sniper")]
+pub fn render_smart_buy(
+    mint: &str,
+    wallets: usize,
+    outcome: &crate::sniper::BuyOutcome,
+) -> Option<String> {
+    use crate::sniper::BuyOutcome;
+    let short = crate::conviction::short_mint(mint);
+    Some(match outcome {
+        BuyOutcome::Refused { reason } => format!(
+            "⚪ <b>Smart buy skipped</b> · <code>{}</code>\n{} wallets\n{}",
+            escape_html(&short), wallets, escape_html(reason)
+        ),
+        BuyOutcome::Failed { reason, .. } => format!(
+            "❌ <b>Smart buy FAILED</b> · <code>{}</code>\n{} wallets\n{}",
+            escape_html(&short), wallets, escape_html(reason)
+        ),
+        BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
+            "🧪 <b>Smart buy rehearsed</b> · <code>{}</code>\n\
+             {wallets} wallets · {sol_in} SOL\n{}\n\
+             <i>Dry run — nothing was signed.</i>",
+            escape_html(&short),
+            if *would_succeed { "would succeed" } else { "would FAIL" }
+        ),
+        BuyOutcome::Submitted { sol_in, result, .. } => format!(
+            "🟢 <b>SMART BUY</b> · <code>{}</code>\n{wallets} wallets · {sol_in} SOL\n{}",
+            escape_html(&short),
+            escape_html(&describe_submission(result))
+        ),
+    })
+}
+
+/// Announce an exit to the group.
+#[cfg(feature = "sniper")]
+pub fn render_auto_sell(
+    mint: &str,
+    pct: u8,
+    reason: &str,
+    outcome: &crate::sniper::SellOutcome,
+) -> Option<String> {
+    use crate::sniper::SellOutcome;
+    let short = crate::conviction::short_mint(mint);
+    Some(match outcome {
+        SellOutcome::NoPosition { .. } => return None,
+        SellOutcome::Refused { reason: r } => format!(
+            "⚪ <b>Auto-sell skipped</b> · <code>{}</code>\n{}",
+            escape_html(&short), escape_html(r)
+        ),
+        SellOutcome::Failed { reason: r, .. } => format!(
+            "❌ <b>Auto-sell FAILED</b> · <code>{}</code>\n{}\n{}",
+            escape_html(&short), escape_html(reason), escape_html(r)
+        ),
+        SellOutcome::Rehearsed { sol_out, would_succeed, .. } => format!(
+            "🧪 <b>Auto-sell rehearsed</b> · <code>{}</code>\n\
+             {pct}% · est {sol_out:.4} SOL\n{}\n{}\n<i>Dry run.</i>",
+            escape_html(&short), escape_html(reason),
+            if *would_succeed { "would succeed" } else { "would FAIL" }
+        ),
+        SellOutcome::Submitted { sol_out, result, .. } => format!(
+            "🔴 <b>AUTO-SELL</b> · <code>{}</code>\n{pct}% · est {sol_out:.4} SOL\n{}\n{}",
+            escape_html(&short), escape_html(reason),
+            escape_html(&describe_submission(result))
+        ),
+    })
+}
+
+/// One line describing where a submission ended up.
+#[cfg(feature = "sniper")]
+fn describe_submission(r: &crate::sniper::SubmitOutcome) -> String {
+    use crate::sniper::SubmitOutcome;
+    match r {
+        SubmitOutcome::Executed { reference, slot } => match slot {
+            Some(s) => format!("confirmed in slot {s} · {reference}"),
+            None => format!("confirmed · {reference}"),
+        },
+        SubmitOutcome::NotExecuted { reason } => format!("not executed: {reason}"),
+        SubmitOutcome::Indeterminate { reason, reference } => {
+            // The reference is the only way to check what actually happened, so
+            // it belongs in the message that says we do not know.
+            format!(
+                "UNKNOWN outcome — may have landed, do NOT retry blindly: {reason} ({reference})"
+            )
+        }
+    }
+}

@@ -47,6 +47,14 @@ pub struct TrackedWallet {
     pub address: String,
     /// Display name, already sanitized for Telegram.
     pub name: String,
+    /// Cohorts this wallet belongs to, e.g. `Main`, `jup:influencer`.
+    ///
+    /// Read from the export's `groups` field, which the loader previously
+    /// ignored. Conviction can be restricted to chosen cohorts, which is the
+    /// only way to exclude a group like `jup:topPnl` — full of launch bundlers
+    /// whose entries are unreachable — without deleting the wallets and losing
+    /// the data they generate.
+    pub groups: Vec<String>,
 }
 
 /// The tracker-export format (Axiom/Photon style). Only two fields are read;
@@ -58,6 +66,8 @@ struct ExportedWallet {
     address: String,
     #[serde(default)]
     name: String,
+    #[serde(default)]
+    groups: Vec<String>,
 }
 
 /// Address -> wallet. Lookup is per transaction on a hot path, so it is a map.
@@ -87,13 +97,42 @@ impl WalletBook {
                 continue;
             }
             let name = sanitize_name(&w.name, &addr);
-            by_address.insert(addr.clone(), TrackedWallet { address: addr, name });
+            by_address
+                .insert(addr.clone(), TrackedWallet { address: addr, name, groups: w.groups });
         }
         Ok(Self { by_address })
     }
 
     pub fn len(&self) -> usize {
         self.by_address.len()
+    }
+
+    /// Does this wallet belong to any of `allowed`?
+    ///
+    /// An EMPTY allow-list means every wallet counts — the filter is opt-in, so
+    /// a missing or mistyped config cannot silently narrow the signal to
+    /// nothing and leave the bot looking healthy while it ignores every buy.
+    pub fn in_groups(&self, address: &str, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        self.by_address
+            .get(address)
+            .map(|w| w.groups.iter().any(|g| allowed.iter().any(|a| a == g)))
+            .unwrap_or(false)
+    }
+
+    /// How many wallets fall in `allowed`. For startup logging: an operator who
+    /// mistypes a cohort should see it immediately, not wonder why nothing
+    /// calls.
+    pub fn count_in_groups(&self, allowed: &[String]) -> usize {
+        if allowed.is_empty() {
+            return self.by_address.len();
+        }
+        self.by_address
+            .values()
+            .filter(|w| w.groups.iter().any(|g| allowed.iter().any(|a| a == g)))
+            .count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -375,6 +414,57 @@ mod tests {
     use super::*;
 
     const ADDR: &str = "5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW";
+
+
+    /// The cohort gate decides what the bot BUYS. Alerts are unaffected — that
+    /// separation is the whole point of filtering here rather than at
+    /// detection.
+    #[test]
+    fn cohort_membership_gates_by_group() {
+        let json = r#"[
+            {"trackedWalletAddress":"5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW","name":"a","groups":["Main"]},
+            {"trackedWalletAddress":"CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o","name":"b","groups":["jup:influencer"]},
+            {"trackedWalletAddress":"5cjcW9wExnJJRTFzo7X1eBpXFHhpFYPKcCum武","name":"bad","groups":["jup:topPnl"]},
+            {"trackedWalletAddress":"DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX","name":"c","groups":["jup:topPnl"]},
+            {"trackedWalletAddress":"FBRjXds5PVUFxAEfdKGjKSpGbYmS8z5Qbdsoqk3q6SUM","name":"d"}
+        ]"#;
+        let book = WalletBook::from_export_json(json).unwrap();
+        let allow = vec!["Main".to_string(), "jup:influencer".to_string()];
+
+        assert!(book.in_groups("5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW", &allow));
+        assert!(book.in_groups("CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o", &allow));
+        assert!(!book.in_groups("DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX", &allow),
+                "topPnl must not count toward a buy");
+        assert!(!book.in_groups("FBRjXds5PVUFxAEfdKGjKSpGbYmS8z5Qbdsoqk3q6SUM", &allow),
+                "an ungrouped wallet is not in an allow-list");
+        assert!(!book.in_groups("NOT_A_TRACKED_WALLET", &allow));
+        assert_eq!(book.count_in_groups(&allow), 2);
+    }
+
+    /// An EMPTY allow-list means everything counts. A missing or mistyped
+    /// config must not silently narrow trading to nothing while the bot looks
+    /// perfectly healthy.
+    #[test]
+    fn an_empty_allow_list_admits_every_wallet() {
+        let json = r#"[
+            {"trackedWalletAddress":"5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW","name":"a","groups":["Main"]},
+            {"trackedWalletAddress":"FBRjXds5PVUFxAEfdKGjKSpGbYmS8z5Qbdsoqk3q6SUM","name":"d"}
+        ]"#;
+        let book = WalletBook::from_export_json(json).unwrap();
+        assert!(book.in_groups("5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW", &[]));
+        assert!(book.in_groups("FBRjXds5PVUFxAEfdKGjKSpGbYmS8z5Qbdsoqk3q6SUM", &[]));
+        assert_eq!(book.count_in_groups(&[]), 2);
+    }
+
+    /// Exports written before cohorts existed have no `groups` at all and must
+    /// still load.
+    #[test]
+    fn an_export_without_groups_still_loads() {
+        let json = r#"[{"trackedWalletAddress":"5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW","name":"a"}]"#;
+        let book = WalletBook::from_export_json(json).unwrap();
+        assert_eq!(book.len(), 1);
+        assert!(book.get("5R4RJojpoKNwBcJNgVYGtwXdmhyEHWXGDBQqUnSpLfcW").unwrap().groups.is_empty());
+    }
 
     #[test]
     fn parses_tracker_export() {

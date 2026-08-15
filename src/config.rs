@@ -53,6 +53,25 @@ pub struct TrackedConfig {
     /// which defeats the purpose; the tracker clamps it.
     #[serde(default = "default_conviction_threshold")]
     pub conviction_threshold: usize,
+    /// Buy automatically when enough tracked wallets converge on a token.
+    ///
+    /// Separate from alerting on purpose. Alerts stay wide — every cohort, so
+    /// the scoring dataset keeps growing — while trading starts narrow.
+    #[serde(default)]
+    pub auto_buy: bool,
+    /// Cohorts whose buys count toward an AUTO-BUY. Empty = all of them.
+    ///
+    /// Excluded on evidence: `jup:topPnl` is full of launch bundlers whose
+    /// entries sit inside creation bundles and cannot be followed, and
+    /// `jup:whale` moved 4555 times for a 1.02x with one rug — it does not
+    /// trade this market. Both still alert and still generate scoring data.
+    #[serde(default)]
+    pub auto_buy_groups: Vec<String>,
+    /// Distinct wallets FROM THOSE COHORTS required before buying. Deliberately
+    /// higher than the alert threshold: an alert costs a notification, a buy
+    /// costs money.
+    #[serde(default = "default_auto_buy_min")]
+    pub auto_buy_min_wallets: usize,
     #[serde(default = "default_conviction_window")]
     pub window_secs: u64,
     /// Minimum SOL a wallet must spend for the buy to count. Every signer pays
@@ -180,6 +199,7 @@ fn default_update_multiples() -> Vec<f64> {
     ]
 }
 
+fn default_auto_buy_min() -> usize { 4 }
 fn default_conviction_threshold() -> usize {
     3
 }
@@ -199,6 +219,9 @@ impl Default for TrackedConfig {
             enabled: false,
             wallets_path: String::new(),
             conviction_threshold: default_conviction_threshold(),
+            auto_buy: false,
+            auto_buy_groups: Vec::new(),
+            auto_buy_min_wallets: default_auto_buy_min(),
             window_secs: default_conviction_window(),
             min_buy_sol: default_min_buy_sol(),
             log_all_buys: true,

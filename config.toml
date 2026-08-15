@@ -258,6 +258,22 @@ wallets_path = "tracked_wallets.json"
 # what makes a channel unreadable. Suppression lapses after `track_for_secs`, so
 # a token that goes quiet and genuinely re-accumulates can call again.
 conviction_threshold = 3
+# --- Smart-money auto-buy ---
+# Alerts are unaffected by anything below: every cohort still calls, and every
+# tracked buy is still logged for scoring. This section only decides what the
+# bot BUYS.
+auto_buy = false
+# Cohorts whose buys count toward an auto-buy. Empty = all of them.
+#
+# Excluded on evidence, not preference:
+#   jup:topPnl  — launch bundlers. Four of its wallets bought USON inside the
+#                 creation bundle at $4,493 FDV; the first price anyone else
+#                 could pay was $351,705. Their entry cannot be followed.
+#   jup:whale   — 4555 buys for a 1.02x with one rug. Not this market.
+auto_buy_groups = ["Main", "jup:influencer"]
+# Distinct wallets FROM THOSE COHORTS before buying. Higher than the alert
+# threshold on purpose: an alert costs a notification, a buy costs money.
+auto_buy_min_wallets = 4
 window_secs = 600
 # Minimum SOL a wallet must spend for a buy to count. Not 0: every signer pays
 # a transaction fee, so zero would count any tracked wallet that merely signed

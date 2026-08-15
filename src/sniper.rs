@@ -157,6 +157,18 @@ pub enum Execution {
 /// the sniper reacting to a detected pool.
 #[cfg(feature = "sniper")]
 #[derive(Debug, Clone)]
+pub enum BuyOutcome {
+    /// Refused before any network call (halted, capped, no identity).
+    Refused { reason: String },
+    /// Something failed while quoting or building the swap.
+    Failed { mint: String, reason: String },
+    /// Dry run: quoted and simulated, nothing signed.
+    Rehearsed { mint: String, sol_in: f64, tokens_out: f64, would_succeed: bool },
+    /// Armed: submitted.
+    Submitted { mint: String, sol_in: f64, tokens_out: f64, result: SubmitOutcome },
+}
+
+#[derive(Debug, Clone)]
 pub enum SellOutcome {
     /// The wallet holds none of this mint.
     NoPosition { mint: String },
@@ -769,13 +781,140 @@ impl Sniper {
         })
     }
 
+    /// Buy a token by mint, with no pool event — the smart-money entry.
+    ///
+    /// Routed through the quote API rather than a pool we decoded ourselves,
+    /// because a conviction signal gives us a MINT and nothing else: no pool,
+    /// no venue, no vaults. The asymmetry with selling is deliberate and worth
+    /// stating — if the quote API refuses an ENTRY we simply do not trade,
+    /// which costs nothing. If it refused an EXIT we would be trapped in a
+    /// position, which is why exits go direct first and fall back second.
+    ///
+    /// The consequence to accept: a position opened this way has no recorded
+    /// sell route, so its exit is quote-API-dependent until pool discovery
+    /// exists. That is the main reason to keep the size small.
+    pub async fn buy_mint(&self, mint: &str, reason: &str) -> BuyOutcome {
+        use crate::jupiter::Jupiter;
+        use crate::model::WSOL_MINT;
+
+        if !self.cfg.enabled {
+            return BuyOutcome::Refused { reason: "sniper disabled".into() };
+        }
+        if self.kill_switch_engaged() {
+            return BuyOutcome::Refused { reason: "kill switch engaged (HALT)".into() };
+        }
+        let Some(owner) = self.owner() else {
+            return BuyOutcome::Refused { reason: "no trading identity".into() };
+        };
+        let owner = owner.to_string();
+
+        let live = self.settings.snapshot();
+        let env = self.settings.envelope();
+        let size = live.trade_size_sol;
+        let max_size = live.effective_max_trade_size(&env);
+        if size <= 0.0 || (max_size > 0.0 && size > max_size) {
+            return BuyOutcome::Refused {
+                reason: format!("trade size {size} outside the {max_size} ceiling"),
+            };
+        }
+
+        // Daily limits share the same state the pool path uses, so the two
+        // entries cannot each spend a full day's budget.
+        let now = Utc::now();
+        {
+            let mut st = self.state.lock().unwrap();
+            st.roll(now);
+            let max_trades = live.effective_max_trades(&env);
+            if max_trades > 0 && st.trades >= max_trades {
+                return BuyOutcome::Refused {
+                    reason: format!("daily trade limit reached ({max_trades})"),
+                };
+            }
+            let cap = live.effective_daily_cap(&env);
+            if cap > 0.0 && st.spent + size > cap {
+                return BuyOutcome::Refused {
+                    reason: format!("daily cap reached ({:.3}/{cap} SOL)", st.spent),
+                };
+            }
+        }
+
+        let lamports = (size * 1e9) as u64;
+        let jup = Jupiter::new(&self.cfg.jupiter_base_url);
+        let quote = match jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await {
+            Ok(q) => q,
+            Err(e) => {
+                return BuyOutcome::Failed { mint: mint.into(), reason: format!("quote: {e:#}") };
+            }
+        };
+        // Raw units — the token's decimals are unknown here, and reporting a
+        // scaled figure we cannot verify would be worse than reporting none.
+        let tokens_out = quote.out_lamports().unwrap_or(0) as f64;
+        let tx_b64 = match jup.swap_tx(&quote, &owner).await {
+            Ok(t) => t,
+            Err(e) => {
+                return BuyOutcome::Failed {
+                    mint: mint.into(),
+                    reason: format!("build swap: {e:#}"),
+                };
+            }
+        };
+
+        match &self.mode {
+            Mode::DryRun { .. } => {
+                let would_succeed = match self.rpc.simulate_transaction(&tx_b64).await {
+                    Some(v) => v.get("err").map(|e| e.is_null()).unwrap_or(false),
+                    None => false,
+                };
+                info!(%mint, size, tokens_out, would_succeed, %reason,
+                      "sniper: DRY RUN SMART BUY (nothing signed)");
+                self.audit_smart_buy(&owner, mint, size, reason,
+                    if would_succeed { "would-succeed" } else { "would-FAIL" }).await;
+                BuyOutcome::Rehearsed { mint: mint.into(), sol_in: size, tokens_out, would_succeed }
+            }
+            Mode::Armed(cap) => {
+                warn!(%mint, size, tokens_out, %reason, "sniper: SUBMITTING REAL SMART BUY");
+                // Reserved BEFORE submitting. Reserving after a confirmation
+                // would let a burst of signals each pass the cap check while
+                // the first is still in flight.
+                self.reserve(mint, size, now);
+                let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
+                let (outcome, result) = classify_submission(res);
+                self.audit_smart_buy(&owner, mint, size, reason, &outcome).await;
+                BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
+            }
+        }
+    }
+
+    async fn audit_smart_buy(&self, owner: &str, mint: &str, sol: f64, reason: &str, outcome: &str) {
+        if self.cfg.audit_log.is_empty() {
+            return;
+        }
+        let record = serde_json::json!({
+            "ts": Utc::now().to_rfc3339(),
+            "action": "smart_buy",
+            "owner": owner,
+            "mint": mint,
+            "sol": sol,
+            "reason": reason,
+            "outcome": outcome,
+            "mode": match self.mode { Mode::Armed(_) => "armed", Mode::DryRun { .. } => "dry_run" },
+        });
+        if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
+            warn!(error = %e, "failed to write smart buy audit");
+        }
+    }
+
     /// One pass of the exit policy over every position the bot opened.
     ///
     /// Returns (considered, sold). Deliberately sequential and one action per
     /// position per pass: selling is the irreversible half of trading, and a
     /// burst of concurrent sells on a bad price tick is exactly the failure
     /// this is meant to prevent rather than cause.
-    pub async fn sweep_exits(&self, state: &Arc<crate::exits::ExitStateStore>) -> (usize, usize) {
+    pub async fn sweep_exits(
+        &self,
+        state: &Arc<crate::exits::ExitStateStore>,
+        alerter: &crate::alerts::Alerter,
+    ) -> (usize, usize) {
         let rules = self.settings.snapshot().exits;
         if !rules.enabled || self.kill_switch_engaged() {
             return (0, 0);
@@ -831,6 +970,12 @@ impl Sniper {
                 );
                 let outcome = self.sell(&mint, pct_now).await;
                 info!(%mint, ?outcome, "auto-sell result");
+                // Announced whether it worked or not: an operator must be able
+                // to tell "the ladder never fired" from "it fired and failed".
+                if let Some(msg) = crate::alerts::render_auto_sell(&mint, pct_now, &reason, &outcome)
+                {
+                    alerter.send_html(msg).await;
+                }
                 sold += 1;
             }
         }
