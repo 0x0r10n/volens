@@ -410,6 +410,8 @@ pub struct Sniper {
     #[cfg(feature = "sniper")]
     /// Live settings, persisted. Snapshotted once per decision.
     settings: Arc<crate::settings::SettingsStore>,
+    /// How to sell each position, captured at buy time. See `crate::routes`.
+    routes: Arc<crate::routes::RouteStore>,
     rpc: Arc<RpcClient>,
     /// Stream-derived prices. Replaces the external quote API that was
     /// IP-blocked, and which — while the market-cap gate still failed open —
@@ -516,6 +518,7 @@ impl Sniper {
             envelope,
             defaults,
         ));
+        let routes_path = cfg.sell_routes_path.clone();
         let live = settings.snapshot();
         info!(
             trade_size_sol = live.trade_size_sol,
@@ -532,6 +535,7 @@ impl Sniper {
             prices,
             state: Mutex::new(DailyState::default()),
             settings,
+            routes: Arc::new(crate::routes::RouteStore::load(&routes_path)),
             rpc,
             submitter,
             jito,
@@ -989,6 +993,12 @@ impl Sniper {
             }
         };
 
+        // Record the exit BEFORE anything is submitted. Written here rather
+        // than after a confirmed fill because a crash between submit and
+        // confirm would otherwise leave a position on chain with no recorded
+        // way out — and PumpSwap's `pool_v2` cannot be recovered afterwards.
+        self.routes.remember(ev);
+
         // A buy that moves the pool this much is buying its own bad fill.
         if exec.quote.price_impact_bps > self.cfg.max_price_impact_bps {
             let d = Denial::PriceImpactTooHigh {
@@ -1193,6 +1203,21 @@ impl Sniper {
             return SellOutcome::Refused { reason: "computed sell amount is zero".into() };
         }
 
+        // Direct first. Jupiter is the fallback, not the plan: it has
+        // IP-blocked this box repeatedly, and an exit that only works while a
+        // third party tolerates us is not an exit. Falling back is still right
+        // for venues we cannot encode and for tokens we did not buy ourselves.
+        if let Some(route) = self.routes.get(mint) {
+            match self.sell_direct(&route, &owner, mint, pct, amount).await {
+                Ok(outcome) => return outcome,
+                Err(e) => warn!(
+                    %mint,
+                    error = %format!("{e:#}"),
+                    "direct sell unavailable; falling back to the quote API"
+                ),
+            }
+        }
+
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let quote = match jup.quote(mint, WSOL_MINT, amount, self.cfg.sell_slippage_bps).await {
             Ok(q) => q,
@@ -1239,6 +1264,65 @@ impl Sniper {
                 SellOutcome::Submitted { mint: mint.to_string(), pct, sol_out, result }
             }
         }
+    }
+
+    /// Sell through the pool we bought from, with no third party involved.
+    ///
+    /// Returns `Err` when this venue or route cannot be encoded, so the caller
+    /// can fall back rather than leaving the operator holding a position. An
+    /// error here is "we could not build it", never "the sell failed" — a
+    /// submitted-and-failed sell returns `Ok(SellOutcome::Failed)` so it is
+    /// audited once and not retried down a second path.
+    #[cfg(feature = "sniper")]
+    async fn sell_direct(
+        &self,
+        route: &PoolEvent,
+        owner: &str,
+        mint: &str,
+        pct: u8,
+        amount: u64,
+    ) -> Result<SellOutcome> {
+        let owner_pk = crate::tx::pk(owner)?;
+        let plan = crate::execute::build_sell(
+            &self.rpc,
+            route,
+            &owner_pk,
+            amount,
+            self.cfg.sell_slippage_bps,
+            self.cfg.compute_unit_limit,
+            self.cfg.priority_fee_micro_lamports,
+        )
+        .await?;
+
+        let sol_out = plan.quote.expected_out as f64 / 1e9;
+        let venue = plan.venue.label();
+
+        Ok(match &self.mode {
+            Mode::DryRun { .. } => {
+                info!(%mint, pct, sol_out, venue, "sniper: DRY RUN DIRECT SELL (nothing signed)");
+                self.audit_sell(owner, mint, pct, sol_out, "would-succeed:direct").await;
+                SellOutcome::Rehearsed {
+                    mint: mint.to_string(),
+                    pct,
+                    sol_out,
+                    // Impact is already priced into `minimum_out` by the quote;
+                    // reporting a separate figure we did not compute would be
+                    // inventing one.
+                    impact_pct: 0.0,
+                    would_succeed: true,
+                }
+            }
+            Mode::Armed(cap) => {
+                warn!(%mint, pct, sol_out, venue, "sniper: SUBMITTING REAL DIRECT SELL");
+                let res = self
+                    .submitter
+                    .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
+                    .await;
+                let (outcome, result) = classify_submission(res);
+                self.audit_sell(owner, mint, pct, sol_out, &format!("{outcome}:direct")).await;
+                SellOutcome::Submitted { mint: mint.to_string(), pct, sol_out, result }
+            }
+        })
     }
 
     /// SOL price in USD, from the stream-derived index.
@@ -1607,8 +1691,9 @@ mod tests {
             // Off in tests: the gate needs live RPC + Jupiter, and existing
             // cases assert on the other guards. Covered by its own pure test.
             max_market_cap_usd: 0.0,
-            // Tests must never touch a real settings file.
+            // Tests must never touch a real settings or routes file.
             settings_path: String::new(),
+            sell_routes_path: String::new(),
             jupiter_base_url: "https://lite-api.jup.ag/swap/v1".into(),
             sell_slippage_bps: 500,
         }

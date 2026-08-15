@@ -373,6 +373,14 @@ pub struct SniperConfig {
     /// Append-only log of every decision, allowed or denied.
     #[serde(default = "default_audit_log")]
     pub audit_log: String,
+    /// Where sell routes are recorded, one JSON line per position entered.
+    ///
+    /// Written at BUY time because some accounts cannot be recovered later —
+    /// PumpSwap's `pool_v2` exists only in the pool's creation transaction. A
+    /// position with no route here can still be sold, but only via the quote
+    /// API, which has blocked this host before.
+    #[serde(default = "default_routes_path")]
+    pub sell_routes_path: String,
     /// Where live settings changed from Telegram are persisted.
     ///
     /// These are working values INSIDE the ceilings set here; the file can
@@ -595,6 +603,7 @@ fn default_snipe_mode() -> String { "open".to_string() }
 fn default_export_ttl() -> u64 { 60 }
 fn default_max_mcap() -> f64 { 50_000.0 }
 fn default_settings_path() -> String { "settings.json".to_string() }
+fn default_routes_path() -> String { "sell_routes.jsonl".to_string() }
 fn default_recheck_interval() -> u64 { 120 }
 fn default_max_watch() -> u64 { 600 }
 fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
@@ -682,6 +691,7 @@ impl Default for SniperConfig {
             kill_switch_file: default_kill_switch(),
             audit_log: default_audit_log(),
             settings_path: default_settings_path(),
+            sell_routes_path: default_routes_path(),
             keypair_path: String::new(),
             simulate_as: String::new(),
             max_price_impact_bps: default_max_impact(),

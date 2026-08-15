@@ -28,6 +28,8 @@ mod positions;
 mod prices;
 #[cfg(feature = "sniper")]
 mod quote;
+#[cfg(feature = "sniper")]
+mod routes;
 mod rpc;
 #[cfg(feature = "sniper")]
 mod sniper;

@@ -242,31 +242,25 @@ async fn build_v4(
     Ok(ExecutionPlan { instructions, quote: q, venue: Dex::RaydiumV4 })
 }
 
-/// Build a PumpSwap buy.
+/// Everything a PumpSwap swap needs, in either direction.
 ///
-/// Passes the three `remaining_accounts` the DEPLOYED program requires but its
-/// published IDL never documents: `[pool_v2, fee_recipient, fee_recipient_ata]`.
-/// `pool_v2` is captured at detection (see `parser::find_pumpswap_pool_v2`);
-/// without it the program rejects the swap with `InvalidPoolV2` (6062).
-///
-/// Which instruction acquires the token depends on ORIENTATION:
-///   * token is the pool's BASE  -> `buy`  (exact-out: name the tokens wanted,
-///     cap the SOL spent)
-///   * token is the pool's QUOTE -> `sell` (exact-in: spend WSOL as the base
-///     side, require a minimum of the token back)
-///
-/// Getting this backwards would trade the wrong direction entirely.
-#[allow(clippy::too_many_arguments)]
-async fn build_pumpswap(
-    rpc: &RpcClient,
-    event: &PoolEvent,
-    owner: &Pubkey,
-    token_mint: Pubkey,
-    lamports_in: u64,
-    slippage_bps: u16,
-    unit_limit: u32,
-    priority_fee: u64,
-) -> Result<ExecutionPlan> {
+/// Shared by the buy and sell paths deliberately: the fee source, the
+/// Token-2022 program lookup and the three undocumented trailing accounts were
+/// each established by experiment against the deployed program, and two copies
+/// of that would drift.
+#[cfg(feature = "sniper")]
+struct PumpSwapCtx {
+    pool: PumpSwapPool,
+    accounts: PumpSwapSwapAccounts,
+    remaining: Vec<solana_instruction::AccountMeta>,
+    fee: crate::quote::FeeRate,
+    base_bal: u64,
+    quote_bal: u64,
+    base_token_program: Pubkey,
+    quote_token_program: Pubkey,
+}
+
+async fn pumpswap_ctx(rpc: &RpcClient, event: &PoolEvent, owner: &Pubkey) -> Result<PumpSwapCtx> {
     // Check the one prerequisite we cannot recover before doing any network
     // work: `pool_v2` is only observable in the pool's creation transaction, so
     // if it was not captured then no amount of fetching will help.
@@ -350,6 +344,47 @@ async fn build_pumpswap(
             false,
         ),
     ];
+
+    Ok(PumpSwapCtx {
+        pool,
+        accounts,
+        remaining,
+        fee,
+        base_bal,
+        quote_bal,
+        base_token_program,
+        quote_token_program,
+    })
+}
+
+/// Build a PumpSwap buy.
+///
+/// Passes the three `remaining_accounts` the DEPLOYED program requires but its
+/// published IDL never documents: `[pool_v2, fee_recipient, fee_recipient_ata]`.
+/// `pool_v2` is captured at detection (see `parser::find_pumpswap_pool_v2`);
+/// without it the program rejects the swap with `InvalidPoolV2` (6062).
+///
+/// Which instruction acquires the token depends on ORIENTATION:
+///   * token is the pool's BASE  -> `buy`  (exact-out: name the tokens wanted,
+///     cap the SOL spent)
+///   * token is the pool's QUOTE -> `sell` (exact-in: spend WSOL as the base
+///     side, require a minimum of the token back)
+///
+/// Getting this backwards would trade the wrong direction entirely.
+#[allow(clippy::too_many_arguments)]
+async fn build_pumpswap(
+    rpc: &RpcClient,
+    event: &PoolEvent,
+    owner: &Pubkey,
+    token_mint: Pubkey,
+    lamports_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    let ctx = pumpswap_ctx(rpc, event, owner).await?;
+    let PumpSwapCtx { pool, accounts, remaining, fee, base_bal, quote_bal,
+                      base_token_program, quote_token_program } = ctx;
 
     let (swap_ix, q) = if pool.base_mint == token_mint && pool.quote_mint == WSOL {
         // Spend WSOL (quote) to receive the token (base): `buy`.
@@ -611,4 +646,329 @@ mod tests {
             "the swap must actually execute"
         );
     }
+}
+
+#[cfg(test)]
+mod sell_tests {
+    use super::*;
+    use crate::model::{Dex, SwapAccounts};
+
+    /// A real mint address: `build_sell` parses the mint before any venue
+    /// check, so a placeholder would fail for the wrong reason.
+    const TOKEN: &str = "AByynfTALEVQFkE3i52oiSbJNDV61PzrXMNffX4pump";
+
+    fn route(dex: Dex) -> PoolEvent {
+        PoolEvent {
+            dex,
+            pool: "POOL".into(),
+            base_mint: TOKEN.into(),
+            quote_mint: crate::model::WSOL_MINT.into(),
+            new_token_mint: Some(TOKEN.into()),
+            quote_asset: Some(crate::model::WSOL_MINT.into()),
+            quote_asset_vault: None,
+            quote_liquidity: Some(20.0),
+            mint_authority_revoked: Some(true),
+            freeze_authority_revoked: Some(true),
+            risky_extensions: Vec::new(),
+            lp_mint: None,
+            base_vault: Some("BASEV".into()),
+            quote_vault: Some("QUOTEV".into()),
+            swap_accounts: SwapAccounts::default(),
+            lp_supply_at_detection: None,
+            token_name: None,
+            token_symbol: None,
+            signature: "SIG".into(),
+            slot: 1,
+            detected_at: chrono::Utc::now(),
+        }
+    }
+
+    fn rpc() -> RpcClient {
+        RpcClient::new(&crate::config::RpcConfig::default())
+    }
+
+    /// A venue with no verified encoder must refuse rather than approximate.
+    /// The caller then falls back — which is right for a venue we cannot build,
+    /// where a guessed `minimum_out` would spend real money on a wrong number.
+    #[tokio::test]
+    async fn detection_only_venues_refuse_to_build_a_sell() {
+        for dex in [Dex::MeteoraDammV2, Dex::MeteoraDlmm, Dex::MeteoraDbc] {
+            let e = build_sell(&rpc(), &route(dex), &Pubkey::new_unique(), 1_000, 300, 200_000, 0)
+                .await
+                .expect_err("must refuse");
+            assert!(
+                format!("{e:#}").contains("detection-only"),
+                "expected a detection-only refusal, got: {e:#}"
+            );
+        }
+    }
+
+    /// The refusal must happen before any network work: `pool_v2` exists only
+    /// in the pool's creation transaction, so no amount of fetching recovers it.
+    #[tokio::test]
+    async fn a_pumpswap_route_without_pool_v2_refuses_early() {
+        let e = build_sell(&rpc(), &route(Dex::PumpSwap), &Pubkey::new_unique(), 1_000, 300, 200_000, 0)
+            .await
+            .expect_err("must refuse without pool_v2");
+        assert!(format!("{e:#}").contains("pool_v2"), "got: {e:#}");
+    }
+
+    /// Selling nothing is a caller bug, not a trade.
+    #[tokio::test]
+    async fn selling_zero_is_refused() {
+        let e = build_sell(&rpc(), &route(Dex::RaydiumV4), &Pubkey::new_unique(), 0, 300, 200_000, 0)
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{e:#}").contains("nothing to sell"), "got: {e:#}");
+    }
+
+    /// We can only pay out in SOL from a WSOL-quoted pool.
+    #[tokio::test]
+    async fn a_non_wsol_pool_cannot_be_sold_for_sol() {
+        let mut r = route(Dex::RaydiumV4);
+        r.quote_asset = Some("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".into());
+        let e = build_sell(&rpc(), &r, &Pubkey::new_unique(), 1_000, 300, 200_000, 0)
+            .await
+            .expect_err("must refuse");
+        assert!(format!("{e:#}").contains("WSOL-quoted"), "got: {e:#}");
+    }
+}
+
+/// Build a "sell the held token back to SOL" transaction for a known pool.
+///
+/// The mirror of [`build_buy`]: same freshly-read state, same verified
+/// encoders, direction reversed. `token_amount_in` is in RAW token units.
+///
+/// This exists so an exit does not depend on a third-party quote API. Jupiter
+/// has IP-blocked this box repeatedly; a stop-loss that routes through it would
+/// fail exactly when it is needed, and be trusted while doing so.
+///
+/// Refuses rather than approximating, for the same reason `build_buy` does —
+/// the caller falls back to Jupiter, which is the right answer for a venue we
+/// cannot encode, but a wrong `minimum_out` is not.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_sell(
+    rpc: &RpcClient,
+    event: &PoolEvent,
+    owner: &Pubkey,
+    token_amount_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    if token_amount_in == 0 {
+        bail!("nothing to sell");
+    }
+    let token_mint_str = event
+        .new_token_mint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("route has no token mint"))?;
+    let token_mint = tx::pk(token_mint_str)?;
+    if event.quote_asset.as_deref() != Some(crate::model::WSOL_MINT) {
+        bail!("only WSOL-quoted pools can be sold for SOL");
+    }
+
+    match event.dex {
+        Dex::RaydiumCpmm => {
+            sell_cpmm(rpc, event, owner, token_mint, token_amount_in, slippage_bps, unit_limit, priority_fee).await
+        }
+        Dex::RaydiumV4 => {
+            sell_v4(rpc, event, owner, token_mint, token_amount_in, slippage_bps, unit_limit, priority_fee).await
+        }
+        Dex::PumpSwap => {
+            sell_pumpswap(rpc, event, owner, token_mint, token_amount_in, slippage_bps, unit_limit, priority_fee).await
+        }
+        dex @ (Dex::MeteoraDammV2 | Dex::MeteoraDlmm | Dex::MeteoraDbc) => {
+            bail!("{} is detection-only — no verified sell encoder", dex.label())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sell_cpmm(
+    rpc: &RpcClient,
+    event: &PoolEvent,
+    owner: &Pubkey,
+    token_mint: Pubkey,
+    amount_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    let pool_addr = &event.pool;
+    let observation = event
+        .swap_accounts
+        .observation
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("cpmm pool has no observation account recorded"))?;
+
+    let raw = rpc
+        .account_data(pool_addr)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("could not read cpmm pool {pool_addr}"))?;
+    let pool = CpmmPoolState::decode(&raw).context("decoding cpmm pool")?;
+    let cfg_raw = rpc
+        .account_data(&pool.amm_config.to_string())
+        .await
+        .ok_or_else(|| anyhow::anyhow!("could not read amm_config"))?;
+    let cfg = CpmmAmmConfig::decode(&cfg_raw).context("decoding amm_config")?;
+
+    // Selling: the INPUT side is now the token, not WSOL. Getting this the
+    // wrong way round would quote against the wrong reserve and set a
+    // `minimum_out` that either reverts or protects nothing.
+    let input_is_token_0 = pool.token_0_mint == token_mint;
+    if !input_is_token_0 && pool.token_1_mint != token_mint {
+        bail!("cpmm pool does not hold this token");
+    }
+
+    let b0 = rpc.vault_balance_raw(&pool.token_0_vault.to_string()).await
+        .ok_or_else(|| anyhow::anyhow!("could not read vault 0"))?;
+    let b1 = rpc.vault_balance_raw(&pool.token_1_vault.to_string()).await
+        .ok_or_else(|| anyhow::anyhow!("could not read vault 1"))?;
+
+    let reserves = pool.reserves(b0, b1, input_is_token_0);
+    let q = quote::quote(reserves, amount_in, cfg.fee(), slippage_bps)
+        .context("quoting cpmm sell")?;
+
+    let (input_vault, output_vault) = if input_is_token_0 {
+        (pool.token_0_vault, pool.token_1_vault)
+    } else {
+        (pool.token_1_vault, pool.token_0_vault)
+    };
+
+    let accounts = CpmmSwapAccounts {
+        payer: *owner,
+        amm_config: pool.amm_config,
+        pool_state: tx::pk(pool_addr)?,
+        user_input_ata: tx::ata(owner, &token_mint),
+        user_output_ata: tx::ata(owner, &WSOL),
+        input_vault,
+        output_vault,
+        input_mint: token_mint,
+        output_mint: WSOL,
+        observation_state: tx::pk(observation)?,
+    };
+
+    let mut instructions = tx::compute_budget(unit_limit, priority_fee);
+    // The WSOL account must exist to receive, and is closed afterwards so the
+    // proceeds land as native SOL rather than sitting wrapped.
+    instructions.push(tx::ensure_token_ata(owner, &WSOL));
+    instructions.push(tx::cpmm_swap_base_input(&accounts, amount_in, q.minimum_out));
+    instructions.push(tx::unwrap_sol(owner)?);
+    Ok(ExecutionPlan { instructions, quote: q, venue: Dex::RaydiumCpmm })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sell_v4(
+    rpc: &RpcClient,
+    event: &PoolEvent,
+    owner: &Pubkey,
+    token_mint: Pubkey,
+    amount_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    let sa = &event.swap_accounts;
+    let open_orders = sa.open_orders.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("v4 route has no open_orders recorded"))?;
+    let market_addr = sa.market.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("v4 route has no market recorded"))?;
+
+    let raw = rpc.account_data(market_addr).await
+        .ok_or_else(|| anyhow::anyhow!("could not read openbook market {market_addr}"))?;
+    let market_state = OpenBookMarket::decode(&raw).context("decoding openbook market")?;
+
+    let coin_vault = tx::pk(&event.base_vault_or_err()?)?;
+    let pc_vault = tx::pk(&event.quote_vault_or_err()?)?;
+    let coin_bal = rpc.vault_balance_raw(&coin_vault.to_string()).await
+        .ok_or_else(|| anyhow::anyhow!("could not read coin vault"))?;
+    let pc_bal = rpc.vault_balance_raw(&pc_vault.to_string()).await
+        .ok_or_else(|| anyhow::anyhow!("could not read pc vault"))?;
+
+    // Selling the token: the input reserve is the TOKEN side, the mirror of the
+    // buy path where it is the WSOL side.
+    let coin_is_wsol = event.base_mint == crate::model::WSOL_MINT;
+    let reserves = if coin_is_wsol {
+        Reserves { input: pc_bal, output: coin_bal }
+    } else {
+        Reserves { input: coin_bal, output: pc_bal }
+    };
+
+    let q = quote::quote(reserves, amount_in, quote::V4_FEE, slippage_bps)
+        .context("quoting v4 sell")?;
+
+    // Direction on v4 is expressed ONLY through source/destination, so the same
+    // encoder serves both ways round.
+    let accounts = V4SwapAccounts {
+        amm: tx::pk(&event.pool)?,
+        amm_open_orders: tx::pk(open_orders)?,
+        amm_target_orders: None,
+        pool_coin_vault: coin_vault,
+        pool_pc_vault: pc_vault,
+        market: tx::pk(market_addr)?,
+        market_state,
+        user_source: tx::ata(owner, &token_mint),
+        user_destination: tx::ata(owner, &WSOL),
+        user_owner: *owner,
+    };
+
+    let mut instructions = tx::compute_budget(unit_limit, priority_fee);
+    instructions.push(tx::ensure_token_ata(owner, &WSOL));
+    instructions.push(tx::v4_swap_base_in(&accounts, amount_in, q.minimum_out)?);
+    instructions.push(tx::unwrap_sol(owner)?);
+    Ok(ExecutionPlan { instructions, quote: q, venue: Dex::RaydiumV4 })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn sell_pumpswap(
+    rpc: &RpcClient,
+    event: &PoolEvent,
+    owner: &Pubkey,
+    token_mint: Pubkey,
+    amount_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    let PumpSwapCtx { pool, accounts, remaining, fee, base_bal, quote_bal, .. } =
+        pumpswap_ctx(rpc, event, owner).await?;
+
+    // The mirror of the buy path's orientation check. Which instruction SELLS
+    // depends on which side the token sits on, and getting it backwards would
+    // trade the wrong direction entirely.
+    let (swap_ix, q) = if pool.base_mint == token_mint && pool.quote_mint == WSOL {
+        // Token is base, WSOL is quote: spend the token, receive WSOL — `sell`.
+        let q = quote::quote(
+            Reserves { input: base_bal, output: quote_bal },
+            amount_in,
+            fee,
+            slippage_bps,
+        )?;
+        (tx::pumpswap_sell_with_remaining(&accounts, amount_in, q.minimum_out, &remaining), q)
+    } else if pool.quote_mint == token_mint && pool.base_mint == WSOL {
+        // WSOL is base, so disposing of the quote token is a `buy`: name the
+        // WSOL wanted, cap the tokens spent.
+        let q = quote::quote(
+            Reserves { input: quote_bal, output: base_bal },
+            amount_in,
+            fee,
+            slippage_bps,
+        )?;
+        (tx::pumpswap_buy_with_remaining(&accounts, q.minimum_out, amount_in, false, &remaining), q)
+    } else {
+        bail!(
+            "pumpswap pool is not a WSOL/{token_mint} pair (base={}, quote={})",
+            pool.base_mint,
+            pool.quote_mint
+        );
+    };
+
+    let mut instructions = tx::compute_budget(unit_limit, priority_fee);
+    // Receive into WSOL, then close the account so the proceeds land as native
+    // SOL rather than sitting wrapped in an ATA the operator has to notice.
+    instructions.push(tx::ensure_token_ata(owner, &WSOL));
+    instructions.push(swap_ix);
+    instructions.push(tx::unwrap_sol(owner)?);
+    Ok(ExecutionPlan { instructions, quote: q, venue: Dex::PumpSwap })
 }

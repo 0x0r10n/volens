@@ -411,6 +411,13 @@ audit_log = "sniper_audit.jsonl"
 # This file can only ever TIGHTEN the limits set in this section — it is
 # re-clamped to them on load, so hand-editing it cannot widen a ceiling.
 settings_path = "settings.json"
+# How to sell each position, recorded when the buy is built.
+#
+# Written at BUY time on purpose: PumpSwap's `pool_v2` account is only ever
+# observable in the pool's creation transaction and cannot be derived, so a
+# position whose route was not captured can never be sold DIRECTLY — only via
+# the quote API, which has IP-blocked this host before.
+sell_routes_path = "sell_routes.jsonl"
 
 # Keypair file (Solana CLI JSON array). REQUIRED to arm.
 # Use a DEDICATED wallet, never your main one.
