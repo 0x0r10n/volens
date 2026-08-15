@@ -625,6 +625,10 @@ impl Bot {
             return Some(self.ask_screen(chat_id, field));
         }
         #[cfg(feature = "sniper")]
+        if data == "set:autobuy" {
+            return Some(self.autobuy_screen());
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:exits" {
             return Some(self.exits_screen());
         }
@@ -1344,6 +1348,15 @@ impl Bot {
                 {"text": format!("💧 Min liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
                 {"text": format!("🎚 TP / SL · {}", crate::exits::describe(&live.exits)), "callback_data": "set:exits"},
             ]));
+            let env = sniper.envelope();
+            let ab = if live.auto_buy_active(&env) {
+                format!("on · {} wallets", live.effective_auto_buy_min(&env))
+            } else {
+                "off".to_string()
+            };
+            rows.push(serde_json::json!([
+                {"text": format!("🤖 Auto-buy · {ab}"), "callback_data": "set:autobuy"}
+            ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
@@ -1443,6 +1456,58 @@ impl Bot {
         (text, kb)
     }
 
+
+
+    /// Auto-buy: the switch and the wallet threshold.
+    ///
+    /// The COHORTS are deliberately absent. Which groups of wallets are worth
+    /// following is a decision made from scoring data, on the host, not a knob
+    /// to flip mid-session — and getting it wrong quietly changes what the bot
+    /// trades rather than whether it trades.
+    #[cfg(feature = "sniper")]
+    fn autobuy_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let env = sniper.envelope();
+        let active = live.auto_buy_active(&env);
+        let need = live.effective_auto_buy_min(&env);
+
+        let text = if env.auto_buy_allowed {
+            format!(
+                "🤖 <b>Auto-buy</b>\n\nStatus: <b>{}</b>\nWallets required: <b>{need}</b>\n\n\
+                 <i>Buys when this many tracked wallets from the permitted \
+                 cohorts buy the same token inside the window. Alerts are \
+                 unaffected — they still fire on every cohort at the alert \
+                 threshold.</i>",
+                if active { "🟢 on" } else { "⚪ off" }
+            )
+        } else {
+            "🤖 <b>Auto-buy</b>\n\nStatus: <b>not permitted</b>\n\n\
+             <i>The host has not enabled it. Set <code>auto_buy = true</code> in \
+             [tracked] and restart; this screen can then switch it off and on.</i>"
+                .to_string()
+        };
+
+        let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
+            {"text": if active { "🟢 On — tap to disable" } else { "⚪ Off — tap to enable" },
+             "callback_data": "setv:autobuy_on:toggle"}
+        ])];
+        let opts: Vec<serde_json::Value> = [3usize, 4, 5, 6, 8, 10]
+            .iter()
+            .filter(|n| **n >= env.auto_buy_min_wallets)
+            .map(|n| serde_json::json!({
+                "text": format!("{}{} wallets", if *n == need { "✓ " } else { "" }, n),
+                "callback_data": format!("setv:autobuy_min:{n}"),
+            }))
+            .collect();
+        for chunk in opts.chunks(3) {
+            rows.push(serde_json::Value::Array(chunk.to_vec()));
+        }
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
 
     /// The auto-sell screen: one list of orders, plus the trailing stop.
     #[cfg(feature = "sniper")]
@@ -1571,6 +1636,8 @@ impl Bot {
         let sniper = self.sniper.as_ref()?;
         let (res, screen): (Result<String, String>, String) = match field {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
+            "autobuy_on" => (sniper.toggle_auto_buy(), "autobuy".into()),
+            "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "exits".into()),
             "delorder" => (sniper.remove_order(value.parse().ok()?), "exits".into()),
@@ -1589,6 +1656,8 @@ impl Bot {
             self.order_screen(n.parse().unwrap_or(0))
         } else if screen == "trailing" {
             self.stop_screen("trailing")
+        } else if screen == "autobuy" {
+            self.autobuy_screen()
         } else {
             self.exits_screen()
         };
@@ -2859,12 +2928,12 @@ mod tests {
         sc.enabled = true;
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), false, 4).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         let (_, kb) = b.settings_screen();
         let blob = kb.to_string();
-        for field in ["size", "slippage", "minliq", "exits"] {
+        for field in ["size", "slippage", "minliq", "exits", "autobuy"] {
             assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
         }
         // Spend caps are enforced from config and deliberately have no button:
@@ -2873,6 +2942,14 @@ mod tests {
                      "set:maximpact", "set:mode"] {
             assert!(!blob.contains(gone), "{gone} should no longer be on the screen");
         }
+
+        // Auto-buy: the switch and threshold are tappable; the COHORTS are
+        // not, by design — which wallets to follow is a decision from scoring
+        // data, not a knob to flip mid-session.
+        let ab = b.autobuy_screen().1.to_string();
+        assert!(ab.contains("setv:autobuy_on:toggle"), "no auto-buy switch");
+        assert!(ab.contains("setv:autobuy_min:"), "no wallet threshold");
+        assert!(!ab.contains("cohort") && !ab.contains("group"), "cohorts must not be editable here");
 
         // The whole exit policy is reachable by tapping, nothing typed.
         let exits = b.exits_screen().1.to_string();
@@ -2910,7 +2987,7 @@ mod tests {
         sc.slippage_bps = 300;
         sc.max_trade_size_sol = 0.1;
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), false, 4).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         let s = b.setting_editor("slippage").1.to_string();
@@ -2933,7 +3010,7 @@ mod tests {
         sc.enabled = true;
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), false, 4).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         b.ask_screen(1, "size");
@@ -3449,7 +3526,7 @@ mod tests {
         // Never let a test write the operator's real settings file.
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), false, 4).unwrap());
 
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
         let (msg, kb) = b.settings_screen();

@@ -92,6 +92,8 @@ impl Detector {
             rpc.clone(),
             &cfg.rpc,
             prices.clone(),
+            cfg.tracked.auto_buy,
+            cfg.tracked.auto_buy_min_wallets,
         )?);
 
         // Load the tracked-wallet list up front so a bad path is a startup
@@ -822,23 +824,31 @@ impl Detector {
             // call fires: the trading threshold is higher than the alert
             // threshold, so the buy that crosses it usually arrives after the
             // alert has already gone out.
+            // Read live, not from config: the operator can stop auto-buying
+            // from Telegram, and that has to take effect on the next signal
+            // rather than the next restart.
             #[cfg(feature = "sniper")]
-            if self.cfg.tracked.auto_buy {
-                let eligible: Vec<String> = {
+            {
+                let live = self.sniper.live();
+                let env = self.sniper.envelope();
+                if live.auto_buy_active(&env) {
+                    let need = live.effective_auto_buy_min(&env);
+                        let eligible: Vec<String> = {
                     let tracker = match self.conviction.lock() {
                         Ok(t) => t,
                         Err(p) => p.into_inner(),
                     };
-                    tracker
-                        .buyers_in_window(&buy.mint, Instant::now())
-                        .into_iter()
-                        .filter(|w| {
-                            self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
-                        })
-                        .collect()
-                };
-                if eligible.len() >= self.cfg.tracked.auto_buy_min_wallets {
-                    self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                        tracker
+                            .buyers_in_window(&buy.mint, Instant::now())
+                            .into_iter()
+                            .filter(|w| {
+                                self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
+                            })
+                            .collect()
+                    };
+                    if eligible.len() >= need {
+                        self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                    }
                 }
             }
 
