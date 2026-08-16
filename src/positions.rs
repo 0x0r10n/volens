@@ -56,17 +56,47 @@ pub fn cost_basis_from_audit(audit_jsonl: &str) -> HashMap<String, CostBasis> {
             continue;
         };
 
-        // Skip any tagged action (sell / withdraw): only buys have no `action`
-        // field, and a sell/withdraw `confirmed:` must never count as buy spend.
-        if rec.get("action").is_some() {
-            continue;
-        }
         if rec.get("mode").and_then(|m| m.as_str()) != Some("armed") {
             continue;
         }
         let outcome = rec.get("outcome").and_then(|o| o.as_str()).unwrap_or("");
         if !executed(outcome) {
             continue;
+        }
+
+        // Smart-money entries are a different record shape: no `plan`, and the
+        // mint and size at the top level.
+        //
+        // These were invisible here, because the filter below skipped every
+        // record carrying an `action`. Cost basis is how `sweep_exits` FINDS a
+        // position, so a smart-money buy could never be seen by take-profit,
+        // stop-loss or trailing — the position was held until it was worthless
+        // and nothing in the logs said why.
+        match rec.get("action").and_then(|a| a.as_str()) {
+            None => {}
+            Some("smart_buy") => {
+                let Some(mint) = rec.get("mint").and_then(|m| m.as_str()) else { continue };
+                let size = rec.get("sol").and_then(|s| s.as_f64()).unwrap_or(0.0);
+                if size <= 0.0 {
+                    continue;
+                }
+                let entry = out.entry(mint.to_string()).or_insert_with(|| CostBasis {
+                    // No pool: the entry was routed, not built from a pool we
+                    // decoded. Selling falls back accordingly.
+                    pool: String::new(),
+                    dex: "routed".to_string(),
+                    sol_spent: 0.0,
+                    trades: 0,
+                    base_vault: None,
+                    quote_vault: None,
+                });
+                entry.sol_spent += size;
+                entry.trades += 1;
+                continue;
+            }
+            // Sells and withdrawals: a `confirmed:` on those must never count
+            // as buy spend.
+            Some(_) => continue,
         }
 
         let Some(plan) = rec.get("plan") else { continue };
@@ -138,6 +168,46 @@ pub fn unrealized(cost: f64, value: f64) -> Pnl {
 
 #[cfg(test)]
 mod tests {
+
+    /// The bug that made auto-sell blind.
+    ///
+    /// Smart-money entries are audited with an `action` field and no `plan`,
+    /// and the filter skipped every record carrying an `action`. Cost basis is
+    /// how `sweep_exits` FINDS a position, so take-profit, stop-loss and
+    /// trailing never saw one — the position was held to zero and nothing said
+    /// why.
+    #[test]
+    fn a_smart_money_buy_produces_a_cost_basis() {
+        let log = r#"
+{"ts":"2026-08-16T01:00:00Z","action":"smart_buy","mint":"MINT_A","sol":0.05,"outcome":"confirmed:abc","mode":"armed"}
+{"ts":"2026-08-16T01:05:00Z","action":"smart_buy","mint":"MINT_A","sol":0.05,"outcome":"confirmed:def","mode":"armed"}
+"#;
+        let basis = cost_basis_from_audit(log);
+        let a = basis.get("MINT_A").expect("a routed entry is still a position");
+        assert!((a.sol_spent - 0.10).abs() < 1e-9);
+        assert_eq!(a.trades, 2);
+    }
+
+    /// Sells and withdrawals must still be excluded — a `confirmed:` on those
+    /// is money leaving, not money spent acquiring.
+    #[test]
+    fn sells_and_withdrawals_are_not_buy_spend() {
+        let log = r#"
+{"ts":"2026-08-16T01:00:00Z","action":"sell","mint":"MINT_A","sol":0.9,"outcome":"confirmed:x","mode":"armed"}
+{"ts":"2026-08-16T01:01:00Z","action":"withdraw","mint":"MINT_A","sol":1.0,"outcome":"confirmed:y","mode":"armed"}
+"#;
+        assert!(cost_basis_from_audit(log).is_empty());
+    }
+
+    /// A rehearsal is not a position. Dry-run records must never appear as
+    /// money spent.
+    #[test]
+    fn a_rehearsed_smart_buy_is_not_a_position() {
+        let log = r#"
+{"ts":"2026-08-16T01:00:00Z","action":"smart_buy","mint":"MINT_A","sol":0.05,"outcome":"would-succeed","mode":"dry_run"}
+"#;
+        assert!(cost_basis_from_audit(log).is_empty());
+    }
     use super::*;
 
     const T1: &str = "So11111111111111111111111111111111111111112";

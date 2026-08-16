@@ -854,6 +854,33 @@ impl Sniper {
             }
         }
 
+        // Mint safety. The pool path has always refused a token whose
+        // authorities are live; this path had NO checks at all beyond the caps
+        // and the kill switch, so it would buy a mint whose owner can still
+        // print supply or freeze the holder's account.
+        //
+        // Fails CLOSED, like the pool path: unknown is refused, not trusted.
+        // Spending money on a mint we could not verify is not a smaller
+        // mistake than spending it on one we verified as bad.
+        match self.rpc.mint_info(mint).await {
+            Some(info) => {
+                if !info.mint_authority_revoked() {
+                    return BuyOutcome::Refused { reason: "mint authority still live".into() };
+                }
+                if !info.freeze_authority_revoked() {
+                    return BuyOutcome::Refused { reason: "freeze authority still live".into() };
+                }
+                if !info.risky_extensions.is_empty() {
+                    return BuyOutcome::Refused {
+                        reason: format!("token-2022 extensions: {}", info.risky_extensions.join(", ")),
+                    };
+                }
+            }
+            None => {
+                return BuyOutcome::Refused { reason: "could not verify the mint".into() };
+            }
+        }
+
         let lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let quote = match jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await {
@@ -865,6 +892,17 @@ impl Sniper {
         // Raw units — the token's decimals are unknown here, and reporting a
         // scaled figure we cannot verify would be worse than reporting none.
         let tokens_out = quote.out_lamports().unwrap_or(0) as f64;
+
+        // Price impact stands in for depth here. There is no pool to read a
+        // reserve from on a routed entry, but a trade that moves the market
+        // this much is buying into something too thin to leave.
+        let impact_bps = (quote.price_impact_pct() * 100.0) as u32;
+        let max_impact = live.effective_max_impact_bps(&env);
+        if max_impact > 0 && impact_bps > max_impact {
+            return BuyOutcome::Refused {
+                reason: format!("price impact {impact_bps} bps exceeds {max_impact}"),
+            };
+        }
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,
             Err(e) => {
