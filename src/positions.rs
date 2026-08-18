@@ -188,6 +188,31 @@ mod tests {
         assert_eq!(a.trades, 2);
     }
 
+    /// The guard against the failure that actually happened: the writer and
+    /// the reader drifting apart.
+    ///
+    /// This feeds the REAL record produced by the sniper through the reader,
+    /// rather than a hand-written line that can be updated to match while the
+    /// production format quietly does not.
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn the_reader_understands_what_the_writer_actually_writes() {
+        let rec = crate::sniper::smart_buy_record(
+            "OWNER", "MINT_A", 0.05, "4 tracked wallets in window", "confirmed:sig", true,
+        );
+        let basis = cost_basis_from_audit(&rec.to_string());
+        let a = basis
+            .get("MINT_A")
+            .expect("a position the bot opened must be visible to the exit policy");
+        assert!((a.sol_spent - 0.05).abs() < 1e-9);
+
+        // …and a rehearsal from the same writer must NOT become a position.
+        let dry = crate::sniper::smart_buy_record(
+            "OWNER", "MINT_A", 0.05, "r", "would-succeed", false,
+        );
+        assert!(cost_basis_from_audit(&dry.to_string()).is_empty());
+    }
+
     /// Sells and withdrawals must still be excluded — a `confirmed:` on those
     /// is money leaving, not money spent acquiring.
     #[test]

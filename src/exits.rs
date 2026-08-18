@@ -249,6 +249,73 @@ pub fn describe(rules: &ExitRules) -> String {
     parts.join(" · ")
 }
 
+
+/// A position as the ladder sees it: what it cost, what is held, what it is
+/// worth per token.
+#[derive(Debug, Clone)]
+pub struct Holding {
+    pub mint: String,
+    pub sol_spent: f64,
+    pub raw: u64,
+    pub decimals: u32,
+    /// SOL per whole token, or `None` if nothing has traded in our window.
+    pub price_sol: Option<f64>,
+}
+
+/// One decided exit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedSell {
+    pub mint: String,
+    /// Share of the CURRENT balance to sell — what a sell can act on.
+    pub pct_of_current: u8,
+    pub reason: String,
+}
+
+/// Decide every exit for a set of holdings, without touching the network.
+///
+/// Split out of the sweep so the JOIN can be tested — the step that reads a
+/// position out of the audit log and hands it to the ladder. That join was
+/// broken for smart-money buys (their audit records were skipped by cost-basis
+/// parsing) and the failure was invisible: the ladder was correct, the rules
+/// were correct, and the list it was given was simply empty. Testing the rules
+/// in isolation could never have caught it.
+///
+/// Returns the sells to make, and the mints whose position is gone and whose
+/// ladder state should be forgotten.
+pub fn plan_exits(
+    rules: &ExitRules,
+    state: &ExitStateStore,
+    holdings: &[Holding],
+) -> (Vec<PlannedSell>, Vec<String>) {
+    let mut sells = Vec::new();
+    let mut closed = Vec::new();
+    if !rules.enabled {
+        return (sells, closed);
+    }
+    for h in holdings {
+        if h.raw == 0 {
+            // Closed by hand or fully sold: drop the ladder so a re-entry
+            // starts fresh rather than inheriting spent orders.
+            closed.push(h.mint.clone());
+            continue;
+        }
+        if h.sol_spent <= 0.0 {
+            continue;
+        }
+        let Some(price) = h.price_sol else { continue };
+        let tokens = h.raw as f64 / 10f64.powi(h.decimals as i32);
+        let multiple = (price * tokens) / h.sol_spent;
+
+        let (action, pct_now) = state.decide(rules, &h.mint, multiple, h.raw);
+        if let ExitAction::Sell { reason, .. } = action
+            && pct_now > 0
+        {
+            sells.push(PlannedSell { mint: h.mint.clone(), pct_of_current: pct_now, reason });
+        }
+    }
+    (sells, closed)
+}
+
 /// Per-position exit memory, persisted so a restart does not re-take an order
 /// already taken or forget the peak a trailing stop measures from.
 pub struct ExitStateStore {
@@ -337,6 +404,110 @@ impl ExitStateStore {
 
 #[cfg(test)]
 mod tests {
+
+    // --- The join: audit record -> position -> ladder.
+    //
+    // This is the layer that failed in production. The rules were right, the
+    // ladder was right, and the list handed to it was empty — so nothing sold,
+    // through a +150% peak and all the way down to zero.
+
+    fn holding(mint: &str, sol_spent: f64, raw: u64, price: Option<f64>) -> Holding {
+        Holding { mint: mint.into(), sol_spent, raw, decimals: 6, price_sol: price }
+    }
+
+    /// A smart-money buy must reach the ladder. The audit shape it is written
+    /// in was skipped by cost-basis parsing, which made the position invisible.
+    #[test]
+    fn a_smart_money_position_reaches_the_ladder() {
+        let log = r#"{"ts":"2026-08-16T01:00:00Z","action":"smart_buy","mint":"MINT_A","sol":0.05,"outcome":"confirmed:abc","mode":"armed"}"#;
+        let basis = crate::positions::cost_basis_from_audit(log);
+        let cost = basis.get("MINT_A").expect("the position must exist at all").sol_spent;
+
+        // Bought 1,000,000 tokens for 0.05 SOL; now worth 2.5x.
+        let raw = 1_000_000_000_000u64; // 1e6 tokens at 6 decimals
+        let entry_price = cost / 1_000_000.0;
+        let now_price = entry_price * 2.5;
+
+        let store = ExitStateStore::ephemeral();
+        let (sells, _) = plan_exits(
+            &ExitRules { enabled: true, ..Default::default() },
+            &store,
+            &[holding("MINT_A", cost, raw, Some(now_price))],
+        );
+        assert_eq!(sells.len(), 1, "the +100% target should have fired");
+        assert_eq!(sells[0].pct_of_current, 50);
+    }
+
+    /// The failure exactly as it happened: up 150%, then down through the stop.
+    /// Both must act.
+    #[test]
+    fn a_run_up_then_a_collapse_both_fire() {
+        let store = ExitStateStore::ephemeral();
+        let rules = ExitRules { enabled: true, ..Default::default() };
+        let raw = 1_000_000_000_000u64;
+        let cost = 0.05;
+        let entry = cost / 1_000_000.0;
+
+        // +150%: the +100% target takes half.
+        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, raw, Some(entry * 2.5))]);
+        assert_eq!(sells.len(), 1, "take-profit must fire on the way up");
+        assert!(sells[0].reason.contains("target"), "{}", sells[0].reason);
+
+        // Then it collapses. Half is already sold, so the stop closes the rest.
+        let left = raw / 2;
+        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, left, Some(entry * 0.3))]);
+        assert_eq!(sells.len(), 1, "the stop must fire on the way down");
+        assert_eq!(sells[0].pct_of_current, 100);
+        assert!(sells[0].reason.contains("stop"), "{}", sells[0].reason);
+    }
+
+    /// A rehearsal is not a position, so nothing is ever sold from a dry run.
+    #[test]
+    fn a_dry_run_never_produces_something_to_sell() {
+        let log = r#"{"ts":"2026-08-16T01:00:00Z","action":"smart_buy","mint":"M","sol":0.05,"outcome":"would-succeed","mode":"dry_run"}"#;
+        assert!(crate::positions::cost_basis_from_audit(log).is_empty());
+    }
+
+    /// An unpriced position is left alone. The whole point of gathering the
+    /// price separately is that "we could not price it" must not read as "it is
+    /// worthless" — that confusion has already cost this project a dataset.
+    #[test]
+    fn an_unpriced_position_is_never_sold() {
+        let store = ExitStateStore::ephemeral();
+        let (sells, closed) = plan_exits(
+            &ExitRules { enabled: true, ..Default::default() },
+            &store,
+            &[holding("M", 0.05, 1_000_000_000_000, None)],
+        );
+        assert!(sells.is_empty());
+        assert!(closed.is_empty(), "and it is still a position");
+    }
+
+    /// A position that is gone releases its ladder, so a re-entry starts fresh
+    /// rather than inheriting spent orders.
+    #[test]
+    fn a_closed_position_is_forgotten() {
+        let store = ExitStateStore::ephemeral();
+        let (sells, closed) = plan_exits(
+            &ExitRules { enabled: true, ..Default::default() },
+            &store,
+            &[holding("M", 0.05, 0, Some(1.0))],
+        );
+        assert!(sells.is_empty());
+        assert_eq!(closed, vec!["M".to_string()]);
+    }
+
+    /// Disabled means disabled, whatever the prices are doing.
+    #[test]
+    fn nothing_is_planned_while_auto_sell_is_off() {
+        let store = ExitStateStore::ephemeral();
+        let (sells, _) = plan_exits(
+            &ExitRules::default(),
+            &store,
+            &[holding("M", 0.05, 1_000_000_000_000, Some(1.0))],
+        );
+        assert!(sells.is_empty());
+    }
     use super::*;
 
     fn rules() -> ExitRules {

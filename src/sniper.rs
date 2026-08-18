@@ -347,6 +347,37 @@ fn fmt_cap_sol(v: f64) -> String {
     }
 }
 
+/// The audit record for a smart-money entry.
+///
+/// Defined here, in ONE place, because the writer and the reader disagreed
+/// once and it cost real money: this record carries an `action` and no `plan`,
+/// and `cost_basis_from_audit` skipped every record with an `action`. The
+/// position therefore never existed as far as the exit policy was concerned,
+/// so take-profit and stop-loss were never offered it and the position was held
+/// to zero in silence.
+///
+/// Anything reading these records should be tested against THIS function, not
+/// against a hand-written string that can drift from it.
+pub fn smart_buy_record(
+    owner: &str,
+    mint: &str,
+    sol: f64,
+    reason: &str,
+    outcome: &str,
+    armed: bool,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": Utc::now().to_rfc3339(),
+        "action": "smart_buy",
+        "owner": owner,
+        "mint": mint,
+        "sol": sol,
+        "reason": reason,
+        "outcome": outcome,
+        "mode": if armed { "armed" } else { "dry_run" },
+    })
+}
+
 /// Refuse a cap that would be looser than the config envelope.
 fn check_tighten(v: f64, hard: f64, unit: &str) -> Result<(), String> {
     if v < 0.0 || v.is_nan() || v.is_infinite() {
@@ -943,16 +974,8 @@ impl Sniper {
         if self.cfg.audit_log.is_empty() {
             return;
         }
-        let record = serde_json::json!({
-            "ts": Utc::now().to_rfc3339(),
-            "action": "smart_buy",
-            "owner": owner,
-            "mint": mint,
-            "sol": sol,
-            "reason": reason,
-            "outcome": outcome,
-            "mode": match self.mode { Mode::Armed(_) => "armed", Mode::DryRun { .. } => "dry_run" },
-        });
+        let armed = matches!(self.mode, Mode::Armed(_));
+        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed);
         if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
             warn!(error = %e, "failed to write smart buy audit");
         }
@@ -978,60 +1001,51 @@ impl Sniper {
 
         // Cost basis counts only buys that truly moved funds, so a dry-run
         // rehearsal never produces a position the ladder would act on.
+        // Cost basis counts only buys that truly moved funds, so a dry-run
+        // rehearsal never produces a position the ladder would act on.
         let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.unwrap_or_default();
         let basis = crate::positions::cost_basis_from_audit(&audit);
-        let (mut considered, mut sold) = (0usize, 0usize);
 
+        // Gather first, decide second. The decision is a pure function so the
+        // JOIN — audit record to position to ladder — can be tested; that join
+        // silently produced an empty list for smart-money buys, and no amount
+        // of testing the rules alone would have found it.
+        let mut holdings = Vec::new();
         for (mint, cost) in basis {
-            if cost.sol_spent <= 0.0 {
-                continue;
-            }
             let Some((raw, decimals)) = self.rpc.token_balance_raw(&owner, &mint).await else {
                 continue;
             };
-            if raw == 0 {
-                // Position closed by hand or fully sold: drop its ladder so a
-                // re-entry starts fresh rather than inheriting old rungs.
-                state.forget(&mint);
-                continue;
-            }
-            considered += 1;
+            let price_sol = self
+                .prices
+                .price_sol(&mint, std::time::Duration::from_secs(3600))
+                .map(|p| p.price_sol);
+            holdings.push(crate::exits::Holding {
+                mint,
+                sol_spent: cost.sol_spent,
+                raw,
+                decimals: decimals as u32,
+                price_sol,
+            });
+        }
+        let considered = holdings.iter().filter(|h| h.raw > 0).count();
+        let (sells, closed) = crate::exits::plan_exits(&rules, state, &holdings);
+        for mint in closed {
+            state.forget(&mint);
+        }
 
-            // Price from our own stream. A missing price yields no action at
-            // all — see `exits::evaluate`, which refuses to read "unpriced" as
-            // "worthless".
-            let Some(priced) = self.prices.price_sol(&mint, std::time::Duration::from_secs(3600))
-            else {
-                continue;
-            };
-            let tokens = raw as f64 / 10f64.powi(decimals as i32);
-            let value_sol = priced.price_sol * tokens;
-            let multiple = value_sol / cost.sol_spent;
-
-            // `decide` also converts the order's share of the ORIGINAL
-            // position into a share of what is held now, which is what a sell
-            // can act on.
-            let (action, pct_now) = state.decide(&rules, &mint, multiple, raw);
-            if let crate::exits::ExitAction::Sell { amount_pct_of_original, reason } = action {
-                if pct_now == 0 {
-                    continue;
-                }
-                warn!(
-                    %mint, multiple, %reason,
-                    of_original = amount_pct_of_original,
-                    of_current = pct_now,
-                    "auto-sell firing"
-                );
-                let outcome = self.sell(&mint, pct_now).await;
-                info!(%mint, ?outcome, "auto-sell result");
-                // Announced whether it worked or not: an operator must be able
-                // to tell "the ladder never fired" from "it fired and failed".
-                if let Some(msg) = crate::alerts::render_auto_sell(&mint, pct_now, &reason, &outcome)
-                {
-                    alerter.send_html(msg).await;
-                }
-                sold += 1;
+        let mut sold = 0usize;
+        for s in sells {
+            warn!(mint = %s.mint, pct = s.pct_of_current, reason = %s.reason, "auto-sell firing");
+            let outcome = self.sell(&s.mint, s.pct_of_current).await;
+            info!(mint = %s.mint, ?outcome, "auto-sell result");
+            // Announced whether it worked or not: an operator must be able to
+            // tell "the ladder never fired" from "it fired and failed".
+            if let Some(msg) =
+                crate::alerts::render_auto_sell(&s.mint, s.pct_of_current, &s.reason, &outcome)
+            {
+                alerter.send_html(msg).await;
             }
+            sold += 1;
         }
         (considered, sold)
     }
