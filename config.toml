@@ -272,7 +272,9 @@ auto_buy = false
 #                 creation bundle at $4,493 FDV; the first price anyone else
 #                 could pay was $351,705. Their entry cannot be followed.
 #   jup:whale   — 4555 buys for a 1.02x with one rug. Not this market.
-auto_buy_groups = ["Main", "jup:influencer"]
+#   jup:influencer — dropped by choice; on the one clean scoring run it read
+#                 2.99x peak / 1.68x final against Main's 5.77x / 4.35x.
+auto_buy_groups = ["Main"]
 # Distinct buyers FROM THOSE COHORTS before buying. Higher than the alert
 # threshold on purpose: an alert costs a notification, a buy costs money.
 # Also settable from Telegram; this is the default until one is chosen.
