@@ -396,6 +396,14 @@ pub struct SniperConfig {
     /// Append-only log of every decision, allowed or denied.
     #[serde(default = "default_audit_log")]
     pub audit_log: String,
+    /// Buy on NEW POOL detection.
+    ///
+    /// Separate from smart-money auto-buy because they are different
+    /// strategies that share one wallet. With both on and a small balance the
+    /// pool path can take the only trade there is room for, and the
+    /// smart-money test learns nothing.
+    #[serde(default = "default_true")]
+    pub pool_auto_buy: bool,
     /// Where sell routes are recorded, one JSON line per position entered.
     ///
     /// Written at BUY time because some accounts cannot be recovered later —
@@ -725,6 +733,7 @@ impl Default for SniperConfig {
             kill_switch_file: default_kill_switch(),
             audit_log: default_audit_log(),
             settings_path: default_settings_path(),
+            pool_auto_buy: true,
             sell_routes_path: default_routes_path(),
             exit_state_path: default_exit_state_path(),
             exit_check_secs: default_exit_check(),

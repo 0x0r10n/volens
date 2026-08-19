@@ -438,6 +438,10 @@ settings_path = "settings.json"
 # observable in the pool's creation transaction and cannot be derived, so a
 # position whose route was not captured can never be sold DIRECTLY — only via
 # the quote API, which has IP-blocked this host before.
+# Buy on NEW POOL detection. OFF: this bot follows smart money, and with both
+# spenders live on one wallet the pool path can take the only trade there is
+# room for. Detection and pool ALERTS are unaffected — this only gates buying.
+pool_auto_buy = false
 sell_routes_path = "sell_routes.jsonl"
 # Per-position exit memory: which take-profit levels have fired and the peak
 # seen. Persisted so a restart does not re-take a level already taken, nor

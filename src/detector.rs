@@ -1023,6 +1023,7 @@ impl Detector {
         let sniper = self.sniper.clone();
         #[cfg(feature = "sniper")]
         let verbose_rehearsals = self.cfg.sniper.alert_on_all_rehearsals;
+        let pool_auto_buy = self.cfg.sniper.pool_auto_buy;
 
         tokio::spawn(async move {
             if enabled {
@@ -1144,7 +1145,7 @@ impl Detector {
             // unlocked, so the decision is deferred to the watcher re-check,
             // which buys only once the LP is confirmed burned/locked.
             #[cfg(feature = "sniper")]
-            if sniper.snipe_mode() == crate::sniper::SnipeMode::Open {
+            if pool_auto_buy && sniper.snipe_mode() == crate::sniper::SnipeMode::Open {
                 let exec = sniper.handle(&event).await;
                 // Alerting lives here, not in the sniper: a failing Telegram
                 // call must not sit inside the execution path. Routine skips

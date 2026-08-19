@@ -2133,6 +2133,7 @@ mod tests {
             max_market_cap_usd: 0.0,
             // Tests must never touch a real settings or routes file.
             settings_path: String::new(),
+            pool_auto_buy: true,
             sell_routes_path: String::new(),
             exit_state_path: String::new(),
             exit_check_secs: 15,
