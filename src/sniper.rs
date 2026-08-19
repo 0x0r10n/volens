@@ -883,7 +883,7 @@ impl Sniper {
         // Fails CLOSED, like the pool path: unknown is refused, not trusted.
         // Spending money on a mint we could not verify is not a smaller
         // mistake than spending it on one we verified as bad.
-        match self.rpc.mint_info(mint).await {
+        let decimals = match self.rpc.mint_info(mint).await {
             Some(info) => {
                 if !info.mint_authority_revoked() {
                     return BuyOutcome::Refused { reason: "mint authority still live".into() };
@@ -896,11 +896,12 @@ impl Sniper {
                         reason: format!("token-2022 extensions: {}", info.risky_extensions.join(", ")),
                     };
                 }
+                info.decimals
             }
             None => {
                 return BuyOutcome::Refused { reason: "could not verify the mint".into() };
             }
-        }
+        };
 
         let lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
@@ -923,6 +924,38 @@ impl Sniper {
             return BuyOutcome::Refused {
                 reason: format!("price impact {impact_bps} bps exceeds {max_impact}"),
             };
+        }
+
+        // Market-cap ceiling. The pool path has always had this; the smart-money
+        // path did not, so it would happily enter something already at $5M —
+        // buying the top is exactly what the ceiling exists to prevent.
+        //
+        // Priced from THIS quote rather than the stream index: the quote is the
+        // price we are about to pay, and it exists by definition here, so the
+        // check cannot be skipped for want of an observation.
+        let max_mcap = live.effective_max_market_cap(&env);
+        if max_mcap > 0.0 {
+            let tokens_out = quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
+            let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
+            let supply = self.rpc.token_supply(mint).await;
+            match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
+                Some((sol_usd, supply)) => {
+                    let price_sol = size / tokens_out;
+                    let mcap = price_sol * supply * sol_usd;
+                    if mcap >= max_mcap {
+                        return BuyOutcome::Refused {
+                            reason: format!("market cap ${mcap:.0} at or above ${max_mcap:.0}"),
+                        };
+                    }
+                }
+                // Fails CLOSED, as the same gate does on the pool path: an
+                // unreadable guard is not a passed guard.
+                None => {
+                    return BuyOutcome::Refused {
+                        reason: "market cap unreadable (no SOL price or supply)".into(),
+                    };
+                }
+            }
         }
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,
