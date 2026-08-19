@@ -1441,28 +1441,6 @@ impl Bot {
             rows.push(serde_json::json!([
                 {"text": format!("🤖 Auto-buy · {ab}"), "callback_data": "set:autobuy"}
             ]));
-            // Risk caps. Back on the screen because every setting should be
-            // reachable from here — the earlier host-only split meant the one
-            // control that bounds losses needed an SSH session to change.
-            let cap = |l: f64, h: f64, unit: &str| -> String {
-                let e = crate::settings::tightest(l, h);
-                if e > 0.0 { format!("{e}{unit}") } else { "none".into() }
-            };
-            let cap_u = |l: u32, h: u32| -> String {
-                let e = crate::settings::tightest_u32(l, h);
-                if e > 0 { e.to_string() } else { "none".into() }
-            };
-            rows.push(serde_json::json!([
-                {"text": format!("🧢 Max trade · {}", cap(live.max_trade_size_sol, env.max_trade_size_sol, " SOL")), "callback_data": "set:maxsize"},
-                {"text": format!("📆 Daily cap · {}", cap(live.daily_cap_sol, env.daily_cap_sol, " SOL")), "callback_data": "set:dailycap"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("🔢 Trades/day · {}", cap_u(live.max_trades_per_day, env.max_trades_per_day)), "callback_data": "set:maxtrades"},
-                {"text": format!("🏦 Max mcap · {}", cap(live.max_market_cap_usd, env.max_market_cap_usd, "")), "callback_data": "set:maxmcap"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("💥 Max impact · {}", cap_u(live.max_price_impact_bps, env.max_price_impact_bps)), "callback_data": "set:maximpact"}
-            ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
@@ -3069,19 +3047,17 @@ mod tests {
 
         let (_, kb) = b.settings_screen();
         let blob = kb.to_string();
-        for field in ["size", "slippage", "minliq", "exits", "autobuy",
-                      "maxsize", "dailycap", "maxtrades", "maxmcap", "maximpact"] {
+        for field in ["size", "slippage", "minliq", "exits", "autobuy"] {
             assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
         }
-        // Every risk cap is reachable too: nothing that bounds losses should
-        // need an SSH session to change.
-        for cap in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
-                    "set:maximpact"] {
-            assert!(blob.contains(cap), "{cap} must be on the settings screen");
+        // Spend caps are deliberately absent. Trade size bounds a single
+        // entry, the wallet balance bounds the rest, and a screen of limits
+        // nobody uses is noise on the one screen that has to stay readable.
+        // The commands still exist and still bind if anyone sets them.
+        for gone in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
+                     "set:maximpact", "set:mode"] {
+            assert!(!blob.contains(gone), "{gone} should not be on the settings screen");
         }
-        // Snipe mode stays off: it is new-pool strategy, and this bot follows
-        // smart money.
-        assert!(!blob.contains("set:mode"), "snipe mode should not be here");
 
         // Auto-buy: the switch and threshold are tappable; the COHORTS are
         // not, by design — which wallets to follow is a decision from scoring
@@ -3107,7 +3083,7 @@ mod tests {
         }
 
         // …and each editor offers presets plus a typed escape hatch.
-        for field in ["size", "slippage", "minliq", "maxsize", "dailycap", "maxtrades"] {
+        for field in ["size", "slippage", "minliq"] {
             let (_, kb) = b.setting_editor(field);
             let s = kb.to_string();
             assert!(s.contains(&format!("setv:{field}:")), "{field} has no preset buttons");
