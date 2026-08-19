@@ -455,6 +455,9 @@ pub struct Sniper {
     settings: Arc<crate::settings::SettingsStore>,
     /// How to sell each position, captured at buy time. See `crate::routes`.
     routes: Arc<crate::routes::RouteStore>,
+    /// Held positions we have already warned about being unpriceable, so the
+    /// warning fires on the transition rather than every fifteen seconds.
+    unpriceable: Mutex<std::collections::HashSet<String>>,
     rpc: Arc<RpcClient>,
     /// Stream-derived prices. Replaces the external quote API that was
     /// IP-blocked, and which — while the market-cap gate still failed open —
@@ -584,6 +587,7 @@ impl Sniper {
             state: Mutex::new(DailyState::default()),
             settings,
             routes: Arc::new(crate::routes::RouteStore::load(&routes_path)),
+            unpriceable: Mutex::new(std::collections::HashSet::new()),
             rpc,
             submitter,
             jito,
@@ -714,8 +718,8 @@ impl Sniper {
         let ceiling = self.settings.snapshot().effective_max_trade_size(&env);
         if ceiling > 0.0 && v > ceiling {
             return Err(format!(
-                "trade size {v} exceeds the {ceiling} SOL ceiling. Lower it with \
-                 /maxsize, or raise max_trade_size_sol in config on the host."
+                "trade size {v} exceeds the {ceiling} SOL per-trade cap. Raise the \
+                 cap first (Settings -> Max trade)."
             ));
         }
         self.settings.update(|s| {
@@ -730,11 +734,8 @@ impl Sniper {
         if bps == 0 {
             return Err("slippage of 0 bps would essentially never fill".into());
         }
-        if bps > self.cfg.slippage_bps {
-            return Err(format!(
-                "can only TIGHTEN slippage from here. Current ceiling is {} bps.",
-                self.cfg.slippage_bps
-            ));
+        if bps > 5_000 {
+            return Err("above 50% slippage a fill is worse than no fill".into());
         }
         self.settings.update(|s| {
             s.slippage_bps = bps;
@@ -748,13 +749,6 @@ impl Sniper {
         if v < 0.0 {
             return Err("minimum liquidity cannot be negative".into());
         }
-        if v < self.cfg.min_liquidity_sol {
-            return Err(format!(
-                "can only RAISE the minimum liquidity from here (more cautious). \
-                 Floor is {} SOL — lower it in config on the host.",
-                self.cfg.min_liquidity_sol
-            ));
-        }
         self.settings.update(|s| {
             s.min_liquidity_sol = v;
             Ok(format!("minimum liquidity set to {v} SOL"))
@@ -765,7 +759,9 @@ impl Sniper {
     /// to the config envelope — it never means "unlimited".
     pub fn set_max_trade_size(&self, v: f64) -> Result<String, String> {
         let hard = self.settings.envelope().max_trade_size_sol;
-        check_tighten(v, hard, "SOL")?;
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("value must be zero or positive".into());
+        }
         self.settings.update(|s| {
             s.max_trade_size_sol = v;
             Ok(describe_cap("max trade size", v, hard, "SOL"))
@@ -775,7 +771,9 @@ impl Sniper {
     /// Tighten the daily spend cap.
     pub fn set_daily_cap(&self, v: f64) -> Result<String, String> {
         let hard = self.settings.envelope().daily_cap_sol;
-        check_tighten(v, hard, "SOL")?;
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("value must be zero or positive".into());
+        }
         self.settings.update(|s| {
             s.daily_cap_sol = v;
             Ok(describe_cap("daily spend cap", v, hard, "SOL"))
@@ -785,11 +783,6 @@ impl Sniper {
     /// Tighten the daily trade count.
     pub fn set_max_trades(&self, v: u32) -> Result<String, String> {
         let hard = self.settings.envelope().max_trades_per_day;
-        if hard > 0 && v > hard {
-            return Err(format!(
-                "{v} exceeds the configured limit of {hard}. Only the host can raise it."
-            ));
-        }
         self.settings.update(|s| {
             s.max_trades_per_day = v;
             Ok(if v == 0 {
@@ -803,7 +796,9 @@ impl Sniper {
     /// Tighten the market-cap ceiling for entries.
     pub fn set_max_market_cap(&self, v: f64) -> Result<String, String> {
         let hard = self.settings.envelope().max_market_cap_usd;
-        check_tighten(v, hard, "USD")?;
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("value must be zero or positive".into());
+        }
         self.settings.update(|s| {
             s.max_market_cap_usd = v;
             Ok(describe_cap("max market cap", v, hard, "USD"))
@@ -813,11 +808,6 @@ impl Sniper {
     /// Tighten the tolerated price impact.
     pub fn set_max_impact_bps(&self, v: u32) -> Result<String, String> {
         let hard = self.settings.envelope().max_price_impact_bps;
-        if hard > 0 && v > hard {
-            return Err(format!(
-                "{v} bps exceeds the configured limit of {hard} bps. Only the host can raise it."
-            ));
-        }
         self.settings.update(|s| {
             s.max_price_impact_bps = v;
             Ok(if v == 0 {
@@ -927,7 +917,7 @@ impl Sniper {
         // Price impact stands in for depth here. There is no pool to read a
         // reserve from on a routed entry, but a trade that moves the market
         // this much is buying into something too thin to leave.
-        let impact_bps = (quote.price_impact_pct() * 100.0) as u32;
+        let impact_bps = (quote.price_impact_pct() * 100.0) as u32; // percent -> bps
         let max_impact = live.effective_max_impact_bps(&env);
         if max_impact > 0 && impact_bps > max_impact {
             return BuyOutcome::Refused {
@@ -1027,6 +1017,29 @@ impl Sniper {
                 price_sol,
             });
         }
+        // A held position with no price has stopped trading where we can see
+        // it — the shape a rug takes from here. It is NOT sold: unpriceable
+        // means we could not sell it either, and treating "no price" as "sell"
+        // is the confusion that has already cost this project a dataset. But
+        // the operator is told once, because it is the moment to look.
+        for h in holdings.iter().filter(|h| h.raw > 0 && h.price_sol.is_none()) {
+            let first_time = {
+                let mut seen = self.unpriceable.lock().unwrap_or_else(|p| p.into_inner());
+                seen.insert(h.mint.clone())
+            };
+            if first_time {
+                warn!(mint = %h.mint, "held position has stopped trading — cannot be priced or sold");
+                if let Some(msg) = crate::alerts::render_unpriceable(&h.mint) {
+                    alerter.send_html(msg).await;
+                }
+            }
+        }
+        {
+            // Forget the ones that recovered, so a later stall alerts again.
+            let mut seen = self.unpriceable.lock().unwrap_or_else(|p| p.into_inner());
+            seen.retain(|m| holdings.iter().any(|h| &h.mint == m && h.price_sol.is_none()));
+        }
+
         let considered = holdings.iter().filter(|h| h.raw > 0).count();
         let (sells, closed) = crate::exits::plan_exits(&rules, state, &holdings);
         for mint in closed {
@@ -2139,17 +2152,24 @@ mod tests {
 
     /// Telegram may tighten a ceiling, never raise one past the host's.
     #[test]
-    fn telegram_cannot_widen_the_envelope() {
-        let s = mk(cfg()).unwrap(); // max_trade_size 1.0, daily 1.0, trades 5
-        assert!(s.set_max_trade_size(5.0).is_err(), "must refuse a wider per-trade cap");
-        assert!(s.set_daily_cap(50.0).is_err(), "must refuse a wider daily cap");
-        assert!(s.set_max_trades(500).is_err(), "must refuse more trades than config allows");
-        assert!(s.set_slippage_bps(5000).is_err(), "slippage is tighten-only");
+    fn caps_are_settable_and_bind_immediately() {
+        let s = mk(cfg()).unwrap();
 
-        // …and tightening is accepted.
-        assert!(s.set_max_trade_size(0.5).is_ok());
-        assert!(s.set_daily_cap(0.5).is_ok());
-        assert!(s.set_max_trades(2).is_ok());
+        // Caps are the operator's, in both directions — they bound losses, and
+        // needing an SSH session to change the one control that does that was
+        // the wrong trade.
+        assert!(s.set_daily_cap(0.2).is_ok());
+        assert!(s.set_max_trades(3).is_ok());
+        assert!(s.set_max_trade_size(0.05).is_ok());
+        assert!(s.set_daily_cap(-1.0).is_err(), "negative is not a cap");
+
+        // And a cap set here refuses the very next trade. Set below the trade
+        // size so it binds on the FIRST one rather than after some spend.
+        s.set_daily_cap(0.01).unwrap();
+        match s.consider(&event(), Utc::now()) {
+            Err(Denial::DailyCapReached { cap, .. }) => assert_eq!(cap, 0.01),
+            other => panic!("the tightened daily cap must bind, got {other:?}"),
+        }
     }
 
     /// Clearing a live cap falls back to config, and when config sets none the
@@ -2297,30 +2317,34 @@ mod tests {
     /// SAFER. A leaked bot token must not be able to raise spend or loosen
     /// slippage. The config values are the risk ceilings.
     #[test]
-    fn tuning_is_tighten_only() {
+    fn every_setting_is_the_operators_to_choose() {
         let mut c = cfg();
         c.trade_size_sol = 0.05;
         c.slippage_bps = 300;
         c.min_liquidity_sol = 10.0;
         let s = mk(c).unwrap();
 
-        // Size: freely settable up to max_trade_size_sol (1.0 in this cfg).
-        // Raising IS allowed now — the ceiling, not a tighten-only rule, is the
-        // guard. Only above the configured max is refused.
-        assert!(s.set_trade_size(0.02).is_ok());
-        assert!(s.set_trade_size(0.5).is_ok(), "raising within the ceiling is allowed");
-        assert!(s.set_trade_size(1.0).is_ok(), "equal to the max is fine");
-        assert!(s.set_trade_size(1.5).is_err(), "above max_trade_size_sol refused");
-        assert!(s.set_trade_size(0.0).is_err(), "zero/negative refused");
-
-        // Slippage: tightening allowed, loosening refused.
+        // Slippage and liquidity move in BOTH directions now. They were
+        // tighten-only, which meant loosening either — a legitimate call on a
+        // thin market — needed host access the operator may not have to hand.
         assert!(s.set_slippage_bps(200).is_ok());
-        assert!(s.set_slippage_bps(301).is_err(), "looser than ceiling refused");
+        assert!(s.set_slippage_bps(800).is_ok(), "looser is the operator's risk to take");
+        assert!(s.set_slippage_bps(0).is_err(), "zero would never fill");
+        assert!(s.set_slippage_bps(6_000).is_err(), "past 50% a fill is worse than none");
 
-        // Min liquidity: raising allowed (more cautious), lowering refused.
         assert!(s.set_min_liquidity(20.0).is_ok());
-        assert!(s.set_min_liquidity(9.0).is_err(), "below floor refused");
+        assert!(s.set_min_liquidity(2.0).is_ok(), "lowering is allowed");
+        assert!(s.set_min_liquidity(-1.0).is_err());
+
+        // The ONE invariant that survives: a trade may not exceed the
+        // per-trade cap. That cap is itself settable — from the screen above —
+        // so the guard is real without being a locked door.
+        s.set_max_trade_size(1.0).unwrap();
+        assert!(s.set_trade_size(0.5).is_ok());
+        assert!(s.set_trade_size(1.5).is_err(), "above the per-trade cap is refused");
+        assert!(s.set_trade_size(0.0).is_err(), "zero is not a trade");
     }
+
 
     /// With the three ceilings set to 0, none of them gate a trade: size is
     /// unbounded from Telegram, and consider() enforces no per-trade, daily, or

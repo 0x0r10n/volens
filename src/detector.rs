@@ -886,6 +886,17 @@ impl Detector {
                 return;
             }
         }
+        // Second line of defence, and the one that survives a restart: the
+        // in-memory set above is empty on boot, so a token still inside its
+        // window would be bought AGAIN. Holding any of it already means the
+        // position is open.
+        if let Some((owner, _)) = self.sniper.trading_identity()
+            && let Some((raw, _)) = self.rpc.token_balance_raw(&owner.to_string(), mint).await
+            && raw > 0
+        {
+            info!(%mint, "already holding — not opening a second position");
+            return;
+        }
         let reason = format!("{wallets} tracked wallets in window");
         let outcome = self.sniper.buy_mint(mint, &reason).await;
         info!(%mint, wallets, ?outcome, "smart-money buy");

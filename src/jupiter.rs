@@ -46,11 +46,18 @@ impl Quote {
     }
 
     /// Price impact as a percentage (e.g. 3.2 for 3.2%). 0.0 if absent.
+    /// Price impact as a PERCENT (5.0 means 5%).
+    ///
+    /// The API reports a fraction — verified live, a 1 SOL swap returned
+    /// `"0.0000070039..."` for an impact of 0.0007%. Reading that number as a
+    /// percent understates impact by 100x, which silently disabled the guard
+    /// meant to refuse thin markets and made the rehearsal display wrong.
     pub fn price_impact_pct(&self) -> f64 {
         self.raw
             .get("priceImpactPct")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|fraction| fraction * 100.0)
             .unwrap_or(0.0)
     }
 }
@@ -243,7 +250,8 @@ mod tests {
         let q = Quote {
             raw: serde_json::json!({
                 "outAmount": "1500000000",
-                "priceImpactPct": "2.5",
+                // A fraction, as the API sends it: 2.5% impact.
+                "priceImpactPct": "0.025",
                 "inAmount": "42",
             }),
         };

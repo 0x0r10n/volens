@@ -657,3 +657,19 @@ fn describe_submission(r: &crate::sniper::SubmitOutcome) -> String {
         }
     }
 }
+
+/// A held position that can no longer be priced.
+///
+/// Deliberately not a sell instruction. If nothing is trading it, we could not
+/// sell it either — this is a "go and look" notice, not an action. Naming that
+/// distinction matters: the alternative reading, that no price means worthless,
+/// is the one that has already caused real damage here.
+#[cfg(feature = "sniper")]
+pub fn render_unpriceable(mint: &str) -> Option<String> {
+    Some(format!(
+        "🟠 <b>Position stopped trading</b> · <code>{}</code>\n\
+         No fills observed, so it cannot be priced — or sold — right now.\n\
+         <i>Auto-sell is holding rather than acting on a price it does not have.</i>",
+        escape_html(&crate::conviction::short_mint(mint))
+    ))
+}

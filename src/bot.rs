@@ -1441,6 +1441,28 @@ impl Bot {
             rows.push(serde_json::json!([
                 {"text": format!("🤖 Auto-buy · {ab}"), "callback_data": "set:autobuy"}
             ]));
+            // Risk caps. Back on the screen because every setting should be
+            // reachable from here — the earlier host-only split meant the one
+            // control that bounds losses needed an SSH session to change.
+            let cap = |l: f64, h: f64, unit: &str| -> String {
+                let e = crate::settings::tightest(l, h);
+                if e > 0.0 { format!("{e}{unit}") } else { "none".into() }
+            };
+            let cap_u = |l: u32, h: u32| -> String {
+                let e = crate::settings::tightest_u32(l, h);
+                if e > 0 { e.to_string() } else { "none".into() }
+            };
+            rows.push(serde_json::json!([
+                {"text": format!("🧢 Max trade · {}", cap(live.max_trade_size_sol, env.max_trade_size_sol, " SOL")), "callback_data": "set:maxsize"},
+                {"text": format!("📆 Daily cap · {}", cap(live.daily_cap_sol, env.daily_cap_sol, " SOL")), "callback_data": "set:dailycap"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("🔢 Trades/day · {}", cap_u(live.max_trades_per_day, env.max_trades_per_day)), "callback_data": "set:maxtrades"},
+                {"text": format!("🏦 Max mcap · {}", cap(live.max_market_cap_usd, env.max_market_cap_usd, "")), "callback_data": "set:maxmcap"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("💥 Max impact · {}", cap_u(live.max_price_impact_bps, env.max_price_impact_bps)), "callback_data": "set:maximpact"}
+            ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
@@ -1810,20 +1832,16 @@ impl Bot {
         // Envelope filtering: caps and slippage may only tighten, liquidity may
         // only rise. Offering a value that would be refused is worse than
         // offering fewer.
-        let ceiling = match field {
-            "size" | "maxsize" => env.max_trade_size_sol,
-            "slippage" => env.slippage_bps as f64,
-            "dailycap" => env.daily_cap_sol,
-            "maxtrades" => env.max_trades_per_day as f64,
-            "maxmcap" => env.max_market_cap_usd,
-            "maximpact" => env.max_price_impact_bps as f64,
-            _ => 0.0,
+        // Only the per-trade CAP still filters a preset, because a size above
+        // it would be refused. Everything else is the operator's to choose:
+        // filtering by a ceiling they can also change here just hides options.
+        let ceiling = if field == "size" {
+            live.effective_max_trade_size(&env)
+        } else {
+            0.0
         };
-        let floor = if field == "minliq" { env.min_liquidity_sol } else { 0.0 };
-        let allowed: Vec<f64> = presets
-            .into_iter()
-            .filter(|v| (ceiling <= 0.0 || *v <= ceiling) && *v >= floor)
-            .collect();
+        let allowed: Vec<f64> =
+            presets.into_iter().filter(|v| ceiling <= 0.0 || *v <= ceiling).collect();
 
         let mut rows: Vec<serde_json::Value> = Vec::new();
         for chunk in allowed.chunks(3) {
@@ -3051,15 +3069,19 @@ mod tests {
 
         let (_, kb) = b.settings_screen();
         let blob = kb.to_string();
-        for field in ["size", "slippage", "minliq", "exits", "autobuy"] {
+        for field in ["size", "slippage", "minliq", "exits", "autobuy",
+                      "maxsize", "dailycap", "maxtrades", "maxmcap", "maximpact"] {
             assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
         }
-        // Spend caps are enforced from config and deliberately have no button:
-        // hiding them removes a way to TIGHTEN, never the ceiling itself.
-        for gone in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
-                     "set:maximpact", "set:mode"] {
-            assert!(!blob.contains(gone), "{gone} should no longer be on the screen");
+        // Every risk cap is reachable too: nothing that bounds losses should
+        // need an SSH session to change.
+        for cap in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
+                    "set:maximpact"] {
+            assert!(blob.contains(cap), "{cap} must be on the settings screen");
         }
+        // Snipe mode stays off: it is new-pool strategy, and this bot follows
+        // smart money.
+        assert!(!blob.contains("set:mode"), "snipe mode should not be here");
 
         // Auto-buy: the switch and threshold are tappable; the COHORTS are
         // not, by design — which wallets to follow is a decision from scoring
@@ -3084,8 +3106,8 @@ mod tests {
             assert!(ord.contains(&format!("ask:ordt{i}")), "order {i} has no custom trigger");
         }
 
-        // …and each remaining editor offers presets plus a typed escape hatch.
-        for field in ["size", "slippage", "minliq"] {
+        // …and each editor offers presets plus a typed escape hatch.
+        for field in ["size", "slippage", "minliq", "maxsize", "dailycap", "maxtrades"] {
             let (_, kb) = b.setting_editor(field);
             let s = kb.to_string();
             assert!(s.contains(&format!("setv:{field}:")), "{field} has no preset buttons");
@@ -3093,8 +3115,10 @@ mod tests {
         }
     }
 
-    /// Presets must never offer a value the envelope would refuse — a button
-    /// that answers "refused" teaches the operator to distrust the buttons.
+    /// A preset must never be refused when tapped. Only the per-trade cap
+    /// still constrains one — everything else is the operator's to set, and
+    /// filtering by a ceiling they can change on the next screen would just
+    /// hide options for no reason.
     #[cfg(feature = "sniper")]
     #[tokio::test]
     async fn presets_never_offer_a_refused_value() {
@@ -3108,13 +3132,15 @@ mod tests {
         let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
+        // Slippage is now the operator's call in both directions.
         let s = b.setting_editor("slippage").1.to_string();
-        assert!(s.contains("setv:slippage:300"), "the ceiling itself is offerable");
-        assert!(!s.contains("setv:slippage:500"), "must not offer a looser value");
-        assert!(!s.contains("setv:slippage:1000"));
+        assert!(s.contains("setv:slippage:300"));
+        assert!(s.contains("setv:slippage:500"), "looser is allowed, it is their risk");
 
+        // Trade size is the exception: a size above the per-trade cap WOULD be
+        // refused, so it is not offered.
         let s = b.setting_editor("size").1.to_string();
-        assert!(!s.contains("setv:size:0.25"), "must not offer above the trade ceiling");
+        assert!(!s.contains("setv:size:0.25"), "must not offer above the per-trade cap");
         assert!(s.contains("setv:size:0.05"));
     }
 
