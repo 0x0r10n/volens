@@ -76,6 +76,10 @@ pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Observations kept per token. Enough for a stable median, small enough that
 /// tens of thousands of tokens stay cheap.
 const KEEP_PER_TOKEN: usize = 9;
+/// Observations an EXIT decision looks at — see `exit_price_sol`. Three is the
+/// smallest window that still needs corroboration: one bad print cannot carry
+/// the median, but the window turns within a few trades instead of nine.
+const EXIT_OBS: usize = 3;
 /// Observations kept for SOL/USD. Larger because it is one series and the
 /// artifacts are frequent.
 const KEEP_SOL: usize = 25;
@@ -442,6 +446,44 @@ impl PriceIndex {
         }
         let price = weighted_median(&series.recent)?;
         Some(Priced { price_sol: price, age, observations: series.recent.len() })
+    }
+
+    /// Price for an EXIT decision, where recency beats smoothness.
+    ///
+    /// `price_sol` takes the weighted median of all `KEEP_PER_TOKEN`
+    /// observations. That is right for the detector — the median is what
+    /// rejects the fee-vault and migration artifacts that produced $11T market
+    /// caps — but it is wrong as a sell trigger, because a median exists
+    /// precisely to *suppress* recent movement. When a token drops 80%, several
+    /// of the last nine prints are still pre-drop, so the median barely moves
+    /// and a stop-loss reading it cannot see the crash until it is over.
+    ///
+    /// So exits read only the newest `EXIT_OBS` observations. Still a median,
+    /// because one print with a misread token leg should not be able to fire a
+    /// sell on its own, but over a window short enough to actually turn.
+    ///
+    /// `max_age` should be TIGHT here (seconds, not the hour the detector
+    /// tolerates). Returning `None` is the honest answer for a position that
+    /// has stopped printing: the caller treats it as unpriceable and alerts
+    /// rather than selling blind, which is correct — no recent trades is the
+    /// shape a rug takes, and we could not have sold into it anyway.
+    pub fn exit_price_sol(&self, mint: &str, max_age: Duration) -> Option<Priced> {
+        let map = self.tokens();
+        let series = map.get(mint)?;
+        if series.recent.len() < MIN_OBS_FOR_PRICE {
+            return None;
+        }
+        let newest = series.recent.iter().map(|o| o.at).max()?;
+        let age = newest.elapsed();
+        if age > max_age {
+            return None;
+        }
+        // `recent` is chronological (push_back / pop_front), so the tail is the
+        // newest. Collected back into order for the weighting to read normally.
+        let tail: VecDeque<Obs> =
+            series.recent.iter().rev().take(EXIT_OBS).rev().copied().collect();
+        let price = weighted_median(&tail)?;
+        Some(Priced { price_sol: price, age, observations: tail.len() })
     }
 
     /// Cumulative SOL traded for a token since it was first observed.
@@ -904,5 +946,62 @@ mod tests {
         assert_eq!(i.tracked_tokens(), 2);
         assert_eq!(i.prune(Duration::from_secs(3600)), 1);
         assert_eq!(i.tracked_tokens(), 1);
+    }
+
+    /// The failure this function exists for: a position that has crashed, where
+    /// the full-window median still reports it near the old price.
+    ///
+    /// Six prints at 1.0, then three at 0.2 — an 80% drop. The detector's
+    /// median sits on the pre-drop majority and shows almost no move, so a
+    /// -15% stop reading it never fires. The exit price follows the crash.
+    #[test]
+    fn exit_price_follows_a_crash_the_full_median_cannot_see() {
+        let i = PriceIndex::new();
+        for _ in 0..6 {
+            i.seed("mint", 1.0, 1.0);
+        }
+        for _ in 0..3 {
+            i.seed("mint", 0.2, 1.0);
+        }
+
+        let detector = i.price_sol("mint", Duration::from_secs(60)).unwrap().price_sol;
+        let exit = i.exit_price_sol("mint", Duration::from_secs(60)).unwrap().price_sol;
+
+        assert_eq!(detector, 1.0, "full median is still anchored to the pre-crash prints");
+        assert_eq!(exit, 0.2, "exit price sees the crash");
+
+        // The point of the whole change, stated as the number the ladder reads.
+        let entry = 1.0;
+        assert!(
+            (exit - entry) / entry <= -0.15,
+            "a -15% stop must be able to fire on this position"
+        );
+        assert!(
+            (detector - entry) / entry > -0.15,
+            "and would NOT have fired on the full median"
+        );
+    }
+
+    #[test]
+    fn exit_price_refuses_a_stale_series() {
+        let i = PriceIndex::new();
+        i.seed("mint", 1.0, 1.0);
+        i.seed("mint", 1.0, 1.0);
+        // Fresh enough at a minute, not at a millisecond.
+        assert!(i.exit_price_sol("mint", Duration::from_secs(60)).is_some());
+        assert!(
+            i.exit_price_sol("mint", Duration::from_millis(0)).is_none(),
+            "a price too old to trust is None, not a sell signal"
+        );
+    }
+
+    #[test]
+    fn exit_price_still_needs_corroboration() {
+        let i = PriceIndex::new();
+        i.seed("mint", 1.0, 1.0);
+        assert!(
+            i.exit_price_sol("mint", Duration::from_secs(60)).is_none(),
+            "one print cannot fire a sell on its own"
+        );
     }
 }

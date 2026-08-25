@@ -1,6 +1,7 @@
 /target
 /data
 .env
+.env.*
 
 # --- SECRETS / KEYS: never commit these ---
 # Private keys. Committing this = anyone with the repo can drain the wallets.
@@ -36,3 +37,6 @@ local-settings.json
 local_*.jsonl
 sell_routes.jsonl
 exit_state.json
+
+# Runtime logs
+*.log

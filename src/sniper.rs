@@ -43,6 +43,15 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
+/// How stale a price may be and still fire an exit.
+///
+/// The detector tolerates an hour because it is describing a token; an exit is
+/// spending money on the claim that the price is what it says right now. A
+/// position that has not printed in 90 seconds is not "worth its last price" —
+/// it is a position we cannot currently see, and the sweep says so rather than
+/// selling against a number that stopped being true.
+const EXIT_PRICE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// Execution capability. Only `Armed` can ever sign; `DryRun` holds nothing.
 ///
 /// This is the core safety invariant — do not add a keypair to `DryRun`, and do
@@ -880,10 +889,39 @@ impl Sniper {
         // and the kill switch, so it would buy a mint whose owner can still
         // print supply or freeze the holder's account.
         //
+        // The mint read, the quote and the supply read are mutually
+        // independent — the market-cap ceiling needs neither the mint read nor
+        // the quote to be *issued*, and the quote needs neither read. They ran
+        // sequentially only because they were written in that order, which at
+        // ~150ms of network RTT apiece cost ~400ms of the critical path for
+        // nothing.
+        //
+        // Concurrency changes how long the decision takes, never what it
+        // decides: every result below is still checked, in the same order and
+        // with the same precedence, so a refusal reports the reason it always
+        // did. The only difference is that a mint which fails safety has now
+        // also spent a quote — wasted work on a token we were never going to
+        // buy, which is the correct trade for the time saved on ones we do.
+        let lamports = (size * 1e9) as u64;
+        let jup = Jupiter::new(&self.cfg.jupiter_base_url);
+        let max_mcap = live.effective_max_market_cap(&env);
+        let (mint_info, quote, supply) = tokio::join!(
+            self.rpc.mint_info(mint),
+            jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps),
+            // Not requested at all when the ceiling is off, as before.
+            async {
+                if max_mcap > 0.0 {
+                    self.rpc.token_supply(mint).await
+                } else {
+                    None
+                }
+            },
+        );
+
         // Fails CLOSED, like the pool path: unknown is refused, not trusted.
         // Spending money on a mint we could not verify is not a smaller
         // mistake than spending it on one we verified as bad.
-        let decimals = match self.rpc.mint_info(mint).await {
+        let decimals = match mint_info {
             Some(info) => {
                 if !info.mint_authority_revoked() {
                     return BuyOutcome::Refused { reason: "mint authority still live".into() };
@@ -903,9 +941,7 @@ impl Sniper {
             }
         };
 
-        let lamports = (size * 1e9) as u64;
-        let jup = Jupiter::new(&self.cfg.jupiter_base_url);
-        let quote = match jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await {
+        let quote = match quote {
             Ok(q) => q,
             Err(e) => {
                 return BuyOutcome::Failed { mint: mint.into(), reason: format!("quote: {e:#}") };
@@ -933,11 +969,9 @@ impl Sniper {
         // Priced from THIS quote rather than the stream index: the quote is the
         // price we are about to pay, and it exists by definition here, so the
         // check cannot be skipped for want of an observation.
-        let max_mcap = live.effective_max_market_cap(&env);
         if max_mcap > 0.0 {
             let tokens_out = quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
             let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
-            let supply = self.rpc.token_supply(mint).await;
             match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
                 Some((sol_usd, supply)) => {
                     let price_sol = size / tokens_out;
@@ -1033,15 +1067,24 @@ impl Sniper {
         // JOIN — audit record to position to ladder — can be tested; that join
         // silently produced an empty list for smart-money buys, and no amount
         // of testing the rules alone would have found it.
+        // Balances read concurrently. They are independent RPC round trips at
+        // ~150ms of network RTT each, and doing them one at a time put the
+        // whole position list behind the slowest link before the ladder had
+        // even been consulted.
+        let owner_ref = owner.as_str();
+        let reads = basis.into_iter().map(|(mint, cost)| async move {
+            let (raw, decimals) = self.rpc.token_balance_raw(owner_ref, &mint).await?;
+            Some((mint, cost, raw, decimals))
+        });
+        let read = futures::future::join_all(reads).await;
+
         let mut holdings = Vec::new();
-        for (mint, cost) in basis {
-            let Some((raw, decimals)) = self.rpc.token_balance_raw(&owner, &mint).await else {
-                continue;
-            };
-            let price_sol = self
-                .prices
-                .price_sol(&mint, std::time::Duration::from_secs(3600))
-                .map(|p| p.price_sol);
+        for (mint, cost, raw, decimals) in read.into_iter().flatten() {
+            // EXIT_PRICE_MAX_AGE, not the detector's hour: a stop-loss reading
+            // an hour-old price is not a stop-loss. See `exit_price_sol` for
+            // why this uses a short window rather than the full median.
+            let price_sol =
+                self.prices.exit_price_sol(&mint, EXIT_PRICE_MAX_AGE).map(|p| p.price_sol);
             holdings.push(crate::exits::Holding {
                 mint,
                 sol_spent: cost.sol_spent,

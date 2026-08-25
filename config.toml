@@ -450,7 +450,7 @@ exit_state_path = "exit_state.json"
 # How often open positions are re-priced for take-profit / stop-loss, seconds.
 # The rules themselves (levels, stop loss, trailing) live in settings.json and
 # are set from Telegram; auto-sell starts OFF.
-exit_check_secs = 15
+exit_check_secs = 5
 
 # Keypair file (Solana CLI JSON array). REQUIRED to arm.
 # Use a DEDICATED wallet, never your main one.
