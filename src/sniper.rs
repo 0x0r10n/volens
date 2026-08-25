@@ -568,6 +568,7 @@ impl Sniper {
             max_trades_per_day: cfg.max_trades_per_day,
             slippage_bps: cfg.slippage_bps,
             min_liquidity_sol: cfg.min_liquidity_sol,
+            curve_min_liquidity_sol: cfg.curve_min_liquidity_sol,
             max_market_cap_usd: cfg.max_market_cap_usd,
             max_price_impact_bps: cfg.max_price_impact_bps,
         };
@@ -761,6 +762,26 @@ impl Sniper {
         self.settings.update(|s| {
             s.min_liquidity_sol = v;
             Ok(format!("minimum liquidity set to {v} SOL"))
+        })
+    }
+
+    /// Liquidity floor for pump.fun bonding-curve entries.
+    ///
+    /// Unlike `set_min_liquidity` this is NOT raise-only: 0 is a legitimate
+    /// value and the common one. A curve has no LP for a deployer to pull, so
+    /// the pool floor's reasoning does not transfer, and applying it would
+    /// refuse exactly the early entries the curve path exists to catch.
+    pub fn set_curve_min_liquidity(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || !v.is_finite() {
+            return Err("curve minimum liquidity must be zero or a positive number".into());
+        }
+        self.settings.update(|s| {
+            s.curve_min_liquidity_sol = v;
+            Ok(if v == 0.0 {
+                "curve minimum liquidity cleared — no floor on bonding-curve entries".to_string()
+            } else {
+                format!("curve minimum liquidity set to {v} SOL")
+            })
         })
     }
 
@@ -2153,6 +2174,7 @@ mod tests {
             // Cooldown behaviour is covered explicitly below.
             pool_cooldown_secs: 0,
             min_liquidity_sol: 5.0,
+            curve_min_liquidity_sol: 0.0,
             slippage_bps: 300,
             kill_switch_file: String::new(),
             audit_log: String::new(),

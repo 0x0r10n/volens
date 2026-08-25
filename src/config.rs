@@ -387,6 +387,17 @@ pub struct SniperConfig {
     /// Liquidity re-checked at execution time, independent of the alert filter.
     #[serde(default = "default_snipe_min_liq")]
     pub min_liquidity_sol: f64,
+    /// Liquidity floor for pump.fun BONDING-CURVE entries, in SOL.
+    ///
+    /// Separate from `min_liquidity_sol`, which guards AMM pools. A thin AMM
+    /// pool is a rug surface because the deployer can pull the LP; a bonding
+    /// curve has no LP to pull, and a fresh one is supposed to be small.
+    /// Applying the pool floor to curves would refuse every early entry — the
+    /// entire reason to trade the curve.
+    ///
+    /// 0 = no floor (the default). Tunable live from Telegram.
+    #[serde(default)]
+    pub curve_min_liquidity_sol: f64,
     #[serde(default = "default_slippage_bps")]
     pub slippage_bps: u16,
     /// If this file exists, all execution halts immediately. Checked per
@@ -729,6 +740,7 @@ impl Default for SniperConfig {
             max_trades_per_day: default_max_trades(),
             pool_cooldown_secs: default_pool_cooldown(),
             min_liquidity_sol: default_snipe_min_liq(),
+            curve_min_liquidity_sol: 0.0,
             slippage_bps: default_slippage_bps(),
             kill_switch_file: default_kill_switch(),
             audit_log: default_audit_log(),

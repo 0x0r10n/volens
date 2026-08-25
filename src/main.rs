@@ -29,6 +29,8 @@ mod parser;
 mod positions;
 mod prices;
 #[cfg(feature = "sniper")]
+mod pumpfun;
+#[cfg(feature = "sniper")]
 mod quote;
 #[cfg(feature = "sniper")]
 mod routes;

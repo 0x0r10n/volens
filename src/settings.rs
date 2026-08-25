@@ -44,7 +44,21 @@ use std::sync::Mutex;
 pub struct LiveSettings {
     pub trade_size_sol: f64,
     pub slippage_bps: u16,
+    /// Liquidity floor for AMM/POOL entries (Raydium, PumpSwap, …).
     pub min_liquidity_sol: f64,
+    /// Liquidity floor for pump.fun BONDING-CURVE entries.
+    ///
+    /// Deliberately separate from `min_liquidity_sol`, and deliberately not
+    /// clamped by it. The pool floor exists because a thin AMM pool is a rug
+    /// surface: the deployer can pull it. A bonding curve has no LP to pull —
+    /// its reserves are the program's, and a fresh curve is SUPPOSED to be
+    /// small. Applying the pool floor to a curve does not make curve entries
+    /// safer, it just refuses every early entry, which is the entire reason to
+    /// trade the curve at all.
+    ///
+    /// 0 = no floor. Raise it from Telegram if curve entries prove too thin.
+    #[serde(default)]
+    pub curve_min_liquidity_sol: f64,
     /// `open` or `guard`. Stored as text so the file stays readable and this
     /// module does not depend on the sniper's types.
     pub snipe_mode: String,
@@ -84,6 +98,9 @@ pub struct Envelope {
     pub max_trades_per_day: u32,
     pub slippage_bps: u16,
     pub min_liquidity_sol: f64,
+    /// Hard floor for CURVE entries. Separate from the pool floor above; see
+    /// `LiveSettings::curve_min_liquidity_sol`. Defaults to 0 (no floor).
+    pub curve_min_liquidity_sol: f64,
     pub max_market_cap_usd: f64,
     pub max_price_impact_bps: u32,
 }
@@ -135,6 +152,7 @@ impl LiveSettings {
             trade_size_sol,
             slippage_bps: env.slippage_bps,
             min_liquidity_sol: env.min_liquidity_sol,
+            curve_min_liquidity_sol: env.curve_min_liquidity_sol,
             snipe_mode: snipe_mode.to_string(),
             max_trade_size_sol: 0.0,
             daily_cap_sol: 0.0,
@@ -261,6 +279,12 @@ fn clamp(s: &mut LiveSettings, env: &Envelope) {
         s.slippage_bps = s.slippage_bps.min(env.slippage_bps);
     }
     s.min_liquidity_sol = s.min_liquidity_sol.max(env.min_liquidity_sol);
+    // Against its OWN envelope, never the pool floor: the whole point of the
+    // curve setting is that the pool floor must not reach it.
+    s.curve_min_liquidity_sol = s.curve_min_liquidity_sol.max(env.curve_min_liquidity_sol);
+    if !s.curve_min_liquidity_sol.is_finite() || s.curve_min_liquidity_sol < 0.0 {
+        s.curve_min_liquidity_sol = 0.0;
+    }
     let max_size = tightest(s.max_trade_size_sol, env.max_trade_size_sol);
     if max_size > 0.0 {
         s.trade_size_sol = s.trade_size_sol.min(max_size);
@@ -282,6 +306,7 @@ mod tests {
             max_trades_per_day: 10,
             slippage_bps: 300,
             min_liquidity_sol: 15.0,
+            curve_min_liquidity_sol: 0.0,
             max_market_cap_usd: 50_000.0,
             max_price_impact_bps: 1000,
         }

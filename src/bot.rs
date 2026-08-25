@@ -1429,7 +1429,12 @@ impl Bot {
                 {"text": format!("📉 Slippage · {} bps", live.slippage_bps), "callback_data": "set:slippage"},
             ]));
             rows.push(serde_json::json!([
-                {"text": format!("💧 Min liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
+                {"text": format!("💧 Pool liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
+                {"text": format!("🌱 Curve liq · {}", if live.curve_min_liquidity_sol == 0.0 {
+                    "off".to_string() } else { format!("{} SOL", live.curve_min_liquidity_sol) }),
+                 "callback_data": "set:curveliq"},
+            ]));
+            rows.push(serde_json::json!([
                 {"text": format!("🎚 TP / SL · {}", crate::exits::describe(&live.exits)), "callback_data": "set:exits"},
             ]));
             let env = sniper.envelope();
@@ -1513,6 +1518,7 @@ impl Bot {
             "size" => ("trade size", "e.g. <code>0.03</code> (SOL)"),
             "slippage" => ("slippage", "e.g. <code>250</code> (bps)"),
             "minliq" => ("minimum liquidity", "e.g. <code>20</code> (SOL)"),
+            "curveliq" => ("curve minimum liquidity", "e.g. <code>0</code> for no floor"),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
@@ -1786,9 +1792,14 @@ impl Bot {
                 "slippage" => ("📉 Slippage", "Tighten-only. Lower means fewer fills but less sandwich exposure.",
                     format!("{} bps", live.slippage_bps),
                     vec![50.0, 100.0, 200.0, 300.0, 500.0, 1000.0], " bps", false),
-                "minliq" => ("💧 Minimum liquidity", "Raise-only. Pools below this are refused.",
+                "minliq" => ("💧 Pool liquidity floor", "AMM pools below this are refused. Raise-only.",
                     format!("{} SOL", live.min_liquidity_sol),
                     vec![5.0, 10.0, 15.0, 25.0, 50.0, 100.0], " SOL", false),
+                "curveliq" => ("🌱 Curve liquidity floor",
+                    "pump.fun bonding curves only. 0 = no floor, so early entries are not refused for being small.",
+                    if live.curve_min_liquidity_sol == 0.0 { "off".to_string() }
+                    else { format!("{} SOL", live.curve_min_liquidity_sol) },
+                    vec![0.0, 1.0, 2.0, 5.0, 10.0, 20.0], " SOL", false),
                 "maxsize" => ("🧢 Max trade size", "Per-trade ceiling. Lowering it also lowers the trade size.",
                     fmt_eff(live.max_trade_size_sol, env.max_trade_size_sol, " SOL"),
                     vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", true),
@@ -1878,6 +1889,7 @@ impl Bot {
             "size" => sniper.set_trade_size(v),
             "slippage" => sniper.set_slippage_bps(v as u16),
             "minliq" => sniper.set_min_liquidity(v),
+            "curveliq" => sniper.set_curve_min_liquidity(v),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
@@ -3047,7 +3059,7 @@ mod tests {
 
         let (_, kb) = b.settings_screen();
         let blob = kb.to_string();
-        for field in ["size", "slippage", "minliq", "exits", "autobuy"] {
+        for field in ["size", "slippage", "minliq", "curveliq", "exits", "autobuy"] {
             assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
         }
         // Spend caps are deliberately absent. Trade size bounds a single
@@ -3083,7 +3095,7 @@ mod tests {
         }
 
         // …and each editor offers presets plus a typed escape hatch.
-        for field in ["size", "slippage", "minliq"] {
+        for field in ["size", "slippage", "minliq", "curveliq"] {
             let (_, kb) = b.setting_editor(field);
             let s = kb.to_string();
             assert!(s.contains(&format!("setv:{field}:")), "{field} has no preset buttons");
