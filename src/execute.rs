@@ -972,3 +972,306 @@ async fn sell_pumpswap(
     instructions.push(tx::unwrap_sol(owner)?);
     Ok(ExecutionPlan { instructions, quote: q, venue: Dex::PumpSwap })
 }
+
+// ---------------------------------------------------------------------------
+// pump.fun bonding curve
+// ---------------------------------------------------------------------------
+
+/// What a curve trade needs beyond the mint: read once, used by both directions.
+///
+/// Two RPC reads and one owner lookup. Compare with the Jupiter path's two API
+/// round trips on a globally throttled lane — this is the whole reason the
+/// direct path exists.
+async fn curve_context(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    owner: &Pubkey,
+) -> Result<(crate::pumpfun::BondingCurve, crate::pumpfun::Global, crate::pumpfun::TradeContext)> {
+    let curve_addr = crate::pumpfun::bonding_curve_pda(mint).to_string();
+    let global_addr = crate::pumpfun::global_pda().to_string();
+    let mint_str = mint.to_string();
+
+    // Independent reads — the curve, the fee config, and the mint's owning
+    // program have no ordering between them.
+    let (curve_raw, global_raw, mint_owner) = tokio::join!(
+        rpc.account_data(&curve_addr),
+        rpc.account_data(&global_addr),
+        rpc.account_owner(&mint_str),
+    );
+
+    let curve = crate::pumpfun::BondingCurve::decode(
+        &curve_raw.ok_or_else(|| anyhow::anyhow!("no pump.fun bonding curve for {mint_str}"))?,
+    )?;
+    let global = crate::pumpfun::Global::decode(
+        &global_raw.ok_or_else(|| anyhow::anyhow!("could not read pump.fun global account"))?,
+    )?;
+    // Fails CLOSED. pump.fun mints are commonly Token-2022, and an ATA derived
+    // under the wrong program is a DIFFERENT ADDRESS — the transaction fails,
+    // or worse, initialises an account we then cannot spend from.
+    let token_program = tx::pk(
+        &mint_owner.ok_or_else(|| anyhow::anyhow!("could not read the owning program of {mint_str}"))?,
+    )?;
+
+    Ok((
+        curve,
+        global,
+        crate::pumpfun::TradeContext {
+            mint: *mint,
+            user: *owner,
+            token_program,
+            // NOT `global.fee_recipient` — mainnet rejects it as NotAuthorized.
+            // See `Global::authorized_fee_recipient`. Spread across the set by
+            // the mint, so trades do not all pin one account.
+            fee_recipient: global.authorized_fee_recipient(mint.as_ref()[0] as usize)?,
+            creator: curve.creator,
+        },
+    ))
+}
+
+/// The curve's current price in SOL per whole token, for guards and logging.
+pub fn curve_price_sol(curve: &crate::pumpfun::BondingCurve, decimals: u8) -> f64 {
+    let vq = curve.virtual_quote_reserves as f64 / 1e9;
+    let vt = curve.virtual_token_reserves as f64 / 10f64.powi(decimals as i32);
+    if vt <= 0.0 { 0.0 } else { vq / vt }
+}
+
+/// Buy a pump.fun token DIRECTLY on its bonding curve.
+///
+/// No pool lookup and no quote API: the curve address is a PDA of the mint, so
+/// a smart-money signal — which carries only a mint — is enough.
+///
+/// `min_curve_liquidity_sol` is the CURVE floor, not the pool floor. A curve
+/// has no LP for a deployer to pull, so the pool guard's reasoning does not
+/// transfer and applying it would refuse every early entry. 0 disables.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_pumpfun_buy(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    lamports_in: u64,
+    slippage_bps: u16,
+    min_curve_liquidity_sol: f64,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    let (curve, global, ctx) = curve_context(rpc, mint, owner).await?;
+
+    // `tradable()` already refuses a completed or non-SOL-quoted curve; this is
+    // the operator's own floor on top.
+    if min_curve_liquidity_sol > 0.0 {
+        let real_sol = curve.real_quote_reserves as f64 / 1e9;
+        if real_sol < min_curve_liquidity_sol {
+            bail!(
+                "curve liquidity {real_sol:.4} SOL below the {min_curve_liquidity_sol} SOL floor"
+            );
+        }
+    }
+
+    let q = crate::pumpfun::buy_quote(&curve, &global, lamports_in, slippage_bps)?;
+
+    let mut instructions = tx::compute_budget(unit_limit, priority_fee);
+    // The curve takes native SOL, NOT wrapped — so no wrap/unwrap here, unlike
+    // every AMM path in this module. Only the token side needs an account.
+    instructions.push(tx::ensure_token_ata_with_program(owner, mint, &ctx.token_program));
+    instructions.push(crate::pumpfun::buy_ix(&ctx, &q));
+
+    Ok(ExecutionPlan {
+        instructions,
+        quote: Quote {
+            expected_out: q.expected_tokens,
+            minimum_out: q.amount,
+            // Share of the quote reserve this trade consumes — the same meaning
+            // the AMM paths give it, so the impact guard reads it correctly.
+            // Reporting 0 here would hand every curve trade a free pass.
+            price_impact_bps: curve_impact_bps(&curve, lamports_in),
+        },
+        venue: Dex::PumpSwap,
+    })
+}
+
+/// How far this buy moves the curve, in basis points of the quote reserve.
+fn curve_impact_bps(curve: &crate::pumpfun::BondingCurve, lamports_in: u64) -> u32 {
+    let vq = curve.virtual_quote_reserves as u128;
+    if vq == 0 {
+        return u32::MAX;
+    }
+    let bps = (lamports_in as u128)
+        .saturating_mul(10_000)
+        .checked_div(vq.saturating_add(lamports_in as u128))
+        .unwrap_or(0);
+    u32::try_from(bps).unwrap_or(u32::MAX)
+}
+
+/// Sell a pump.fun token DIRECTLY on its bonding curve.
+///
+/// The exit half matters more than the entry: a token we can buy and cannot
+/// sell is strictly worse than one we skipped. This deliberately does not
+/// depend on Jupiter, which has IP-blocked this box before and would therefore
+/// fail exactly when a stop-loss needs it.
+#[allow(clippy::too_many_arguments)]
+pub async fn build_pumpfun_sell(
+    rpc: &RpcClient,
+    mint: &Pubkey,
+    owner: &Pubkey,
+    token_amount_in: u64,
+    slippage_bps: u16,
+    unit_limit: u32,
+    priority_fee: u64,
+) -> Result<ExecutionPlan> {
+    if token_amount_in == 0 {
+        bail!("nothing to sell");
+    }
+    let (curve, _global, ctx) = curve_context(rpc, mint, owner).await?;
+    let q = crate::pumpfun::sell_quote(&curve, token_amount_in, slippage_bps)?;
+
+    let mut instructions = tx::compute_budget(unit_limit, priority_fee);
+    // No ATA creation: we are selling a balance we already hold, so the account
+    // exists by definition. No unwrap either — the curve pays native SOL.
+    instructions.push(crate::pumpfun::sell_ix(&ctx, &q));
+
+    Ok(ExecutionPlan {
+        instructions,
+        quote: Quote {
+            expected_out: q.expected_sol,
+            minimum_out: q.min_sol_output,
+            price_impact_bps: 0,
+        },
+        venue: Dex::PumpSwap,
+    })
+}
+
+#[cfg(test)]
+mod pumpfun_sim {
+    use super::*;
+
+    /// Simulate a REAL pump.fun bonding-curve buy and sell against mainnet.
+    ///
+    /// This is the gate the encoder has to pass before anything is allowed to
+    /// trade through it. Golden fixtures prove we reproduce an instruction that
+    /// once landed; only the node can tell us the instruction we build TODAY,
+    /// against today's accounts, actually executes.
+    ///
+    /// `sigVerify: false` — nothing is signed, nothing is submitted, and a
+    /// pubkey cannot sign, so this adds no capability.
+    ///
+    ///   VOLENS_SIM_PAYER=<funded-pubkey> VOLENS_SIM_MINT=<live-curve-mint> \
+    ///     cargo test --features sniper -- --ignored --nocapture pumpfun_sim
+    #[tokio::test]
+    #[ignore = "hits mainnet RPC; needs VOLENS_SIM_PAYER and VOLENS_SIM_MINT"]
+    async fn live_simulate_pumpfun_buy_and_sell() {
+        use solana_message::Message;
+        use solana_transaction::Transaction;
+
+        let payer = std::env::var("VOLENS_SIM_PAYER")
+            .expect("set VOLENS_SIM_PAYER to a pubkey that EXISTS on-chain");
+        let mint_str = std::env::var("VOLENS_SIM_MINT")
+            .expect("set VOLENS_SIM_MINT to a pump.fun mint whose curve is still live");
+        let owner = tx::pk(&payer).expect("VOLENS_SIM_PAYER must be a valid pubkey");
+        let mint = tx::pk(&mint_str).expect("VOLENS_SIM_MINT must be a valid pubkey");
+
+        let url = std::env::var("RPC_URL")
+            .unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".into());
+        let cfg = crate::config::RpcConfig {
+            url,
+            initial_delay_ms: 0,
+            retries: 3,
+            retry_delay_ms: 1500,
+            ..Default::default()
+        };
+        let rpc = crate::rpc::RpcClient::new(&cfg);
+
+        let simulate = |plan: ExecutionPlan, label: &'static str| {
+            let rpc = &rpc;
+            async move {
+                let msg = Message::new(&plan.instructions, Some(&owner));
+                let tx = Transaction::new_unsigned(msg);
+                let bytes = bincode::serialize(&tx).expect("serialize");
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let sim = rpc.simulate_transaction(&b64).await.expect("simulation result");
+                let logs = sim
+                    .get("logs")
+                    .and_then(|l| l.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join("\n"))
+                    .unwrap_or_default();
+                let err = sim.get("err").cloned().unwrap_or(serde_json::Value::Null);
+                let units = sim.get("unitsConsumed").and_then(|u| u.as_u64()).unwrap_or(0);
+                println!(
+                    "\n===== {label} =====\nexpected_out={} minimum_out={}\nerr={err}\nunits={units}\nlogs:\n{logs}\n",
+                    plan.quote.expected_out, plan.quote.minimum_out
+                );
+                (err, units, logs)
+            }
+        };
+
+        // --- Which fee recipient does the program actually accept? ---
+        // Mainnet rejected both the `fee_recipient` field and array[0] with
+        // NotAuthorized, so rather than guess again, ask the node about every
+        // candidate. Whatever passes here is the ground truth the encoder uses.
+        if std::env::var("VOLENS_SIM_PROBE_FEE").is_ok() {
+            let g_raw = rpc
+                .account_data(&crate::pumpfun::global_pda().to_string())
+                .await
+                .expect("global");
+            let g = crate::pumpfun::Global::decode(&g_raw).expect("decode global");
+            let mut cands = vec![("field", g.fee_recipient)];
+            for (i, r) in g.fee_recipients.iter().enumerate() {
+                cands.push((Box::leak(format!("array[{i}]").into_boxed_str()), *r));
+            }
+            for (label, cand) in cands {
+                let mut plan =
+                    build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 300_000, 100_000)
+                        .await
+                        .expect("build buy");
+                let last = plan.instructions.len() - 1;
+                plan.instructions[last].accounts[1].pubkey = cand;
+                let msg = Message::new(&plan.instructions, Some(&owner));
+                let txn = Transaction::new_unsigned(msg);
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(&txn).unwrap());
+                let sim = rpc.simulate_transaction(&b64).await.expect("sim");
+                let err = sim.get("err").cloned().unwrap_or(serde_json::Value::Null);
+                println!("FEE PROBE {label:10} {cand}  -> {}",
+                    if err.is_null() { "ACCEPTED".to_string() } else { format!("{err}") });
+            }
+            return;
+        }
+
+        // --- BUY ---
+        let buy = build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 300_000, 100_000)
+            .await
+            .expect("build buy");
+        let (err, units, logs) = simulate(buy, "BUY").await;
+        assert_eq!(err, serde_json::Value::Null, "buy must simulate clean\nlogs:\n{logs}");
+        assert!(units > 0, "no compute consumed — nothing executed");
+        assert!(
+            logs.contains("Instruction: Buy"),
+            "the pump.fun buy instruction must have run\nlogs:\n{logs}"
+        );
+
+        // --- SELL ---
+        // Sells whatever the payer already holds. A payer with no balance
+        // proves nothing about the sell path, so that is called out rather than
+        // passing quietly.
+        let held = rpc
+            .token_balance_raw(&payer, &mint_str)
+            .await
+            .map(|(raw, _)| raw)
+            .unwrap_or(0);
+        if held == 0 {
+            println!("SELL SKIPPED: payer holds none of {mint_str} — fund it to prove the exit");
+            return;
+        }
+        let sell = build_pumpfun_sell(&rpc, &mint, &owner, held, 500, 300_000, 100_000)
+            .await
+            .expect("build sell");
+        let (err, units, logs) = simulate(sell, "SELL").await;
+        assert_eq!(err, serde_json::Value::Null, "sell must simulate clean\nlogs:\n{logs}");
+        assert!(units > 0, "no compute consumed on the sell");
+        assert!(
+            logs.contains("Instruction: Sell"),
+            "the pump.fun sell instruction must have run\nlogs:\n{logs}"
+        );
+    }
+}

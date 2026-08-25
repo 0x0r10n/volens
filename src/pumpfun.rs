@@ -157,6 +157,113 @@ impl BondingCurve {
     }
 }
 
+/// The program's `Global` account: who takes the fee, and how much.
+///
+/// Read rather than hardcoded. The fee rates have changed over this program's
+/// life, and a stale constant would quietly bias every quote — the kind of
+/// wrong that shows up as "our fills are worse than they should be" months
+/// later, not as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Global {
+    /// The `fee_recipient` FIELD. Kept for reference — but see
+    /// `authorized_fee_recipient`: the program does not necessarily accept it.
+    pub fee_recipient: Pubkey,
+    pub fee_basis_points: u64,
+    pub creator_fee_basis_points: u64,
+    /// The recipients the program actually authorizes.
+    pub fee_recipients: [Pubkey; 7],
+}
+
+impl Global {
+    /// A fee recipient the program will accept.
+    ///
+    /// # Why this is not simply `fee_recipient`
+    ///
+    /// Passing the `fee_recipient` field was rejected by mainnet simulation:
+    ///
+    /// ```text
+    /// AnchorError thrown in programs/pump/src/fee_recipient.rs:19
+    /// Error Code: NotAuthorized. Error Number: 6000.
+    /// ```
+    ///
+    /// The program validates against the `fee_recipients` ARRAY, and the two
+    /// disagree — the field is stale relative to what is currently authorized.
+    /// Captured mainnet buys back this up: they used array members, and one
+    /// used a recipient that is in neither list any more, so this set rotates.
+    ///
+    /// Reading the array every time is therefore not defensive programming, it
+    /// is the only correct behaviour. `index` spreads load across the set
+    /// rather than pinning every trade to one account.
+    pub fn authorized_fee_recipient(&self, index: usize) -> Result<Pubkey> {
+        let live: Vec<Pubkey> =
+            self.fee_recipients.iter().copied().filter(|p| *p != Pubkey::default()).collect();
+        if live.is_empty() {
+            bail!("pump.fun global lists no authorized fee recipients");
+        }
+        Ok(live[index % live.len()])
+    }
+}
+
+const OFF_G_INITIALIZED: usize = 8;
+const OFF_G_FEE_RECIPIENT: usize = 41;
+const OFF_G_FEE_BPS: usize = 105;
+const OFF_G_CREATOR_FEE_BPS: usize = 154;
+/// `fee_recipients: [pubkey; 7]`, immediately after `creator_fee_basis_points`.
+const OFF_G_FEE_RECIPIENTS: usize = 162;
+const GLOBAL_MIN_LEN: usize = OFF_G_FEE_RECIPIENTS + 32 * 7;
+/// Anchor discriminator of the `Global` account.
+const GLOBAL_ACCOUNT_DISCRIMINATOR: [u8; 8] = [0xa7, 0xe8, 0xe8, 0xb1, 0xc8, 0x6c, 0x72, 0x7f];
+
+impl Global {
+    /// Decode, checking the discriminator so a wrong account cannot supply a
+    /// fee recipient we would then pay.
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < GLOBAL_MIN_LEN {
+            bail!("pump.fun global account too short: {} bytes", data.len());
+        }
+        if data[..8] != GLOBAL_ACCOUNT_DISCRIMINATOR {
+            bail!("not a pump.fun global account (discriminator mismatch)");
+        }
+        if data[OFF_G_INITIALIZED] != 1 {
+            bail!("pump.fun global account is not initialized");
+        }
+        let u64_at = |off: usize| {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&data[off..off + 8]);
+            u64::from_le_bytes(b)
+        };
+        let mut fr = [0u8; 32];
+        fr.copy_from_slice(&data[OFF_G_FEE_RECIPIENT..OFF_G_FEE_RECIPIENT + 32]);
+        let mut recipients = [Pubkey::default(); 7];
+        for (i, slot) in recipients.iter_mut().enumerate() {
+            let off = OFF_G_FEE_RECIPIENTS + i * 32;
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&data[off..off + 32]);
+            *slot = Pubkey::new_from_array(b);
+        }
+        let g = Self {
+            fee_recipient: Pubkey::new_from_array(fr),
+            fee_basis_points: u64_at(OFF_G_FEE_BPS),
+            creator_fee_basis_points: u64_at(OFF_G_CREATOR_FEE_BPS),
+            fee_recipients: recipients,
+        };
+        // A fee that large means the layout moved, not that pump.fun started
+        // charging 50%. Refuse rather than quote against it.
+        if g.total_fee_bps() >= 5_000 {
+            bail!("implausible pump.fun fees ({} bps) — layout mismatch", g.total_fee_bps());
+        }
+        if g.fee_recipient == Pubkey::default() {
+            bail!("pump.fun global has no fee recipient");
+        }
+        Ok(g)
+    }
+
+    /// Total fee taken off the SOL leg, in basis points.
+    pub fn total_fee_bps(&self) -> u64 {
+        self.fee_basis_points.saturating_add(self.creator_fee_basis_points)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Address derivation — the whole point: no lookup, no index, no Jupiter.
 // ---------------------------------------------------------------------------
@@ -226,7 +333,12 @@ pub struct BuyQuote {
 /// and fails if it exceeds the ceiling. So an underestimate of fees costs a
 /// FAILED TRANSACTION, never an overspend. Getting this backwards — modelling
 /// fees optimistically on an exact-IN venue — is how you overpay silently.
-pub fn buy_quote(curve: &BondingCurve, sol_in: u64, slippage_bps: u16) -> Result<BuyQuote> {
+pub fn buy_quote(
+    curve: &BondingCurve,
+    global: &Global,
+    sol_in: u64,
+    slippage_bps: u16,
+) -> Result<BuyQuote> {
     curve.tradable()?;
     if slippage_bps >= 10_000 {
         bail!("slippage_bps {slippage_bps} >= 10000 leaves no minimum at all");
@@ -235,9 +347,17 @@ pub fn buy_quote(curve: &BondingCurve, sol_in: u64, slippage_bps: u16) -> Result
         bail!("cannot buy with 0 lamports");
     }
 
+    // Fees come off the SOL leg BEFORE it reaches the curve, so quoting the
+    // full budget would promise tokens the program will not deliver — and on an
+    // exact-out instruction that is a failed transaction. Rates are read from
+    // `Global`, not assumed.
+    let fee_bps = global.total_fee_bps().min(10_000) as u128;
     let vt = curve.virtual_token_reserves as u128;
     let vq = curve.virtual_quote_reserves as u128;
-    let amt = sol_in as u128;
+    let amt = (sol_in as u128) * (10_000 - fee_bps) / 10_000;
+    if amt == 0 {
+        bail!("fees consume the entire {sol_in} lamport budget");
+    }
 
     let out = vt
         .checked_mul(amt)
@@ -470,6 +590,25 @@ mod tests {
         assert_eq!(ata.to_string(), "8XU9qdcehhAyEU4zRswtndhStYjUqr8eB56YkWdHNfug");
     }
 
+    /// The live `Global` values: 95 bps protocol + 5 bps creator = 100 bps.
+    fn global() -> Global {
+        Global {
+            fee_recipient: Pubkey::from_str("62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV")
+                .unwrap(),
+            fee_basis_points: 95,
+            creator_fee_basis_points: 5,
+            fee_recipients: [
+                Pubkey::from_str("7VtfL8fvgNfhz17qKRMjzQEXgbdpnHHHQRh54R9jP2RJ").unwrap(),
+                Pubkey::from_str("7hTckgnGnLQR6sdH7YkqFTAA7VwTfYFaZ6EhEsU3saCX").unwrap(),
+                Pubkey::from_str("9rPYyANsfQZw3DnDmKE3YCQF5E8oD89UXoHn9JFEhJUz").unwrap(),
+                Pubkey::from_str("AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY").unwrap(),
+                Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM").unwrap(),
+                Pubkey::from_str("FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz").unwrap(),
+                Pubkey::from_str("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP").unwrap(),
+            ],
+        }
+    }
+
     /// The exact 151-byte curve account behind fixture 1.
     fn curve_bytes() -> Vec<u8> {
         let mut d = vec![0u8; 151];
@@ -528,7 +667,7 @@ mod tests {
         let err = c.tradable().unwrap_err().to_string();
         assert!(err.contains("not SOL"), "got: {err}");
         // And the quote path must refuse too, not merely the flag.
-        assert!(buy_quote(&c, 10_000_000, 300).is_err());
+        assert!(buy_quote(&c, &global(), 10_000_000, 300).is_err());
         assert!(sell_quote(&c, 1_000_000, 300).is_err());
     }
 
@@ -536,9 +675,10 @@ mod tests {
     fn buy_quote_prices_against_virtual_reserves() {
         let c = BondingCurve::decode(&curve_bytes()).unwrap();
         let sol_in = 10_000_000u64; // 0.01 SOL
-        let q = buy_quote(&c, sol_in, 300).unwrap();
-        // out = vt * in / (vq + in)
-        let expect = (648814217107443u128 * sol_in as u128) / (49613586138u128 + sol_in as u128);
+        let q = buy_quote(&c, &global(), sol_in, 300).unwrap();
+        // Fees come off first: 100 bps of the budget never reaches the curve.
+        let net = (sol_in as u128) * 9_900 / 10_000;
+        let expect = (648814217107443u128 * net) / (49613586138u128 + net);
         assert_eq!(q.expected_tokens as u128, expect);
         assert_eq!(q.max_sol_cost, sol_in, "the ceiling is our whole budget");
         assert!(q.amount < q.expected_tokens, "slippage must lower the minimum");
@@ -551,7 +691,7 @@ mod tests {
         // Real tokens far below what the virtual formula would promise.
         d[OFF_REAL_TOKEN..OFF_REAL_TOKEN + 8].copy_from_slice(&1_000u64.to_le_bytes());
         let c = BondingCurve::decode(&d).unwrap();
-        let q = buy_quote(&c, 10_000_000_000, 300).unwrap();
+        let q = buy_quote(&c, &global(), 10_000_000_000, 300).unwrap();
         assert!(q.expected_tokens <= 1_000, "capped at real reserves, got {}", q.expected_tokens);
     }
 
@@ -569,8 +709,8 @@ mod tests {
     #[test]
     fn degenerate_inputs_are_refused() {
         let c = BondingCurve::decode(&curve_bytes()).unwrap();
-        assert!(buy_quote(&c, 0, 300).is_err(), "zero in");
-        assert!(buy_quote(&c, 1_000_000, 10_000).is_err(), "100% slippage");
+        assert!(buy_quote(&c, &global(), 0, 300).is_err(), "zero in");
+        assert!(buy_quote(&c, &global(), 1_000_000, 10_000).is_err(), "100% slippage");
         assert!(sell_quote(&c, 0, 300).is_err(), "zero tokens");
     }
 
