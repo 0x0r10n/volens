@@ -1022,8 +1022,23 @@ async fn curve_context(
             // NOT `global.fee_recipient` — mainnet rejects it as NotAuthorized.
             // See `Global::authorized_fee_recipient`. Spread across the set by
             // the mint, so trades do not all pin one account.
-            fee_recipient: global.authorized_fee_recipient(mint.as_ref()[0] as usize)?,
+            // The CURVE decides which recipient set is valid, not Global alone.
+            fee_recipient: global.recipient_for(&curve, mint.as_ref()[0] as usize)?,
             creator: curve.creator,
+            // The deployed program needs TWO accounts past the IDL's sixteen,
+            // in this order. Both were identified by simulation naming them:
+            //   [16] InvalidBondingCurveV2   -> bonding_curve_v2
+            //   [17] BuybackFeeRecipient…    -> Global::buyback_fee_recipients
+            extra_accounts: vec![
+                solana_instruction::AccountMeta::new(
+                    crate::pumpfun::bonding_curve_v2_pda(mint),
+                    false,
+                ),
+                solana_instruction::AccountMeta::new(
+                    global.buyback_fee_recipient(mint.as_ref()[1] as usize)?,
+                    false,
+                ),
+            ],
         },
     ))
 }
@@ -1208,6 +1223,56 @@ mod pumpfun_sim {
         // Mainnet rejected both the `fee_recipient` field and array[0] with
         // NotAuthorized, so rather than guess again, ask the node about every
         // candidate. Whatever passes here is the ground truth the encoder uses.
+        if let Ok(shape) = std::env::var("VOLENS_SIM_PROBE_SHAPE") {
+            use solana_instruction::AccountMeta;
+            let g_raw = rpc.account_data(&crate::pumpfun::global_pda().to_string()).await.unwrap();
+            let g = crate::pumpfun::Global::decode(&g_raw).unwrap();
+            let c_raw = rpc
+                .account_data(&crate::pumpfun::bonding_curve_pda(&mint).to_string())
+                .await
+                .unwrap();
+            let curve = crate::pumpfun::BondingCurve::decode(&c_raw).unwrap();
+            let bb = g.buyback_fee_recipient(0).unwrap();
+            let fr = g.recipient_for(&curve, 0).unwrap();
+            let wsol = tx::pk("So11111111111111111111111111111111111111112").unwrap();
+            let tokkeg = tx::pk("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").unwrap();
+            let ata = |o: &Pubkey, m: &Pubkey| {
+                spl_associated_token_account_interface::address::
+                    get_associated_token_address_with_program_id(o, m, &tokkeg)
+            };
+            let shapes: Vec<(&str, Vec<AccountMeta>)> = vec![
+                ("bb_only", vec![AccountMeta::new(bb, false)]),
+                ("bbAta_bb", vec![AccountMeta::new(ata(&bb, &wsol), false), AccountMeta::new(bb, false)]),
+                ("bb_bbAta", vec![AccountMeta::new(bb, false), AccountMeta::new(ata(&bb, &wsol), false)]),
+                ("frAta_bb", vec![AccountMeta::new(ata(&fr, &wsol), false), AccountMeta::new(bb, false)]),
+                ("bbAtaMint_bb", vec![AccountMeta::new(ata(&bb, &mint), false), AccountMeta::new(bb, false)]),
+            ];
+            for (label, extra) in shapes {
+                if !shape.is_empty() && shape != "all" && shape != label { continue; }
+                let mut plan =
+                    build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 300_000, 100_000)
+                        .await
+                        .expect("build");
+                let last = plan.instructions.len() - 1;
+                plan.instructions[last].accounts.truncate(16);
+                plan.instructions[last].accounts.extend(extra.clone());
+                let msg = Message::new(&plan.instructions, Some(&owner));
+                let txn = Transaction::new_unsigned(msg);
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(&txn).unwrap());
+                let sim = rpc.simulate_transaction(&b64).await.expect("sim");
+                let err = sim.get("err").cloned().unwrap_or(serde_json::Value::Null);
+                let logs = sim.get("logs").and_then(|l| l.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                let anchor = logs.split(" | ").find(|l| l.contains("AnchorError")).unwrap_or("");
+                println!("SHAPE {label:14} naccts={} -> {}", 16 + extra.len(),
+                    if err.is_null() { "CLEAN".to_string() } else { format!("{err} {anchor}") });
+            }
+            return;
+        }
+
         if std::env::var("VOLENS_SIM_PROBE_FEE").is_ok() {
             let g_raw = rpc
                 .account_data(&crate::pumpfun::global_pda().to_string())
@@ -1260,7 +1325,31 @@ mod pumpfun_sim {
             .map(|(raw, _)| raw)
             .unwrap_or(0);
         if held == 0 {
-            println!("SELL SKIPPED: payer holds none of {mint_str} — fund it to prove the exit");
+            // The payer holds none of this token, so prove the exit the only
+            // honest way available: simulate BUY THEN SELL in one transaction.
+            // After the buy executes, the ATA really does hold tokens, so the
+            // sell runs against genuine state rather than a hypothetical.
+            println!("payer holds none — proving the sell by buy+sell in one transaction");
+            let buy = build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 600_000, 100_000)
+                .await
+                .expect("build buy");
+            let sell_amount = buy.quote.minimum_out;
+            let sell = build_pumpfun_sell(&rpc, &mint, &owner, sell_amount, 500, 600_000, 100_000)
+                .await
+                .expect("build sell");
+            let mut ixs = buy.instructions.clone();
+            // Only the swap instruction — the compute budget is already set.
+            ixs.push(sell.instructions.last().unwrap().clone());
+            let combined = ExecutionPlan {
+                instructions: ixs,
+                quote: sell.quote,
+                venue: sell.venue,
+            };
+            let (err, units, logs) = simulate(combined, "BUY + SELL").await;
+            assert_eq!(err, serde_json::Value::Null, "buy+sell must simulate clean\nlogs:\n{logs}");
+            assert!(units > 0, "no compute consumed");
+            assert!(logs.contains("Instruction: Sell"), "the sell must have run\nlogs:\n{logs}");
+            println!("SELL PROVEN: sold {sell_amount} raw units back to SOL in simulation");
             return;
         }
         let sell = build_pumpfun_sell(&rpc, &mint, &owner, held, 500, 300_000, 100_000)

@@ -1012,6 +1012,80 @@ impl Sniper {
                 }
             }
         }
+        // ---- DIRECT BONDING CURVE, preferred over Jupiter ----
+        //
+        // Jupiter costs two API round trips on a lane throttled to 1200ms and
+        // shared with the telemetry sweeps; the curve costs one batch of RPC
+        // reads and no third-party dependency at all. It is also the only way
+        // to reach a token BEFORE it graduates, which is the entry we actually
+        // want.
+        //
+        // Falls back silently to Jupiter when the mint has no live curve —
+        // most tokens do not, and a graduated token is a normal Jupiter trade.
+        // Both buy and sell are mainnet-simulated; see
+        // `execute::pumpfun_sim::live_simulate_pumpfun_buy_and_sell`.
+        if let Ok(owner_pk) = crate::tx::pk(&owner) {
+            if let Ok(mint_pk) = crate::tx::pk(mint) {
+                let curve_floor = live.curve_min_liquidity_sol;
+                match crate::execute::build_pumpfun_buy(
+                    &self.rpc,
+                    &mint_pk,
+                    &owner_pk,
+                    lamports,
+                    live.slippage_bps,
+                    curve_floor,
+                    self.cfg.compute_unit_limit,
+                    self.cfg.priority_fee_micro_lamports,
+                )
+                .await
+                {
+                    Ok(plan) => {
+                        // The same guards the Jupiter path applies, against the
+                        // curve's own numbers. A direct route is not a reason to
+                        // check less.
+                        let impact = plan.quote.price_impact_bps;
+                        if max_impact > 0 && impact > max_impact {
+                            return BuyOutcome::Refused {
+                                reason: format!(
+                                    "curve price impact {impact} bps exceeds {max_impact}"
+                                ),
+                            };
+                        }
+                        let tokens_ui =
+                            plan.quote.expected_out as f64 / 10f64.powi(decimals as i32);
+                        if max_mcap > 0.0 {
+                            let sol_usd =
+                                self.prices.sol_usd(std::time::Duration::from_secs(600));
+                            match (tokens_ui > 0.0).then_some(()).and(sol_usd).zip(supply) {
+                                Some((sol_usd, supply)) => {
+                                    let mcap = (size / tokens_ui) * supply * sol_usd;
+                                    if mcap >= max_mcap {
+                                        return BuyOutcome::Refused {
+                                            reason: format!(
+                                                "market cap ${mcap:.0} at or above ${max_mcap:.0}"
+                                            ),
+                                        };
+                                    }
+                                }
+                                None => {
+                                    return BuyOutcome::Refused {
+                                        reason: "market cap unreadable (no SOL price or supply)"
+                                            .into(),
+                                    };
+                                }
+                            }
+                        }
+                        return self
+                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now)
+                            .await;
+                    }
+                    Err(e) => {
+                        info!(%mint, error = %e, "no direct pump.fun curve — routing via Jupiter");
+                    }
+                }
+            }
+        }
+
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,
             Err(e) => {
@@ -1043,6 +1117,49 @@ impl Sniper {
                 let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
                 let (outcome, result) = classify_submission(res);
                 self.audit_smart_buy(&owner, mint, size, reason, &outcome).await;
+                BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
+            }
+        }
+    }
+
+    /// Submit (or rehearse) a bonding-curve buy.
+    ///
+    /// Separate from the Jupiter branch because the two carry different
+    /// payloads: Jupiter hands back a signed-shape versioned transaction, while
+    /// this is a list of instructions we assembled ourselves.
+    #[cfg(feature = "sniper")]
+    async fn execute_curve_buy(
+        &self,
+        mint: &str,
+        owner: &str,
+        size: f64,
+        tokens_out: f64,
+        reason: &str,
+        plan: crate::execute::ExecutionPlan,
+        now: DateTime<Utc>,
+    ) -> BuyOutcome {
+        match &self.mode {
+            Mode::DryRun { .. } => {
+                info!(%mint, size, tokens_out, %reason,
+                      "sniper: DRY RUN CURVE BUY (nothing signed)");
+                self.audit_smart_buy(owner, mint, size, reason, "would-succeed").await;
+                BuyOutcome::Rehearsed {
+                    mint: mint.into(),
+                    sol_in: size,
+                    tokens_out,
+                    would_succeed: true,
+                }
+            }
+            Mode::Armed(cap) => {
+                warn!(%mint, size, tokens_out, %reason,
+                      "sniper: SUBMITTING REAL CURVE BUY (direct, no Jupiter)");
+                self.reserve(mint, size, now);
+                let res = self
+                    .submitter
+                    .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
+                    .await;
+                let (outcome, result) = classify_submission(res);
+                self.audit_smart_buy(owner, mint, size, reason, &outcome).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }

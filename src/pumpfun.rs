@@ -172,6 +172,13 @@ pub struct Global {
     pub creator_fee_basis_points: u64,
     /// The recipients the program actually authorizes.
     pub fee_recipients: [Pubkey; 7],
+    /// `buyback_fee_recipients` — verified as the source of the trailing
+    /// account the deployed `buy` requires beyond its IDL definition. All five
+    /// captured mainnet transactions passed a member of this array.
+    pub buyback_fee_recipients: [Pubkey; 8],
+    /// The MAYHEM-mode recipient. See `recipient_for`.
+    pub reserved_fee_recipient: Pubkey,
+    pub reserved_fee_recipients: [Pubkey; 7],
 }
 
 impl Global {
@@ -202,6 +209,55 @@ impl Global {
         }
         Ok(live[index % live.len()])
     }
+
+    /// The fee recipient this SPECIFIC curve authorizes.
+    ///
+    /// # Why the curve decides
+    ///
+    /// `Global` carries two disjoint recipient sets, and which one is valid
+    /// depends on the curve's mode. Captured mainnet buys correlate perfectly:
+    ///
+    /// ```text
+    ///   is_mayhem_mode = 1  ->  reserved_fee_recipient(s)   (GesfTA3X…)
+    ///   otherwise           ->  fee_recipient(s)            (62qc2CNX…)
+    /// ```
+    ///
+    /// Passing the wrong set is rejected with `NotAuthorized` at
+    /// `fee_recipient.rs:19` — which is how this was found: every one of the
+    /// eight normal-mode recipients failed against a mayhem-mode curve, and the
+    /// error named the fee recipient rather than the mode, so the account list
+    /// looked wrong when the SET was wrong.
+    pub fn recipient_for(&self, curve: &BondingCurve, index: usize) -> Result<Pubkey> {
+        let pool: Vec<Pubkey> = if curve.is_mayhem_mode {
+            std::iter::once(self.reserved_fee_recipient)
+                .chain(self.reserved_fee_recipients.iter().copied())
+                .filter(|p| *p != Pubkey::default())
+                .collect()
+        } else {
+            std::iter::once(self.fee_recipient)
+                .chain(self.fee_recipients.iter().copied())
+                .filter(|p| *p != Pubkey::default())
+                .collect()
+        };
+        if pool.is_empty() {
+            bail!("pump.fun global lists no fee recipients for this curve mode");
+        }
+        Ok(pool[index % pool.len()])
+    }
+
+    /// A buyback fee recipient the program will accept. Same rotation logic.
+    pub fn buyback_fee_recipient(&self, index: usize) -> Result<Pubkey> {
+        let live: Vec<Pubkey> = self
+            .buyback_fee_recipients
+            .iter()
+            .copied()
+            .filter(|p| *p != Pubkey::default())
+            .collect();
+        if live.is_empty() {
+            bail!("pump.fun global lists no buyback fee recipients");
+        }
+        Ok(live[index % live.len()])
+    }
 }
 
 const OFF_G_INITIALIZED: usize = 8;
@@ -210,7 +266,11 @@ const OFF_G_FEE_BPS: usize = 105;
 const OFF_G_CREATOR_FEE_BPS: usize = 154;
 /// `fee_recipients: [pubkey; 7]`, immediately after `creator_fee_basis_points`.
 const OFF_G_FEE_RECIPIENTS: usize = 162;
-const GLOBAL_MIN_LEN: usize = OFF_G_FEE_RECIPIENTS + 32 * 7;
+/// `buyback_fee_recipients: [pubkey; 8]`.
+const OFF_G_RESERVED_RECIPIENT: usize = 483;
+const OFF_G_RESERVED_RECIPIENTS: usize = 516;
+const OFF_G_BUYBACK_RECIPIENTS: usize = 741;
+const GLOBAL_MIN_LEN: usize = OFF_G_BUYBACK_RECIPIENTS + 32 * 8;
 /// Anchor discriminator of the `Global` account.
 const GLOBAL_ACCOUNT_DISCRIMINATOR: [u8; 8] = [0xa7, 0xe8, 0xe8, 0xb1, 0xc8, 0x6c, 0x72, 0x7f];
 
@@ -241,11 +301,30 @@ impl Global {
             b.copy_from_slice(&data[off..off + 32]);
             *slot = Pubkey::new_from_array(b);
         }
+        let mut buybacks = [Pubkey::default(); 8];
+        for (i, slot) in buybacks.iter_mut().enumerate() {
+            let off = OFF_G_BUYBACK_RECIPIENTS + i * 32;
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&data[off..off + 32]);
+            *slot = Pubkey::new_from_array(b);
+        }
+        let mut reserved = [Pubkey::default(); 7];
+        for (i, slot) in reserved.iter_mut().enumerate() {
+            let off = OFF_G_RESERVED_RECIPIENTS + i * 32;
+            let mut b = [0u8; 32];
+            b.copy_from_slice(&data[off..off + 32]);
+            *slot = Pubkey::new_from_array(b);
+        }
+        let mut rr = [0u8; 32];
+        rr.copy_from_slice(&data[OFF_G_RESERVED_RECIPIENT..OFF_G_RESERVED_RECIPIENT + 32]);
         let g = Self {
             fee_recipient: Pubkey::new_from_array(fr),
+            reserved_fee_recipient: Pubkey::new_from_array(rr),
+            reserved_fee_recipients: reserved,
             fee_basis_points: u64_at(OFF_G_FEE_BPS),
             creator_fee_basis_points: u64_at(OFF_G_CREATOR_FEE_BPS),
             fee_recipients: recipients,
+            buyback_fee_recipients: buybacks,
         };
         // A fee that large means the layout moved, not that pump.fun started
         // charging 50%. Refuse rather than quote against it.
@@ -276,6 +355,19 @@ pub fn global_pda() -> Pubkey {
 /// which carries only a mint, can still be traded directly.
 pub fn bonding_curve_pda(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(&[b"bonding-curve", mint.as_ref()], &PUMP_PROGRAM).0
+}
+
+/// The v2 bonding curve — the first of the two accounts the deployed `buy`
+/// requires beyond its IDL definition.
+///
+/// Found by simulation, not by guessing: omitting it returns
+/// `InvalidBondingCurveV2 — bonding_curve_v2 remaining account is missing or
+/// invalid` (pump/src/sell.rs:133). The seed then matched all five captured
+/// mainnet transactions. It commonly does NOT exist on chain, which is exactly
+/// why no amount of account-scanning found it — the program accepts it
+/// uninitialized.
+pub fn bonding_curve_v2_pda(mint: &Pubkey) -> Pubkey {
+    Pubkey::find_program_address(&[b"bonding-curve-v2", mint.as_ref()], &PUMP_PROGRAM).0
 }
 
 pub fn creator_vault_pda(creator: &Pubkey) -> Pubkey {
@@ -449,6 +541,13 @@ pub struct TradeContext {
     pub fee_recipient: Pubkey,
     /// From the curve state.
     pub creator: Pubkey,
+    /// Accounts appended after the IDL's sixteen.
+    ///
+    /// The deployed program needs more than the IDL declares — sixteen alone
+    /// is rejected with `NotAuthorized`, proven against mainnet for all eight
+    /// authorized fee recipients. What belongs here is established by
+    /// simulation, not by assumption.
+    pub extra_accounts: Vec<AccountMeta>,
 }
 
 /// The 16 accounts of `buy` / `sell`, in IDL order.
@@ -460,7 +559,7 @@ pub struct TradeContext {
 /// mainnet simulation shows they are required. Guessing extra accounts into a
 /// money-moving instruction is not better than leaving them out: both are
 /// unverified, but only one is honest about it.
-fn trade_accounts(ctx: &TradeContext, curve: &Pubkey) -> Vec<AccountMeta> {
+fn trade_accounts(ctx: &TradeContext, curve: &Pubkey, extra: &[AccountMeta]) -> Vec<AccountMeta> {
     let assoc_curve = spl_associated_token_account_interface::address::
         get_associated_token_address_with_program_id(curve, &ctx.mint, &ctx.token_program);
     let assoc_user = spl_associated_token_account_interface::address::
@@ -484,6 +583,9 @@ fn trade_accounts(ctx: &TradeContext, curve: &Pubkey) -> Vec<AccountMeta> {
         AccountMeta::new_readonly(fee_config_pda(), false),
         AccountMeta::new_readonly(PUMP_FEE_PROGRAM, false),
     ]
+    .into_iter()
+    .chain(extra.iter().cloned())
+    .collect()
 }
 
 /// Encode `buy`.
@@ -498,17 +600,51 @@ pub fn buy_ix(ctx: &TradeContext, q: &BuyQuote) -> Instruction {
     data.extend_from_slice(&BUY_DISCRIMINATOR);
     data.extend_from_slice(&q.amount.to_le_bytes());
     data.extend_from_slice(&q.max_sol_cost.to_le_bytes());
-    Instruction { program_id: PUMP_PROGRAM, accounts: trade_accounts(ctx, &curve), data }
+    Instruction { program_id: PUMP_PROGRAM, accounts: trade_accounts(ctx, &curve, &ctx.extra_accounts), data }
 }
 
-/// Encode `sell`. Same account set; args are `amount` + `min_sol_output`.
+/// The 14 accounts of `sell`, in IDL order.
+///
+/// NOT the same list as `buy`, and not merely a subset: `sell` swaps
+/// `creator_vault` and `token_program` relative to `buy`, and carries no volume
+/// accumulators. Sharing one list between them cost a simulation round —
+/// mainnet answered `InvalidProgramId caused by account: token_program`, which
+/// is what a correctly-ordered list of the WRONG order looks like.
+fn sell_accounts(ctx: &TradeContext, curve: &Pubkey, extra: &[AccountMeta]) -> Vec<AccountMeta> {
+    let assoc_curve = spl_associated_token_account_interface::address::
+        get_associated_token_address_with_program_id(curve, &ctx.mint, &ctx.token_program);
+    let assoc_user = spl_associated_token_account_interface::address::
+        get_associated_token_address_with_program_id(&ctx.user, &ctx.mint, &ctx.token_program);
+
+    vec![
+        AccountMeta::new_readonly(global_pda(), false),
+        AccountMeta::new(ctx.fee_recipient, false),
+        AccountMeta::new_readonly(ctx.mint, false),
+        AccountMeta::new(*curve, false),
+        AccountMeta::new(assoc_curve, false),
+        AccountMeta::new(assoc_user, false),
+        AccountMeta::new(ctx.user, true),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM, false),
+        AccountMeta::new(creator_vault_pda(&ctx.creator), false),
+        AccountMeta::new_readonly(ctx.token_program, false),
+        AccountMeta::new_readonly(event_authority_pda(), false),
+        AccountMeta::new_readonly(PUMP_PROGRAM, false),
+        AccountMeta::new_readonly(fee_config_pda(), false),
+        AccountMeta::new_readonly(PUMP_FEE_PROGRAM, false),
+    ]
+    .into_iter()
+    .chain(extra.iter().cloned())
+    .collect()
+}
+
+/// Encode `sell`. Args are `amount` + `min_sol_output`.
 pub fn sell_ix(ctx: &TradeContext, q: &SellQuote) -> Instruction {
     let curve = bonding_curve_pda(&ctx.mint);
     let mut data = Vec::with_capacity(24);
     data.extend_from_slice(&SELL_DISCRIMINATOR);
     data.extend_from_slice(&q.amount.to_le_bytes());
     data.extend_from_slice(&q.min_sol_output.to_le_bytes());
-    Instruction { program_id: PUMP_PROGRAM, accounts: trade_accounts(ctx, &curve), data }
+    Instruction { program_id: PUMP_PROGRAM, accounts: sell_accounts(ctx, &curve, &ctx.extra_accounts), data }
 }
 
 #[cfg(test)]
@@ -605,6 +741,19 @@ mod tests {
                 Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM").unwrap(),
                 Pubkey::from_str("FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz").unwrap(),
                 Pubkey::from_str("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP").unwrap(),
+            ],
+            reserved_fee_recipient: Pubkey::from_str(
+                "GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS").unwrap(),
+            reserved_fee_recipients: [Pubkey::default(); 7],
+            buyback_fee_recipients: [
+                Pubkey::from_str("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD").unwrap(),
+                Pubkey::from_str("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7").unwrap(),
+                Pubkey::from_str("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL").unwrap(),
+                Pubkey::from_str("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR").unwrap(),
+                Pubkey::from_str("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6").unwrap(),
+                Pubkey::from_str("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL").unwrap(),
+                Pubkey::from_str("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD").unwrap(),
+                Pubkey::from_str("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW").unwrap(),
             ],
         }
     }
@@ -725,6 +874,7 @@ mod tests {
             fee_recipient: Pubkey::from_str("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP")
                 .unwrap(),
             creator,
+            extra_accounts: Vec::new(),
         };
         // The exact arguments the captured transaction sent.
         let q = BuyQuote {
@@ -770,6 +920,63 @@ mod tests {
         }
         assert!(ix.accounts[6].is_signer, "the user signs");
         assert!(!ix.accounts[0].is_signer, "nothing else does");
+    }
+
+    /// The seed that mainnet simulation forced us to find. All five captured
+    /// transactions agree.
+    #[test]
+    fn golden_bonding_curve_v2_pda_matches_mainnet() {
+        let (mint, ..) = fixture_1();
+        // Captured slot [16] for this mint's transaction.
+        assert_eq!(
+            bonding_curve_v2_pda(&mint).to_string(),
+            "7T6jFYxB6KF3PJhUk6ECew8yU8me4Xc8o6iBbzFRKpYY"
+        );
+    }
+
+    /// Which recipient set is valid depends on the curve, not on Global alone.
+    /// Getting this wrong is `NotAuthorized` at fee_recipient.rs:19.
+    #[test]
+    fn mayhem_curves_use_the_reserved_recipient_set() {
+        let g = global();
+        let normal = BondingCurve::decode(&curve_bytes()).unwrap();
+        assert!(!normal.is_mayhem_mode);
+        assert_eq!(
+            g.recipient_for(&normal, 0).unwrap(),
+            g.fee_recipient,
+            "a non-mayhem curve takes the standard set"
+        );
+
+        let mut d = curve_bytes();
+        d[OFF_MAYHEM] = 1;
+        let mayhem = BondingCurve::decode(&d).unwrap();
+        assert!(mayhem.is_mayhem_mode);
+        assert_eq!(
+            g.recipient_for(&mayhem, 0).unwrap(),
+            g.reserved_fee_recipient,
+            "a mayhem curve takes the reserved set"
+        );
+        assert_ne!(g.fee_recipient, g.reserved_fee_recipient, "the sets must differ");
+    }
+
+    #[test]
+    fn buy_and_sell_account_orders_differ() {
+        let (mint, user, token_program, creator) = fixture_1();
+        let ctx = TradeContext {
+            mint, user, token_program, creator,
+            fee_recipient: Pubkey::from_str("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP")
+                .unwrap(),
+            extra_accounts: Vec::new(),
+        };
+        let b = buy_ix(&ctx, &BuyQuote { expected_tokens: 1, amount: 1, max_sol_cost: 1 });
+        let sl = sell_ix(&ctx, &SellQuote { expected_sol: 1, amount: 1, min_sol_output: 1 });
+        assert_eq!(b.accounts.len(), 16);
+        assert_eq!(sl.accounts.len(), 14);
+        // The swap that cost a simulation round: sell puts creator_vault where
+        // buy puts token_program.
+        assert_eq!(b.accounts[8].pubkey, token_program);
+        assert_eq!(sl.accounts[9].pubkey, token_program);
+        assert_eq!(sl.accounts[8].pubkey, creator_vault_pda(&creator));
     }
 
     fn hex(b: &[u8]) -> String {
