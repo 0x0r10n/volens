@@ -1136,8 +1136,37 @@ pub async fn build_pumpfun_sell(
     if token_amount_in == 0 {
         bail!("nothing to sell");
     }
-    let (curve, _global, ctx) = curve_context(rpc, mint, owner).await?;
+    let (curve, global, mut ctx) = curve_context(rpc, mint, owner).await?;
     let q = crate::pumpfun::sell_quote(&curve, token_amount_in, slippage_bps)?;
+
+    // SELL's trailing accounts depend on the COIN TYPE, and both shapes were
+    // established by simulating each kind:
+    //
+    //   cashback coin -> [user_volume_accumulator, bonding_curve_v2, buyback]
+    //   otherwise     -> [bonding_curve_v2, buyback]
+    //
+    // A cashback coin buys fine and then fails its exit with
+    // `InvalidCashbackAccumulator` (pump/src/sell.rs:33) unless the accumulator
+    // LEADS. Prepending it unconditionally is equally wrong: on a non-cashback
+    // coin the shift breaks `bonding_curve_v2` instead. Either mistake produces
+    // the same worst outcome — a token we can enter and cannot leave — and
+    // neither is visible to a test that only exercises the buy.
+    let mut extra = Vec::with_capacity(3);
+    if curve.is_cashback_coin {
+        extra.push(solana_instruction::AccountMeta::new(
+            crate::pumpfun::user_volume_accumulator_pda(owner),
+            false,
+        ));
+    }
+    extra.push(solana_instruction::AccountMeta::new(
+        crate::pumpfun::bonding_curve_v2_pda(mint),
+        false,
+    ));
+    extra.push(solana_instruction::AccountMeta::new(
+        global.buyback_fee_recipient(mint.as_ref()[1] as usize)?,
+        false,
+    ));
+    ctx.extra_accounts = extra;
 
     let mut instructions = tx::compute_budget(unit_limit, priority_fee);
     // No ATA creation: we are selling a balance we already hold, so the account
@@ -1223,6 +1252,56 @@ mod pumpfun_sim {
         // Mainnet rejected both the `fee_recipient` field and array[0] with
         // NotAuthorized, so rather than guess again, ask the node about every
         // candidate. Whatever passes here is the ground truth the encoder uses.
+        if std::env::var("VOLENS_SIM_PROBE_SELL").is_ok() {
+            use solana_instruction::AccountMeta;
+            let g_raw = rpc.account_data(&crate::pumpfun::global_pda().to_string()).await.unwrap();
+            let g = crate::pumpfun::Global::decode(&g_raw).unwrap();
+            let c_raw = rpc
+                .account_data(&crate::pumpfun::bonding_curve_pda(&mint).to_string())
+                .await
+                .unwrap();
+            let curve = crate::pumpfun::BondingCurve::decode(&c_raw).unwrap();
+            let bcv2 = AccountMeta::new(crate::pumpfun::bonding_curve_v2_pda(&mint), false);
+            let bb = AccountMeta::new(g.buyback_fee_recipient(0).unwrap(), false);
+            let uva = AccountMeta::new(crate::pumpfun::user_volume_accumulator_pda(&owner), false);
+            let shapes: Vec<(&str, Vec<AccountMeta>)> = vec![
+                ("v2_bb", vec![bcv2.clone(), bb.clone()]),
+                ("v2_bb_uva", vec![bcv2.clone(), bb.clone(), uva.clone()]),
+                ("uva_v2_bb", vec![uva.clone(), bcv2.clone(), bb.clone()]),
+                ("v2_uva_bb", vec![bcv2.clone(), uva.clone(), bb.clone()]),
+            ];
+            for (label, extra) in shapes {
+                let buy =
+                    build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 600_000, 100_000)
+                        .await
+                        .expect("build buy");
+                let amt = buy.quote.minimum_out;
+                let sell = build_pumpfun_sell(&rpc, &mint, &owner, amt, 500, 600_000, 100_000)
+                    .await
+                    .expect("build sell");
+                let mut ixs = buy.instructions.clone();
+                let mut sx = sell.instructions.last().unwrap().clone();
+                sx.accounts.truncate(14);
+                sx.accounts.extend(extra.clone());
+                ixs.push(sx);
+                let msg = Message::new(&ixs, Some(&owner));
+                let txn = Transaction::new_unsigned(msg);
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD
+                    .encode(bincode::serialize(&txn).unwrap());
+                let sim = rpc.simulate_transaction(&b64).await.expect("sim");
+                let err = sim.get("err").cloned().unwrap_or(serde_json::Value::Null);
+                let logs = sim.get("logs").and_then(|l| l.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" | "))
+                    .unwrap_or_default();
+                let anchor = logs.split(" | ").find(|l| l.contains("AnchorError")).unwrap_or("");
+                println!("SELL SHAPE {label:12} (mayhem={} cashback={}) -> {}",
+                    curve.is_mayhem_mode, curve.is_cashback_coin,
+                    if err.is_null() { "CLEAN".to_string() } else { format!("{err} {anchor}") });
+            }
+            return;
+        }
+
         if let Ok(shape) = std::env::var("VOLENS_SIM_PROBE_SHAPE") {
             use solana_instruction::AccountMeta;
             let g_raw = rpc.account_data(&crate::pumpfun::global_pda().to_string()).await.unwrap();
