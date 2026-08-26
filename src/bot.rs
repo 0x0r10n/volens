@@ -1644,31 +1644,94 @@ impl Bot {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
         let e = sniper.live().exits;
-        let total = e.target_total_pct();
         let onoff = if e.enabled { "🟢 On" } else { "⚪ Off" };
 
-        // The running total is shown because the amounts are of the ORIGINAL
-        // position: under 100 leaves a remainder running, over 100 means later
-        // orders will find less than they asked for.
-        let verdict = match total {
-            100 => "✅ exactly 100%".to_string(),
-            t if t < 100 => format!("{}% — {}% keeps running", t, 100 - t),
-            t => format!("{t}% — over 100%, later orders will find less than they ask for"),
-        };
+        // Split by kind. The old screen listed stops and targets together in
+        // config order, which made the actual plan — "what protects me, what
+        // takes profit" — something you had to reconstruct by reading signs.
+        let mut stops: Vec<crate::exits::SellOrder> =
+            e.orders.iter().copied().filter(|o| o.is_armed() && o.is_stop()).collect();
+        let mut targets: Vec<crate::exits::SellOrder> =
+            e.orders.iter().copied().filter(|o| o.is_armed() && !o.is_stop()).collect();
+        stops.sort_by_key(|o| -o.at_pct);
+        targets.sort_by_key(|o| o.at_pct);
+        let unset = e.orders.iter().filter(|o| !o.is_armed()).count();
+
+        let mut body = String::new();
+
+        body.push_str("\n🛑 <b>STOPS</b>  <i>— checked first</i>\n");
+        if stops.is_empty() {
+            body.push_str("   <i>none — nothing closes a losing position</i>\n");
+        }
+        for o in &stops {
+            body.push_str(&format!("   {}% → sell {}%\n", o.at_pct, o.amount_pct));
+        }
+
+        body.push_str("\n🎯 <b>TARGETS</b>  <i>— lowest first</i>\n");
+        if targets.is_empty() {
+            body.push_str("   <i>none — only stops and the trailing stop can exit</i>\n");
+        }
+        // Running total is the thing people get wrong: amounts are shares of
+        // the ORIGINAL position, so they accumulate. Showing what is left after
+        // each rung makes a dead rung obvious instead of arithmetic.
+        let mut sold: u32 = 0;
+        let mut dead_from: Option<i32> = None;
+        for o in &targets {
+            if sold >= 100 && dead_from.is_none() {
+                dead_from = Some(o.at_pct);
+            }
+            sold += o.amount_pct as u32;
+            let left = 100i64 - sold as i64;
+            body.push_str(&format!(
+                "   +{}% → sell {}%   <i>({} left)</i>\n",
+                o.at_pct,
+                o.amount_pct,
+                if left <= 0 { "nothing".to_string() } else { format!("{left}%") }
+            ));
+        }
+
+        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
+        body.push_str(&format!("\n📉 <b>Trailing</b>: {tr}\n"));
+
+        // The warning that matters most, and the one this screen previously
+        // expressed only as a percentage you had to interpret.
+        if let Some(at) = dead_from {
+            body.push_str(&format!(
+                "\n⚠️ The position is fully sold before +{at}%. Every target from \
+                 there up can never fire.\n"
+            ));
+        } else if sold > 0 && sold < 100 {
+            body.push_str(&format!(
+                "\n<i>{}% of the position keeps running past the last target.</i>\n",
+                100 - sold
+            ));
+        }
+        if unset > 0 {
+            body.push_str(&format!("\n<i>{unset} order(s) not set up yet.</i>\n"));
+        }
+
         let text = format!(
-            "🎚 <b>Auto-sell</b>\n\n             A negative trigger is a <b>stop</b>, a positive one a <b>target</b>. \
-             Amounts are percentages of the <b>original</b> position, so a \
-             target column adding to 100% sells all of it.\n\n             Targets total: <b>{verdict}</b>\n\n             <i>Stops are checked before targets: a position that gaps from \
-             +300% to −60% leaves rather than taking a target on the way past.</i>"
+            "🎚 <b>Auto-sell</b> · {onoff}\n{body}\n\
+             <i>Amounts are shares of the ORIGINAL position. A stop fires \
+             before any target, so a position that gaps from +300% to −60% \
+             exits rather than taking a target on the way past.</i>"
         );
 
         let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
             {"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}
         ])];
+        // Buttons stay in config order so the index in the callback keeps
+        // pointing at the same order the list above describes.
         for (i, o) in e.orders.iter().enumerate() {
-            let icon = if !o.is_armed() { "⚪" } else if o.is_stop() { "🛑" } else { "🎯" };
+            let label = if !o.is_armed() {
+                "⚪ not set".to_string()
+            } else if o.is_stop() {
+                format!("🛑 stop {}% → sell {}%", o.at_pct, o.amount_pct)
+            } else {
+                format!("🎯 target +{}% → sell {}%", o.at_pct, o.amount_pct)
+            };
             rows.push(serde_json::json!([
-                {"text": format!("{icon} {}", o.label()), "callback_data": format!("set:order{i}")},
+                {"text": label, "callback_data": format!("set:order{i}")},
                 {"text": "✕", "callback_data": format!("setv:delorder:{i}")},
             ]));
         }
@@ -1677,7 +1740,6 @@ impl Bot {
                 {"text": "➕ Add order", "callback_data": "setv:addorder:1"}
             ]));
         }
-        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
         rows.push(serde_json::json!([
             {"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
             {"text": "◀️ Back", "callback_data": "cmd:settings"},
@@ -1695,20 +1757,42 @@ impl Bot {
         let Some(o) = orders.get(idx).copied() else {
             return self.exits_screen();
         };
+        // Named by what it IS, not by its index. "Order 3" told you nothing
+        // about whether you were editing protection or profit-taking.
+        let (kind, blurb) = if !o.is_armed() {
+            ("⚪ <b>Not set</b>", "Pick a trigger below. Negative = stop, positive = target.")
+        } else if o.is_stop() {
+            ("🛑 <b>Stop</b>", "Fires when the position falls this far below cost. \
+              Stops are checked before any target.")
+        } else {
+            ("🎯 <b>Target</b>", "Fires when the position is up this much. \
+              Targets fire lowest-first, once each.")
+        };
         let text = format!(
-            "📋 <b>Order {}</b>\n\nCurrently: <b>{}</b>\n\n             <i>Negative triggers are stops, positive ones targets. The amount \
-             is a share of the original position.</i>",
-            idx + 1,
-            if o.is_armed() { o.label() } else { "off".into() }
+            "{kind}\n\nTrigger: <b>{}</b>\nSells: <b>{}</b> of the original position\n\n<i>{blurb}</i>",
+            if o.at_pct == 0 {
+                "not set".to_string()
+            } else {
+                format!("{}{}%", if o.at_pct > 0 { "+" } else { "" }, o.at_pct)
+            },
+            if (1..=100).contains(&o.amount_pct) {
+                format!("{}%", o.amount_pct)
+            } else {
+                "not set".to_string()
+            },
         );
-        let trig: Vec<serde_json::Value> = [-50i32, -35, -25, -15, 50, 100, 250, 400, 900, 2000]
-            .iter()
-            .map(|t| serde_json::json!({
-                "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
-                                if *t > 0 { "+" } else { "" }, t),
-                "callback_data": format!("setv:ordt{idx}:{t}"),
-            }))
-            .collect();
+        // Stops and targets in SEPARATE rows, each labelled. The old grid ran
+        // -50 -35 -25 -15 50 100 250 ... together, so the sign was the only
+        // thing distinguishing "cut my loss" from "take my profit".
+        let row = |vals: &[i32]| -> Vec<serde_json::Value> {
+            vals.iter()
+                .map(|t| serde_json::json!({
+                    "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
+                                    if *t > 0 { "+" } else { "" }, t),
+                    "callback_data": format!("setv:ordt{idx}:{t}"),
+                }))
+                .collect()
+        };
         let amts: Vec<serde_json::Value> = [10u8, 20, 25, 33, 50, 100]
             .iter()
             .map(|a| serde_json::json!({
@@ -1717,9 +1801,12 @@ impl Bot {
             }))
             .collect();
         let kb = serde_json::json!({"inline_keyboard": [
-            trig[..4].to_vec(),
-            trig[4..7].to_vec(),
-            trig[7..].to_vec(),
+            [{"text": "🛑 — stop below cost —", "callback_data": format!("set:order{idx}")}],
+            row(&[-50, -35, -25, -15]),
+            [{"text": "🎯 — target above cost —", "callback_data": format!("set:order{idx}")}],
+            row(&[50, 100, 250]),
+            row(&[400, 900, 2000]),
+            [{"text": "— how much to sell —", "callback_data": format!("set:order{idx}")}],
             amts[..3].to_vec(),
             amts[3..].to_vec(),
             [{"text": "✏️ Custom trigger", "callback_data": format!("ask:ordt{idx}")},
@@ -3114,6 +3201,7 @@ mod tests {
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
         let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sn2 = sniper.clone();
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         let (_, kb) = b.settings_screen();
@@ -3149,6 +3237,31 @@ mod tests {
         // mentions the window, and matching prose would fail on wording.
         let vk = b.volume_screen().1.to_string();
         assert!(vk.contains("setv:volume_on:toggle"), "no volume switch");
+
+        // Auto-sell screen: stops and targets must be separated, and the
+        // dead-rung case must be stated rather than left as arithmetic. The
+        // live ladder (-15/100, +25/100, then three more) closes the whole
+        // position at +25%, so everything above it can never fire.
+        let (et, _ek) = b.exits_screen();
+        assert!(et.contains("STOPS"), "stops section missing");
+        assert!(et.contains("TARGETS"), "targets section missing");
+        // Default ladder totals exactly 100%, so it must NOT warn.
+        assert!(
+            !et.contains("can never fire"),
+            "the default ladder does not close early:\n{et}"
+        );
+
+        // Now make the first target close the whole position. Every rung above
+        // it becomes unreachable, and the screen has to say so rather than
+        // leaving it as arithmetic across four lines.
+        let orders = sn2.live().exits.orders;
+        let first_target = orders.iter().position(|o| o.is_armed() && !o.is_stop()).unwrap();
+        sn2.set_order_amount(first_target, 100).unwrap();
+        let (et2, _) = b.exits_screen();
+        assert!(
+            et2.contains("can never fire"),
+            "a ladder that fully closes before its last target must say so:\n{et2}"
+        );
         assert!(vk.contains("set:smartsol"), "no smart-money inflow button");
         assert!(vk.contains("set:tokenvol"), "no token volume button");
         for gone in ["set:accel", "set:smartshare", "set:volwindow"] {
