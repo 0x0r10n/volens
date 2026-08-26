@@ -514,7 +514,19 @@ jito_fallback_to_rpc = false
 # Jupiter swap API root. Free tier: https://lite-api.jup.ag/swap/v1
 # Paid (higher limits): https://api.jup.ag/swap/v1
 jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
-# --- Market cap ceiling ---
+# --- Market cap ceiling --- DISABLED (0).
+#
+# Turned off deliberately. It was written for the POOL path, where a "new pool"
+# carrying a large valuation is usually a migration of a token that already ran.
+# Smart money does not work that way: those wallets buy graduated tokens at real
+# valuations, so the ceiling was refusing exactly the signals we now trade on.
+#
+# It also failed CLOSED, which meant an unreadable price refused the trade —
+# and its own inputs were unreliable, having produced valuations of $77bn and
+# $784bn from a detection-time quote reserve divided by a live base reserve.
+#
+# Set a non-zero value to re-enable.
+#
 # Refuse to buy a token whose fully-diluted market cap (mid-price x total
 # supply, in USD) is at or above this. 0 disables.
 #
@@ -530,7 +542,7 @@ jupiter_base_url = "https://lite-api.jup.ag/swap/v1"
 #
 # NOT fail-closed: if the market cap cannot be computed (RPC or Jupiter down)
 # the trade proceeds on the other guards, rather than halting all trading.
-max_market_cap_usd = 50000.0
+max_market_cap_usd = 0.0
 
 # Seconds before an exported private key message is deleted from the chat.
 # Best-effort ONLY — deletion clears the chat VIEW, but the key has already
