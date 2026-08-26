@@ -269,23 +269,6 @@ pub struct PlannedSell {
     /// Share of the CURRENT balance to sell — what a sell can act on.
     pub pct_of_current: u8,
     pub reason: String,
-    /// Proceeds this sale must actually realize, in SOL, or `None` for a stop.
-    ///
-    /// A take-profit is a claim that the position is UP. That claim comes from
-    /// the stream index — a median of recent trades — which is not the price we
-    /// would receive, and on a token whose liquidity had just been pulled the
-    /// two differed by 25 percentage points. The ladder sold 100% of a position
-    /// believing it was at +25%; on chain the same tokens went out for what
-    /// they cost.
-    ///
-    /// So a take-profit carries the cost basis, and the sell refuses if the
-    /// REAL quote would return less than that. Cheap in the only sense that
-    /// matters: the sell path already fetches that quote to build the
-    /// transaction, so nothing extra is requested and no latency is added.
-    ///
-    /// Stops carry `None`. A stop-loss is SUPPOSED to realize less than cost;
-    /// gating it on proceeds would disable the one exit that must always fire.
-    pub min_sol_out: Option<f64>,
 }
 
 /// Decide every exit for a set of holdings, without touching the network.
@@ -327,18 +310,7 @@ pub fn plan_exits(
         if let ExitAction::Sell { reason, .. } = action
             && pct_now > 0
         {
-            // Only a profit-taking exit has proceeds to verify. `multiple > 1`
-            // is the ladder's own claim that we are up; that is exactly the
-            // claim worth checking against a real route.
-            let min_sol_out = (multiple > 1.0).then(|| {
-                h.sol_spent * (pct_now as f64 / 100.0)
-            });
-            sells.push(PlannedSell {
-                mint: h.mint.clone(),
-                pct_of_current: pct_now,
-                reason,
-                min_sol_out,
-            });
+            sells.push(PlannedSell { mint: h.mint.clone(), pct_of_current: pct_now, reason });
         }
     }
     (sells, closed)
@@ -749,63 +721,58 @@ mod tests {
         assert!(matches!(store.decide(&r, "M", 2.5, 100).0, ExitAction::Sell { .. }), "fresh again");
     }
 
-    /// The trade that motivated `min_sol_out`.
+    /// The position that exposed the whole problem.
     ///
-    /// A position bought for 0.01 SOL, priced by the stream index as if it were
-    /// up 25%. The ladder sold 100% of it; on chain the tokens went out for
-    /// what they cost. A take-profit must carry the basis it has to beat.
+    /// The stream index priced it as +25% and the ladder fired a take-profit.
+    /// A real quote said the same tokens would return 0.006875 SOL against a
+    /// 0.010 basis — the position was DOWN 31%, and the stop-loss should have
+    /// been the thing that fired.
+    ///
+    /// So the ladder is fed the REALIZABLE price now. Given that price, this is
+    /// unambiguous: a stop, not a target. Nothing is vetoed, nothing waits for
+    /// confirmation — the decision is simply made against a number that is true.
     #[test]
-    fn a_take_profit_carries_the_cost_basis_it_must_beat() {
+    fn a_position_that_is_really_down_fires_the_stop_not_the_target() {
         let rules = ExitRules {
             enabled: true,
-            orders: vec![SellOrder { at_pct: 25, amount_pct: 100 }],
+            orders: vec![
+                SellOrder { at_pct: -15, amount_pct: 100 },
+                SellOrder { at_pct: 25, amount_pct: 100 },
+            ],
             ..Default::default()
         };
         let store = ExitStateStore::ephemeral();
-        // 0.01 SOL for 1.0 whole token, now quoted at 0.0125 -> +25%.
-        let h = holding("M", 0.01, 1_000_000, Some(0.0125));
+        // 0.010 SOL basis, 1.0 whole token, realizable 0.006875 -> -31%.
+        let h = holding("M", 0.010, 1_000_000, Some(0.006875));
         let (sells, _) = plan_exits(&rules, &store, &[h]);
-        assert_eq!(sells.len(), 1, "the ladder still fires");
+        assert_eq!(sells.len(), 1, "the position must be acted on, not skipped");
         assert_eq!(sells[0].pct_of_current, 100);
-        assert_eq!(
-            sells[0].min_sol_out,
-            Some(0.01),
-            "selling 100% must realize at least the whole basis"
+        assert!(
+            sells[0].reason.contains("-15") || sells[0].reason.to_lowercase().contains("stop"),
+            "must be the STOP, not a take-profit; got: {}",
+            sells[0].reason
         );
     }
 
-    /// Selling only part of a position must only have to beat that part.
+    /// And the mirror: a position genuinely up takes the target.
     #[test]
-    fn a_partial_take_profit_scales_the_floor() {
+    fn a_position_that_is_really_up_takes_the_target() {
         let rules = ExitRules {
             enabled: true,
-            orders: vec![SellOrder { at_pct: 100, amount_pct: 50 }],
+            orders: vec![
+                SellOrder { at_pct: -15, amount_pct: 100 },
+                SellOrder { at_pct: 25, amount_pct: 100 },
+            ],
             ..Default::default()
         };
         let store = ExitStateStore::ephemeral();
-        let h = holding("M", 0.02, 1_000_000, Some(0.04)); // 2x
+        let h = holding("M", 0.010, 1_000_000, Some(0.0125)); // +25% realizable
         let (sells, _) = plan_exits(&rules, &store, &[h]);
         assert_eq!(sells.len(), 1);
-        let floor = sells[0].min_sol_out.expect("a take-profit has a floor");
         assert!(
-            (floor - 0.01).abs() < 1e-12,
-            "half the position must beat half the basis, got {floor}"
+            sells[0].reason.contains("25"),
+            "must be the target; got: {}",
+            sells[0].reason
         );
-    }
-
-    /// A stop-loss realizes LESS than cost by definition. Gating it on proceeds
-    /// would disable the one exit that must always fire.
-    #[test]
-    fn a_stop_loss_carries_no_floor() {
-        let rules = ExitRules {
-            enabled: true,
-            orders: vec![SellOrder { at_pct: -15, amount_pct: 100 }],
-            ..Default::default()
-        };
-        let store = ExitStateStore::ephemeral();
-        let h = holding("M", 0.01, 1_000_000, Some(0.008)); // -20%
-        let (sells, _) = plan_exits(&rules, &store, &[h]);
-        assert_eq!(sells.len(), 1, "the stop must fire");
-        assert_eq!(sells[0].min_sol_out, None, "a stop is never gated on proceeds");
     }
 }

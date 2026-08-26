@@ -1188,6 +1188,50 @@ impl Sniper {
         }
     }
 
+    /// What we would ACTUALLY receive for `raw` units of `mint`, in SOL.
+    ///
+    /// # Why exits are priced this way and not from the stream index
+    ///
+    /// The index is a weighted median of recent trades. That is the right
+    /// number for describing a token and the wrong number for deciding an exit,
+    /// and the gap is not small: a position with a 0.010 SOL basis read as +25%
+    /// on the index while a real route returned 0.006875 — down 31%. The ladder
+    /// took a "profit" on a position that should have hit its stop.
+    ///
+    /// Vetoing the sell was the wrong repair. It left the position unmanaged:
+    /// no take-profit, and no stop either, on a token that was falling. The
+    /// decision was never the broken part — the PRICE was. So the ladder is
+    /// given the realizable price and then trusted completely: stops and
+    /// targets both fire immediately, in order, with no confirmation step.
+    ///
+    /// Route preference is the same as the buy path: the bonding curve first,
+    /// because it is one RPC read and answers off Jupiter's throttled lane
+    /// entirely; the quote API only for tokens that have graduated.
+    ///
+    /// `None` means no route could price it — which is the same thing as "we
+    /// could not sell it either", and is handled as unpriceable rather than as
+    /// a signal to sell.
+    async fn realizable_sol(&self, mint: &str, raw: u64) -> Option<f64> {
+        if raw == 0 {
+            return None;
+        }
+        if let Ok(mint_pk) = crate::tx::pk(mint) {
+            let curve_addr = crate::pumpfun::bonding_curve_pda(&mint_pk).to_string();
+            if let Some(data) = self.rpc.account_data(&curve_addr).await
+                && let Ok(curve) = crate::pumpfun::BondingCurve::decode(&data)
+                && curve.tradable().is_ok()
+                && let Ok(q) = crate::pumpfun::sell_quote(&curve, raw, self.cfg.sell_slippage_bps)
+            {
+                return Some(q.expected_sol as f64 / 1e9);
+            }
+        }
+        let jup = crate::jupiter::Jupiter::new(&self.cfg.jupiter_base_url);
+        match jup.quote(mint, crate::model::WSOL_MINT, raw, self.cfg.sell_slippage_bps).await {
+            Ok(q) => q.out_sol(),
+            Err(_) => None,
+        }
+    }
+
     async fn audit_smart_buy(&self, owner: &str, mint: &str, sol: f64, reason: &str, outcome: &str) {
         if self.cfg.audit_log.is_empty() {
             return;
@@ -1241,11 +1285,15 @@ impl Sniper {
 
         let mut holdings = Vec::new();
         for (mint, cost, raw, decimals) in read.into_iter().flatten() {
-            // EXIT_PRICE_MAX_AGE, not the detector's hour: a stop-loss reading
-            // an hour-old price is not a stop-loss. See `exit_price_sol` for
-            // why this uses a short window rather than the full median.
-            let price_sol =
-                self.prices.exit_price_sol(&mint, EXIT_PRICE_MAX_AGE).map(|p| p.price_sol);
+            // The price we would REALIZE, not the market's median. See
+            // `realizable_sol`. Expressed per whole token so the ladder's
+            // arithmetic is unchanged: multiple = price * tokens / sol_spent
+            // reduces exactly to realizable / sol_spent.
+            let tokens = raw as f64 / 10f64.powi(decimals as i32);
+            let price_sol = match self.realizable_sol(&mint, raw).await {
+                Some(sol) if tokens > 0.0 => Some(sol / tokens),
+                _ => None,
+            };
             holdings.push(crate::exits::Holding {
                 mint,
                 sol_spent: cost.sol_spent,
@@ -1286,7 +1334,7 @@ impl Sniper {
         let mut sold = 0usize;
         for s in sells {
             warn!(mint = %s.mint, pct = s.pct_of_current, reason = %s.reason, "auto-sell firing");
-            let outcome = self.sell_with_floor(&s.mint, s.pct_of_current, s.min_sol_out).await;
+            let outcome = self.sell(&s.mint, s.pct_of_current).await;
             info!(mint = %s.mint, ?outcome, "auto-sell result");
             // Announced whether it worked or not: an operator must be able to
             // tell "the ladder never fired" from "it fired and failed".
@@ -1831,20 +1879,6 @@ impl Sniper {
     /// withdraw is not.
     #[cfg(feature = "sniper")]
     pub async fn sell(&self, mint: &str, pct: u8) -> SellOutcome {
-        self.sell_with_floor(mint, pct, None).await
-    }
-
-    /// Sell, refusing if the real quote would return less than `min_sol_out`.
-    ///
-    /// The floor is how a take-profit proves itself. See
-    /// `crate::exits::PlannedSell::min_sol_out` for what went wrong without it.
-    /// `None` means sell unconditionally — manual sells and stop-losses.
-    pub async fn sell_with_floor(
-        &self,
-        mint: &str,
-        pct: u8,
-        min_sol_out: Option<f64>,
-    ) -> SellOutcome {
         use crate::jupiter::{Jupiter, fraction_of};
         use crate::model::WSOL_MINT;
 
@@ -1899,22 +1933,6 @@ impl Sniper {
         let sol_out = quote.out_sol().unwrap_or(0.0);
         let impact_pct = quote.price_impact_pct();
 
-        // The take-profit's claim, checked against the route we would actually
-        // take. Costs nothing: this quote was already fetched to build the
-        // transaction below.
-        if let Some(floor) = min_sol_out
-            && sol_out < floor
-        {
-            warn!(
-                %mint, pct, sol_out, floor,
-                "auto-sell SKIPPED — a take-profit that would realize less than cost is not a profit"
-            );
-            return SellOutcome::Refused {
-                reason: format!(
-                    "take-profit would realize {sol_out:.6} SOL against a {floor:.6} SOL basis"
-                ),
-            };
-        }
 
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,
