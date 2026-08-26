@@ -86,6 +86,22 @@ pub struct LiveSettings {
     /// default.
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
+
+    /// Require volume confirmation on top of the wallet count.
+    ///
+    /// Smart money stays the trigger; this only ever makes entry HARDER. Both
+    /// thresholds are additional AND conditions applied before the existing
+    /// safety vetoes, and neither can admit a token the wallet count rejected.
+    #[serde(default)]
+    pub volume_mode: bool,
+    /// SOL the tracked cohort must have put in, inside the signal window.
+    /// 0 = not required.
+    #[serde(default)]
+    pub min_smart_sol_in: f64,
+    /// Total observed SOL traded in the token, inside the signal window.
+    /// 0 = not required.
+    #[serde(default)]
+    pub min_token_volume_sol: f64,
 }
 
 /// The config-side ceilings this process may never exceed.
@@ -162,6 +178,9 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             auto_buy_min_wallets: 0,
+            volume_mode: false,
+            min_smart_sol_in: 0.0,
+            min_token_volume_sol: 0.0,
         }
     }
 

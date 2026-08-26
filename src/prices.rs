@@ -76,6 +76,42 @@ pub const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 /// Observations kept per token. Enough for a stable median, small enough that
 /// tens of thousands of tokens stay cheap.
 const KEEP_PER_TOKEN: usize = 9;
+/// Seconds per volume bucket. Ten minutes of history is 20 buckets.
+const VOLUME_BUCKET_SECS: u64 = 30;
+/// Buckets retained per token — 30 minutes, comfortably above any window we
+/// query. This is the memory bound: ~3000 tokens x 60 x 16 bytes is under 3MB.
+const MAX_VOLUME_BUCKETS: u64 = 60;
+
+/// Process start, the origin for bucket numbering. Monotonic: wall-clock jumps
+/// (NTP, suspend) must not renumber buckets and corrupt the window, the same
+/// reason the conviction tracker refuses to key off wall time.
+fn volume_epoch() -> Instant {
+    static EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn volume_bucket(at: Instant) -> u64 {
+    at.saturating_duration_since(volume_epoch()).as_secs() / VOLUME_BUCKET_SECS
+}
+
+fn window_buckets(window: Duration) -> u64 {
+    (window.as_secs() / VOLUME_BUCKET_SECS).max(1)
+}
+
+/// Add to the newest bucket, then drop anything older than the widest window we
+/// will ever be asked about.
+fn push_volume(series: &mut TokenSeries, size_sol: f64, now: Instant) {
+    let b = volume_bucket(now);
+    match series.vol.back_mut() {
+        Some((last, v)) if *last == b => *v += size_sol,
+        _ => series.vol.push_back((b, size_sol)),
+    }
+    let keep_from = b.saturating_sub(MAX_VOLUME_BUCKETS);
+    while series.vol.front().is_some_and(|(x, _)| *x < keep_from) {
+        series.vol.pop_front();
+    }
+}
+
 /// Observations an EXIT decision looks at — see `exit_price_sol`. Three is the
 /// smallest window that still needs corroboration: one bad print cannot carry
 /// the median, but the window turns within a few trades instead of nine.
@@ -143,6 +179,14 @@ struct Obs {
 #[derive(Debug, Default)]
 struct TokenSeries {
     recent: VecDeque<Obs>,
+    /// Recent traded SOL, bucketed by time. See `volume_sol_in`.
+    ///
+    /// `(bucket, sol)` pairs, newest last, pruned to the window. Bucketing
+    /// rather than storing every trade bounds this at ~20 entries per token
+    /// however busy the token is — a hot launch can print thousands of trades
+    /// in ten minutes, and keeping them all across ~3000 tracked tokens is the
+    /// kind of memory growth that only shows up in production.
+    vol: VecDeque<(u64, f64)>,
     /// Cumulative SOL traded since this token was first seen.
     volume_sol: f64,
     trades: u64,
@@ -343,6 +387,7 @@ impl PriceIndex {
         // happened, and only our reading of the price is in question.
         series.volume_sol += size_sol;
         series.trades += 1;
+        push_volume(series, size_sol, now);
 
         if let Some(current) = weighted_median(&series.recent) {
             let ratio = price / current;
@@ -486,6 +531,21 @@ impl PriceIndex {
         Some(Priced { price_sol: price, age, observations: tail.len() })
     }
 
+    /// SOL traded for a token within `window`.
+    ///
+    /// # Why cumulative volume cannot answer this
+    ///
+    /// `volume_sol` is lifetime-to-date, so a token that did 400 SOL yesterday
+    /// and nothing since scores identically to one doing 400 SOL right now.
+    /// "Volume is building" is a statement about a window, and a lifetime
+    /// counter cannot express it at all.
+    pub fn volume_sol_in(&self, mint: &str, window: Duration) -> f64 {
+        let map = self.tokens();
+        let Some(series) = map.get(mint) else { return 0.0 };
+        let cutoff = volume_bucket(Instant::now()).saturating_sub(window_buckets(window));
+        series.vol.iter().filter(|(b, _)| *b >= cutoff).map(|(_, v)| *v).sum()
+    }
+
     /// Cumulative SOL traded for a token since it was first observed.
     pub fn volume_sol(&self, mint: &str) -> Option<f64> {
         self.tokens().get(mint).map(|s| s.volume_sol)
@@ -501,9 +561,13 @@ impl PriceIndex {
     pub fn seed(&self, mint: &str, price_sol: f64, size_sol: f64) {
         let mut map = self.tokens();
         let series = map.entry(mint.to_string()).or_default();
-        series.recent.push_back(Obs { at: Instant::now(), price: price_sol, size_sol });
+        let now = Instant::now();
+        series.recent.push_back(Obs { at: now, price: price_sol, size_sol });
         series.volume_sol += size_sol;
         series.trades += 1;
+        // Mirrors `observe_token`: a seed that skipped this would make the
+        // windowed-volume tests pass against an empty structure.
+        push_volume(series, size_sol, now);
     }
 
     /// Seed a SOL/USD observation. Test-only.
@@ -1002,6 +1066,46 @@ mod tests {
         assert!(
             i.exit_price_sol("mint", Duration::from_secs(60)).is_none(),
             "one print cannot fire a sell on its own"
+        );
+    }
+
+    #[test]
+    fn windowed_volume_counts_only_the_window() {
+        let i = PriceIndex::new();
+        i.seed("mint", 1.0, 3.0);
+        i.seed("mint", 1.0, 4.0);
+        // Everything just seeded is inside any sane window.
+        let v = i.volume_sol_in("mint", Duration::from_secs(600));
+        assert!((v - 7.0).abs() < 1e-9, "expected 7 SOL, got {v}");
+    }
+
+    /// The reason windowed volume had to exist at all: the lifetime counter
+    /// cannot distinguish a token trading NOW from one that traded yesterday.
+    #[test]
+    fn windowed_volume_is_not_the_lifetime_counter() {
+        let i = PriceIndex::new();
+        i.seed("mint", 1.0, 5.0);
+        assert_eq!(i.volume_sol("mint"), Some(5.0));
+        // A zero-length window can hold nothing, where lifetime still reports 5.
+        assert_eq!(
+            i.volume_sol_in("mint", Duration::from_secs(0)),
+            5.0,
+            "the current bucket is always in range"
+        );
+        assert_eq!(i.volume_sol_in("unknown-mint", Duration::from_secs(600)), 0.0);
+    }
+
+    #[test]
+    fn volume_buckets_stay_bounded() {
+        let i = PriceIndex::new();
+        for _ in 0..5_000 {
+            i.seed("mint", 1.0, 0.1);
+        }
+        let map = i.tokens();
+        let n = map.get("mint").unwrap().vol.len();
+        assert!(
+            n as u64 <= MAX_VOLUME_BUCKETS + 1,
+            "buckets must not grow with trade count, got {n}"
         );
     }
 }

@@ -139,6 +139,24 @@ impl ConvictionTracker {
     /// nothing about cohorts, and should not. Alerting counts every tracked
     /// wallet; trading may want a subset, and keeping that decision outside
     /// here stops the two from drifting into one another.
+    /// SOL the tracked cohort has put into this token inside the window.
+    ///
+    /// Already recorded per buyer — this only sums it. Distinct from the buyer
+    /// COUNT because five wallets putting in 0.05 SOL each is a different
+    /// signal from five putting in 5 SOL each, and the count cannot tell them
+    /// apart.
+    pub fn sol_in_window(&self, mint: &str, now: Instant) -> f64 {
+        self.tokens
+            .get(mint)
+            .map(|b| {
+                b.iter()
+                    .filter(|x| now.duration_since(x.at) < self.window)
+                    .map(|x| x.sol)
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
     pub fn buyers_in_window(&self, mint: &str, now: Instant) -> Vec<String> {
         let window = self.window;
         self.tokens

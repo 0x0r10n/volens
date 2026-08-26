@@ -633,6 +633,10 @@ impl Bot {
             return Some(self.autobuy_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:volume" {
+            return Some(self.volume_screen());
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:exits" {
             return Some(self.exits_screen());
         }
@@ -1439,6 +1443,8 @@ impl Bot {
                 {"text": format!("🔢 Trades/day · {}", if live.max_trades_per_day == 0 {
                     "∞".to_string() } else { live.max_trades_per_day.to_string() }),
                  "callback_data": "set:maxtrades"},
+                {"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
+                 "callback_data": "set:volume"},
             ]));
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
@@ -1522,6 +1528,8 @@ impl Bot {
             "slippage" => ("slippage", "e.g. <code>250</code> (bps)"),
             "minliq" => ("minimum liquidity", "e.g. <code>20</code> (SOL)"),
             "curveliq" => ("curve minimum liquidity", "e.g. <code>0</code> for no floor"),
+            "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
+            "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
@@ -1593,6 +1601,38 @@ impl Bot {
         for chunk in opts.chunks(3) {
             rows.push(serde_json::Value::Array(chunk.to_vec()));
         }
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Volume confirmation: smart money must be corroborated by real flow.
+    #[cfg(feature = "sniper")]
+    fn volume_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let on = live.volume_mode;
+        let fmt = |v: f64| if v <= 0.0 { "off".to_string() } else { format!("{v} SOL") };
+
+        let text = format!(
+            "📊 <b>Volume mode</b>\n\nStatus: <b>{}</b>\n\n             💸 Smart SOL in · <b>{}</b>\n📈 Token volume · <b>{}</b>\n\n             <i>Smart money still decides WHEN. This only decides whether the              flow behind it is real, measured over the same {win}-minute window              as the signal. It can block an entry, never create one — with this              off, behaviour is exactly as before.</i>",
+            if on { "🟢 on" } else { "⚪ off" },
+            fmt(live.min_smart_sol_in),
+            fmt(live.min_token_volume_sol),
+            win = self.track_for_secs.max(60) / 60,
+        );
+
+        let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
+            {"text": if on { "🟢 On — tap to disable" } else { "⚪ Off — tap to enable" },
+             "callback_data": "setv:volume_on:toggle"}
+        ])];
+        rows.push(serde_json::json!([
+            {"text": format!("💸 Smart SOL in · {}", fmt(live.min_smart_sol_in)),
+             "callback_data": "set:smartsol"},
+            {"text": format!("📈 Token volume · {}", fmt(live.min_token_volume_sol)),
+             "callback_data": "set:tokenvol"},
+        ]));
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
@@ -1725,6 +1765,7 @@ impl Bot {
         let (res, screen): (Result<String, String>, String) = match field {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
             "autobuy_on" => (sniper.toggle_auto_buy(), "autobuy".into()),
+            "volume_on" => (sniper.toggle_volume_mode(), "volume".into()),
             "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "exits".into()),
@@ -1746,6 +1787,8 @@ impl Bot {
             self.stop_screen("trailing")
         } else if screen == "autobuy" {
             self.autobuy_screen()
+        } else if screen == "volume" {
+            self.volume_screen()
         } else {
             self.exits_screen()
         };
@@ -1798,6 +1841,16 @@ impl Bot {
                 "minliq" => ("💧 Pool liquidity floor", "AMM pools below this are refused. Raise-only.",
                     format!("{} SOL", live.min_liquidity_sol),
                     vec![5.0, 10.0, 15.0, 25.0, 50.0, 100.0], " SOL", false),
+                "smartsol" => ("💸 Smart-money inflow",
+                    "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
+                    if live.min_smart_sol_in <= 0.0 { "off".to_string() }
+                    else { format!("{} SOL", live.min_smart_sol_in) },
+                    vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], " SOL", false),
+                "tokenvol" => ("📈 Token volume",
+                    "Total observed SOL traded in the token, over the signal window. 0 = not required.",
+                    if live.min_token_volume_sol <= 0.0 { "off".to_string() }
+                    else { format!("{} SOL", live.min_token_volume_sol) },
+                    vec![0.0, 5.0, 15.0, 30.0, 60.0, 120.0], " SOL", false),
                 "curveliq" => ("🌱 Curve liquidity floor",
                     "pump.fun bonding curves only. 0 = no floor, so early entries are not refused for being small.",
                     if live.curve_min_liquidity_sol == 0.0 { "off".to_string() }
@@ -1894,6 +1947,8 @@ impl Bot {
             "slippage" => sniper.set_slippage_bps(v as u16),
             "minliq" => sniper.set_min_liquidity(v),
             "curveliq" => sniper.set_curve_min_liquidity(v),
+            "smartsol" => sniper.set_min_smart_sol_in(v),
+            "tokenvol" => sniper.set_min_token_volume(v),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
@@ -3087,6 +3142,18 @@ mod tests {
         // data, not a knob to flip mid-session.
         let ab = b.autobuy_screen().1.to_string();
         assert!(ab.contains("setv:autobuy_on:toggle"), "no auto-buy switch");
+
+        // Volume mode: the toggle and both thresholds are tappable, and the
+        // three fields that were cut stay cut.
+        // Assert on the KEYBOARD, not the text: the description legitimately
+        // mentions the window, and matching prose would fail on wording.
+        let vk = b.volume_screen().1.to_string();
+        assert!(vk.contains("setv:volume_on:toggle"), "no volume switch");
+        assert!(vk.contains("set:smartsol"), "no smart-money inflow button");
+        assert!(vk.contains("set:tokenvol"), "no token volume button");
+        for gone in ["set:accel", "set:smartshare", "set:volwindow"] {
+            assert!(!vk.contains(gone), "{gone} was cut from the design");
+        }
         assert!(ab.contains("setv:autobuy_min:"), "no wallet threshold");
         assert!(!ab.contains("cohort") && !ab.contains("group"), "cohorts must not be editable here");
 

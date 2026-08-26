@@ -858,7 +858,52 @@ impl Detector {
                         );
                     }
                     if eligible.len() >= need {
-                        self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                        // VOLUME CONFIRMATION.
+                        //
+                        // Evaluated only AFTER the wallet count passes, and
+                        // able only to BLOCK. Smart money is the trigger;
+                        // volume corroborates it. A confirmation that could
+                        // also admit signals would really be a second, weaker
+                        // trigger — so this is structured so a misconfigured
+                        // volume rule makes the bot trade less, never more.
+                        //
+                        // The toggle is a real bypass rather than "thresholds
+                        // at zero": turning volume mode off cannot leave a
+                        // stray threshold still filtering, and costs nothing
+                        // to evaluate.
+                        let passed = if live.volume_mode {
+                            let window = Duration::from_secs(self.cfg.tracked.window_secs);
+                            let smart_sol = {
+                                let tracker = match self.conviction.lock() {
+                                    Ok(t) => t,
+                                    Err(p) => p.into_inner(),
+                                };
+                                tracker.sol_in_window(&buy.mint, Instant::now())
+                            };
+                            let token_vol = self.prices.volume_sol_in(&buy.mint, window);
+                            let smart_ok = live.min_smart_sol_in <= 0.0
+                                || smart_sol >= live.min_smart_sol_in;
+                            let vol_ok = live.min_token_volume_sol <= 0.0
+                                || token_vol >= live.min_token_volume_sol;
+                            // Logged either way, with both numbers. A filter
+                            // you cannot see working is one you cannot tune,
+                            // and this one decides what NOT to buy.
+                            info!(
+                                mint = %buy.mint,
+                                smart_sol_in = smart_sol,
+                                need_smart_sol = live.min_smart_sol_in,
+                                token_volume = token_vol,
+                                need_volume = live.min_token_volume_sol,
+                                passed = smart_ok && vol_ok,
+                                "volume confirmation"
+                            );
+                            smart_ok && vol_ok
+                        } else {
+                            true
+                        };
+                        if passed {
+                            self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                        }
                     }
                 }
             }
