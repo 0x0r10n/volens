@@ -1211,7 +1211,7 @@ impl Sniper {
     /// `None` means no route could price it — which is the same thing as "we
     /// could not sell it either", and is handled as unpriceable rather than as
     /// a signal to sell.
-    async fn realizable_sol(&self, mint: &str, raw: u64) -> Option<f64> {
+    async fn realizable_sol(&self, mint: &str, raw: u64, decimals: u32) -> Option<f64> {
         if raw == 0 {
             return None;
         }
@@ -1226,10 +1226,43 @@ impl Sniper {
             }
         }
         let jup = crate::jupiter::Jupiter::new(&self.cfg.jupiter_base_url);
-        match jup.quote(mint, crate::model::WSOL_MINT, raw, self.cfg.sell_slippage_bps).await {
-            Ok(q) => q.out_sol(),
-            Err(_) => None,
+        if let Ok(q) = jup.quote(mint, crate::model::WSOL_MINT, raw, self.cfg.sell_slippage_bps).await
+            && let Some(sol) = q.out_sol()
+        {
+            return Some(sol);
         }
+
+        // QUOTE API DOWN — fall back to the stream, do not go blind.
+        //
+        // A graduated token has no curve to read, so the quote API is the only
+        // exact source. It shares a globally throttled lane with the telemetry
+        // sweeps and fails in bursts: 72 failures in one session, and during
+        // one of them a live position reported "stopped trading — cannot be
+        // priced or sold" for 35 seconds while the operator watched.
+        //
+        // Reporting a held position as unpriceable is the correct answer when
+        // it truly cannot be sold, and a dangerous lie when the quote endpoint
+        // is merely busy. The ladder holds either way — so a busy endpoint
+        // silently disables the stop-loss on a position that may be falling.
+        //
+        // The stream index is less exact than a route, which is why it is not
+        // the primary source (it once read +25% on a position that was flat).
+        // But an approximate price the ladder can act on beats no price at all
+        // when the alternative is holding through a drop with no stop.
+        let tokens = raw as f64 / 10f64.powi(decimals as i32);
+        if tokens > 0.0
+            && let Some(p) = self.prices.exit_price_sol(mint, EXIT_PRICE_MAX_AGE)
+        {
+            let approx = p.price_sol * tokens;
+            warn!(
+                %mint,
+                approx_sol = approx,
+                age_secs = p.age.as_secs(),
+                "quote API unavailable — pricing this exit from the stream instead"
+            );
+            return Some(approx);
+        }
+        None
     }
 
     async fn audit_smart_buy(&self, owner: &str, mint: &str, sol: f64, reason: &str, outcome: &str) {
@@ -1290,7 +1323,7 @@ impl Sniper {
             // arithmetic is unchanged: multiple = price * tokens / sol_spent
             // reduces exactly to realizable / sol_spent.
             let tokens = raw as f64 / 10f64.powi(decimals as i32);
-            let price_sol = match self.realizable_sol(&mint, raw).await {
+            let price_sol = match self.realizable_sol(&mint, raw, decimals as u32).await {
                 Some(sol) if tokens > 0.0 => Some(sol / tokens),
                 _ => None,
             };

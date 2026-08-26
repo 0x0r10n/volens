@@ -975,6 +975,33 @@ impl Detector {
         let reason = format!("{wallets} tracked wallets in window");
         let outcome = self.sniper.buy_mint(mint, &reason).await;
         info!(%mint, wallets, ?outcome, "smart-money buy");
+
+        // A REFUSAL IS NOT A POSITION.
+        //
+        // The claim taken above exists to stop a burst of signals opening two
+        // positions in the same token. It was also, accidentally, remembering
+        // that a token had once been unbuyable — and the reasons a buy is
+        // refused are mostly temporary. HALT gets lifted, daily caps reset,
+        // price impact moves, market caps change.
+        //
+        // The cost of getting this wrong was measured: a token refused at
+        // 22:27 because HALT was engaged could never be reconsidered. Nine
+        // minutes later it had 17 eligible buyers, 68 SOL of tracked inflow and
+        // 11,643 SOL of volume, passed every gate — and was silently skipped,
+        // because the mint was already in this set.
+        //
+        // Releasing the claim costs a re-check on the next tracked buy, and
+        // every guard that would permanently reject a token (rug blacklist,
+        // mint authority, freeze) runs before any network call, so a genuinely
+        // bad token is re-refused cheaply.
+        let opened = matches!(
+            outcome,
+            crate::sniper::BuyOutcome::Submitted { .. } | crate::sniper::BuyOutcome::Rehearsed { .. }
+        );
+        if !opened {
+            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
+            seen.remove(mint);
+        }
         if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome) {
             self.alerter.send_html(msg).await;
         }
