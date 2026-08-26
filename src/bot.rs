@@ -1436,6 +1436,9 @@ impl Bot {
             ]));
             rows.push(serde_json::json!([
                 {"text": format!("🎚 TP / SL · {}", crate::exits::describe(&live.exits)), "callback_data": "set:exits"},
+                {"text": format!("🔢 Trades/day · {}", if live.max_trades_per_day == 0 {
+                    "∞".to_string() } else { live.max_trades_per_day.to_string() }),
+                 "callback_data": "set:maxtrades"},
             ]));
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
@@ -1806,9 +1809,10 @@ impl Bot {
                 "dailycap" => ("📆 Daily spend cap", "Most SOL this bot may spend in a day.",
                     fmt_eff(live.daily_cap_sol, env.daily_cap_sol, " SOL"),
                     vec![0.1, 0.2, 0.5, 1.0, 2.0, 5.0], " SOL", true),
-                "maxtrades" => ("🔢 Trades per day", "Hard stop on how many buys happen in a day.",
+                "maxtrades" => ("🔢 Trades per day",
+                    "How many buys may happen in a day. 0 = unlimited.",
                     fmt_eff_u(live.max_trades_per_day, env.max_trades_per_day),
-                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 20.0], "", true),
+                    vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0], "", true),
                 "maxmcap" => ("🏦 Max market cap", "Refuse entries valued at or above this.",
                     fmt_eff(live.max_market_cap_usd, env.max_market_cap_usd, ""),
                     vec![10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0], " USD", true),
@@ -3066,10 +3070,17 @@ mod tests {
         // entry, the wallet balance bounds the rest, and a screen of limits
         // nobody uses is noise on the one screen that has to stay readable.
         // The commands still exist and still bind if anyone sets them.
-        for gone in ["set:maxsize", "set:dailycap", "set:maxtrades", "set:maxmcap",
+        for gone in ["set:maxsize", "set:dailycap", "set:maxmcap",
                      "set:maximpact", "set:mode"] {
             assert!(!blob.contains(gone), "{gone} should not be on the settings screen");
         }
+        // Trades/day IS on the screen. It is the one limit that changes with
+        // how the bot is being run — supervised at 1, unattended at many — so
+        // it has to be reachable without a config edit and a restart.
+        assert!(
+            blob.contains("set:maxtrades"),
+            "trades per day must be tappable from the settings screen"
+        );
 
         // Auto-buy: the switch and threshold are tappable; the COHORTS are
         // not, by design — which wallets to follow is a decision from scoring
