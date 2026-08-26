@@ -40,3 +40,8 @@ exit_state.json
 
 # Runtime logs
 *.log
+
+# Rust toolchain, installed INSIDE this directory on servers so nothing lands
+# outside the project (CARGO_HOME / RUSTUP_HOME point here).
+.cargo/
+.rustup/

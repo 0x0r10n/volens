@@ -27,6 +27,11 @@ x_token = ""
 # processed = fastest (best for detection), confirmed = safer, finalized = slowest.
 commitment = "processed"
 backoff_min_secs = 1
+# Seconds of total silence before the stream is treated as dead and
+# reconnected. A subscription can establish and then deliver nothing — no
+# error, no disconnect — which reads as a quiet market rather than a fault.
+# Mainnet never goes this long on the watched programs, so silence is a bug.
+idle_timeout_secs = 90
 backoff_max_secs = 30
 # Fall back to WebSocket when gRPC cannot connect. Set false to make a broken
 # gRPC endpoint a hard failure instead — correct if running seconds behind

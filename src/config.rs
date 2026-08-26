@@ -533,6 +533,15 @@ pub struct GrpcConfig {
     pub backoff_min_secs: u64,
     #[serde(default = "default_backoff_max")]
     pub backoff_max_secs: u64,
+    /// Seconds of TOTAL SILENCE on the stream before it is treated as dead.
+    ///
+    /// Not a heartbeat interval — mainnet delivers thousands of transactions a
+    /// minute on the watched programs, so any real gap this long means the
+    /// subscription is established but not delivering. That state is silent by
+    /// nature: no error, no disconnect, and every other subsystem reporting
+    /// healthy while the bot sees nothing at all.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout_secs: u64,
     /// Fall back to the WebSocket source when gRPC is unavailable.
     ///
     /// gRPC stays the PREFERRED path whenever it is configured and working —
@@ -628,6 +637,12 @@ fn default_true() -> bool { true }
 fn default_commitment() -> String { "processed".into() }
 fn default_backoff_min() -> u64 { 1 }
 fn default_backoff_max() -> u64 { 30 }
+
+/// 90s. Long enough that a genuine lull cannot trip it, short enough that a
+/// dead stream is caught before it costs a session.
+fn default_idle_timeout() -> u64 {
+    90
+}
 fn default_dedup_ttl() -> u64 { 300 }
 fn default_storage_backend() -> String { "jsonl".into() }
 fn default_min_liquidity() -> f64 { 5.0 }
@@ -686,6 +701,7 @@ impl Default for GrpcConfig {
             commitment: default_commitment(),
             backoff_min_secs: default_backoff_min(),
             backoff_max_secs: default_backoff_max(),
+            idle_timeout_secs: default_idle_timeout(),
             fallback_to_websocket: true,
             max_failures_before_fallback: default_grpc_failures(),
         }
@@ -991,6 +1007,7 @@ mod tests {
             commitment: "processed".into(),
             backoff_min_secs: 1,
             backoff_max_secs: 30,
+            idle_timeout_secs: 90,
             fallback_to_websocket: true,
             max_failures_before_fallback: 3,
         }

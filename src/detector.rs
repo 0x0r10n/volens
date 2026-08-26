@@ -561,9 +561,39 @@ impl Detector {
         *connected = true;
         info!("connected & subscribed");
 
+        // STREAM WATCHDOG.
+        //
+        // A subscription can be established and then deliver nothing. Observed
+        // twice in one evening: `connected & subscribed` logged, `tx_seen`
+        // frozen at 0 for minutes, no error, no disconnect — the reconnect
+        // logic below never engaged because from its point of view the stream
+        // was fine. Only a manual restart fixed it.
+        //
+        // That failure is worse than an outage: every other subsystem looks
+        // healthy, so a bot that is completely blind reads as a quiet market.
+        // On a server nobody is watching the log, and the only symptom is
+        // trades that never happen.
+        //
+        // So silence is treated as a fault. Bailing here drops into the same
+        // backoff-and-reconnect path a dropped stream takes.
+        let idle_limit = Duration::from_secs(self.cfg.grpc.idle_timeout_secs.max(5));
+        let mut last_item = Instant::now();
+
         loop {
             tokio::select! {
+                _ = tokio::time::sleep(idle_limit) => {
+                    let idle = last_item.elapsed();
+                    if idle >= idle_limit {
+                        warn!(
+                            idle_secs = idle.as_secs(),
+                            limit_secs = idle_limit.as_secs(),
+                            "stream delivered nothing — treating as dead and reconnecting"
+                        );
+                        anyhow::bail!("stream idle for {}s", idle.as_secs());
+                    }
+                }
                 item = stream.next() => {
+                    last_item = Instant::now();
                     let Some(item) = item else {
                         anyhow::bail!("stream ended");
                     };
