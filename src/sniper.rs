@@ -467,6 +467,20 @@ pub struct Sniper {
     /// Held positions we have already warned about being unpriceable, so the
     /// warning fires on the transition rather than every fifteen seconds.
     unpriceable: Mutex<std::collections::HashSet<String>>,
+    /// Mints whose liquidity was seen being pulled.
+    ///
+    /// # Why this exists
+    ///
+    /// The watcher detected a 52% liquidity pull on a token and fired an
+    /// emergency exit. Seven minutes later the buy path bought that same token,
+    /// because nothing connected the two: mint authority, freeze authority,
+    /// price impact and market cap all still passed, and none of them describes
+    /// "the LP just halved". The bot knew and bought anyway.
+    ///
+    /// A rug is permanent for our purposes, so this never expires within a
+    /// process. It is memory-only on purpose — a restart re-learns from the
+    /// stream rather than trusting a file that could pin a mint forever.
+    rugged: Mutex<std::collections::HashSet<String>>,
     rpc: Arc<RpcClient>,
     /// Stream-derived prices. Replaces the external quote API that was
     /// IP-blocked, and which — while the market-cap gate still failed open —
@@ -598,6 +612,7 @@ impl Sniper {
             settings,
             routes: Arc::new(crate::routes::RouteStore::load(&routes_path)),
             unpriceable: Mutex::new(std::collections::HashSet::new()),
+            rugged: Mutex::new(std::collections::HashSet::new()),
             rpc,
             submitter,
             jito,
@@ -869,6 +884,14 @@ impl Sniper {
         }
         if self.kill_switch_engaged() {
             return BuyOutcome::Refused { reason: "kill switch engaged (HALT)".into() };
+        }
+        // Checked BEFORE any of the paid guards: a token whose liquidity was
+        // pulled is not a candidate at any price, and the remaining checks
+        // would pass it — they did, once, and it cost a real trade.
+        if self.is_rugged(mint) {
+            return BuyOutcome::Refused {
+                reason: "liquidity pull already observed on this mint".into(),
+            };
         }
         let Some(owner) = self.owner() else {
             return BuyOutcome::Refused { reason: "no trading identity".into() };
@@ -1263,7 +1286,7 @@ impl Sniper {
         let mut sold = 0usize;
         for s in sells {
             warn!(mint = %s.mint, pct = s.pct_of_current, reason = %s.reason, "auto-sell firing");
-            let outcome = self.sell(&s.mint, s.pct_of_current).await;
+            let outcome = self.sell_with_floor(&s.mint, s.pct_of_current, s.min_sol_out).await;
             info!(mint = %s.mint, ?outcome, "auto-sell result");
             // Announced whether it worked or not: an operator must be able to
             // tell "the ladder never fired" from "it fired and failed".
@@ -1275,6 +1298,19 @@ impl Sniper {
             sold += 1;
         }
         (considered, sold)
+    }
+
+    /// Record a mint whose liquidity was pulled. Called by the watcher.
+    pub fn mark_rugged(&self, mint: &str) {
+        let mut set = self.rugged.lock().unwrap_or_else(|p| p.into_inner());
+        if set.insert(mint.to_string()) {
+            warn!(%mint, "mint blacklisted for buying — liquidity pull observed");
+        }
+    }
+
+    /// Has this mint been seen rugging?
+    pub fn is_rugged(&self, mint: &str) -> bool {
+        self.rugged.lock().unwrap_or_else(|p| p.into_inner()).contains(mint)
     }
 
     /// Turn smart-money auto-buy on or off.
@@ -1795,6 +1831,20 @@ impl Sniper {
     /// withdraw is not.
     #[cfg(feature = "sniper")]
     pub async fn sell(&self, mint: &str, pct: u8) -> SellOutcome {
+        self.sell_with_floor(mint, pct, None).await
+    }
+
+    /// Sell, refusing if the real quote would return less than `min_sol_out`.
+    ///
+    /// The floor is how a take-profit proves itself. See
+    /// `crate::exits::PlannedSell::min_sol_out` for what went wrong without it.
+    /// `None` means sell unconditionally — manual sells and stop-losses.
+    pub async fn sell_with_floor(
+        &self,
+        mint: &str,
+        pct: u8,
+        min_sol_out: Option<f64>,
+    ) -> SellOutcome {
         use crate::jupiter::{Jupiter, fraction_of};
         use crate::model::WSOL_MINT;
 
@@ -1848,6 +1898,23 @@ impl Sniper {
         };
         let sol_out = quote.out_sol().unwrap_or(0.0);
         let impact_pct = quote.price_impact_pct();
+
+        // The take-profit's claim, checked against the route we would actually
+        // take. Costs nothing: this quote was already fetched to build the
+        // transaction below.
+        if let Some(floor) = min_sol_out
+            && sol_out < floor
+        {
+            warn!(
+                %mint, pct, sol_out, floor,
+                "auto-sell SKIPPED — a take-profit that would realize less than cost is not a profit"
+            );
+            return SellOutcome::Refused {
+                reason: format!(
+                    "take-profit would realize {sol_out:.6} SOL against a {floor:.6} SOL basis"
+                ),
+            };
+        }
 
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,

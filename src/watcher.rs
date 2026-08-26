@@ -195,6 +195,15 @@ pub fn spawn_watch(
                 if let Some(s) = &sniper
                     && let Some(mint) = event.new_token_mint.as_deref()
                 {
+                    // Blacklist FIRST, unconditionally — before the exit rules
+                    // are even consulted. Whether we hold this token and
+                    // whether we exit it are separate questions from whether we
+                    // should ever buy it, and only the last one is settled: no.
+                    //
+                    // This ran without the blacklist once. The pull was
+                    // detected at 23:28 and the buy path bought the same mint
+                    // at 23:35, because every guard it owned still passed.
+                    s.mark_rugged(mint);
                     let rules = s.live().exits;
                     if rules.enabled && rules.exit_on_liquidity_pull {
                         warn!(token = mint, drop_pct, "liquidity pulled — emergency exit");
