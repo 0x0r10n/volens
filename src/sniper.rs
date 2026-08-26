@@ -985,56 +985,22 @@ impl Sniper {
             }
         };
 
-        let quote = match quote {
-            Ok(q) => q,
-            Err(e) => {
-                return BuyOutcome::Failed { mint: mint.into(), reason: format!("quote: {e:#}") };
-            }
-        };
-        // Raw units — the token's decimals are unknown here, and reporting a
-        // scaled figure we cannot verify would be worse than reporting none.
-        let tokens_out = quote.out_lamports().unwrap_or(0) as f64;
-
-        // Price impact stands in for depth here. There is no pool to read a
-        // reserve from on a routed entry, but a trade that moves the market
-        // this much is buying into something too thin to leave.
-        let impact_bps = (quote.price_impact_pct() * 100.0) as u32; // percent -> bps
+        // Hoisted: both the curve path and the Jupiter path apply this, and
+        // the curve path now runs FIRST. `max_mcap` is already bound above,
+        // where it gates whether the supply read is issued at all.
         let max_impact = live.effective_max_impact_bps(&env);
-        if max_impact > 0 && impact_bps > max_impact {
-            return BuyOutcome::Refused {
-                reason: format!("price impact {impact_bps} bps exceeds {max_impact}"),
-            };
-        }
 
-        // Market-cap ceiling. The pool path has always had this; the smart-money
-        // path did not, so it would happily enter something already at $5M —
-        // buying the top is exactly what the ceiling exists to prevent.
+        // ORDER MATTERS: the curve is tried BEFORE any Jupiter-derived guard.
         //
-        // Priced from THIS quote rather than the stream index: the quote is the
-        // price we are about to pay, and it exists by definition here, so the
-        // check cannot be skipped for want of an observation.
-        if max_mcap > 0.0 {
-            let tokens_out = quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
-            let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
-            match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
-                Some((sol_usd, supply)) => {
-                    let price_sol = size / tokens_out;
-                    let mcap = price_sol * supply * sol_usd;
-                    if mcap >= max_mcap {
-                        return BuyOutcome::Refused {
-                            reason: format!("market cap ${mcap:.0} at or above ${max_mcap:.0}"),
-                        };
-                    }
-                }
-                // Fails CLOSED, as the same gate does on the pool path: an
-                // unreadable guard is not a passed guard.
-                None => {
-                    return BuyOutcome::Refused {
-                        reason: "market cap unreadable (no SOL price or supply)".into(),
-                    };
-                }
-            }
-        }
+        // Price impact is a property of the ROUTE, not of the token. Judging a
+        // curve-stage token by Jupiter's routing and refusing it there means a
+        // trade we would have made cheaply, directly, never reaches the builder
+        // that would have made it — observed as "price impact 2720 bps exceeds
+        // 1000" on tokens whose own curve was fine.
+        //
+        // The curve path applies the SAME limits to its own numbers, so nothing
+        // is skipped: a genuinely thin curve is still refused, on the arithmetic
+        // that actually describes the trade.
         // ---- DIRECT BONDING CURVE, preferred over Jupiter ----
         //
         // Jupiter costs two API round trips on a lane throttled to 1200ms and
@@ -1109,6 +1075,55 @@ impl Sniper {
             }
         }
 
+        let quote = match quote {
+            Ok(q) => q,
+            Err(e) => {
+                return BuyOutcome::Failed { mint: mint.into(), reason: format!("quote: {e:#}") };
+            }
+        };
+        // Raw units — the token's decimals are unknown here, and reporting a
+        // scaled figure we cannot verify would be worse than reporting none.
+        let tokens_out = quote.out_lamports().unwrap_or(0) as f64;
+
+        // Price impact stands in for depth here. There is no pool to read a
+        // reserve from on a routed entry, but a trade that moves the market
+        // this much is buying into something too thin to leave.
+        let impact_bps = (quote.price_impact_pct() * 100.0) as u32; // percent -> bps
+        if max_impact > 0 && impact_bps > max_impact {
+            return BuyOutcome::Refused {
+                reason: format!("price impact {impact_bps} bps exceeds {max_impact}"),
+            };
+        }
+
+        // Market-cap ceiling. The pool path has always had this; the smart-money
+        // path did not, so it would happily enter something already at $5M —
+        // buying the top is exactly what the ceiling exists to prevent.
+        //
+        // Priced from THIS quote rather than the stream index: the quote is the
+        // price we are about to pay, and it exists by definition here, so the
+        // check cannot be skipped for want of an observation.
+        if max_mcap > 0.0 {
+            let tokens_out = quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
+            let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
+            match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
+                Some((sol_usd, supply)) => {
+                    let price_sol = size / tokens_out;
+                    let mcap = price_sol * supply * sol_usd;
+                    if mcap >= max_mcap {
+                        return BuyOutcome::Refused {
+                            reason: format!("market cap ${mcap:.0} at or above ${max_mcap:.0}"),
+                        };
+                    }
+                }
+                // Fails CLOSED, as the same gate does on the pool path: an
+                // unreadable guard is not a passed guard.
+                None => {
+                    return BuyOutcome::Refused {
+                        reason: "market cap unreadable (no SOL price or supply)".into(),
+                    };
+                }
+            }
+        }
         let tx_b64 = match jup.swap_tx(&quote, &owner).await {
             Ok(t) => t,
             Err(e) => {
