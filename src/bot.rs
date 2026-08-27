@@ -629,11 +629,15 @@ impl Bot {
         #[cfg(feature = "sniper")]
         if let Some(rest) = data.strip_prefix("wdgo:") {
             if let Some((sol_s, tail)) = rest.split_once(':') {
-                // tail is "<address>" or "<address>:<wallet>".
-                let (address, wallet) = match tail.split_once(':') {
-                    Some((a, w)) if !w.is_empty() => (a, Some(w)),
-                    _ => (tail, None),
-                };
+                // tail is "<address>", "<address>:" or "<address>:<wallet>".
+                //
+                // The trailing-colon form is the COMMON one: the confirm button
+                // is built as `wdgo:{sol}:{address}:{w}` and `w` is empty
+                // whenever no wallet is named — i.e. every withdrawal from the
+                // armed wallet. Falling through to `tail` here kept that colon
+                // attached to the address, so `pk()` rejected it and every
+                // default withdrawal failed with "invalid destination address".
+                let (address, wallet) = split_wdgo_tail(tail);
                 if let Ok(sol) = sol_s.parse::<f64>() {
                     let text = self.render_withdraw_exec(sol, address, wallet).await;
                     let kb = serde_json::json!({ "inline_keyboard": [[
@@ -2812,6 +2816,22 @@ pub fn format_multiple(m: f64) -> String {
 /// user-facing error. Full address validation happens in the sniper; this is
 /// just enough to reject obvious junk before showing a confirm.
 #[cfg(feature = "sniper")]
+/// Split the tail of a `wdgo:` callback into (address, optional wallet).
+///
+/// Extracted so the trailing-colon case is pinned by a test. The confirm button
+/// is built as `wdgo:{sol}:{address}:{w}` with `w` empty whenever no wallet is
+/// named — every withdrawal from the armed wallet — and an earlier version fell
+/// through to the raw tail there, leaving the colon on the address. `pk()` then
+/// rejected it, so the default withdrawal path failed for every user of it.
+#[cfg(feature = "sniper")]
+fn split_wdgo_tail(tail: &str) -> (&str, Option<&str>) {
+    match tail.split_once(':') {
+        Some((a, w)) => (a, (!w.is_empty()).then_some(w)),
+        None => (tail, None),
+    }
+}
+
+#[cfg(feature = "sniper")]
 fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String, Option<String>), String> {
     const USAGE: &str =
         "Usage: <code>/withdraw &lt;amount_SOL&gt; &lt;address&gt; [wallet]</code>";
@@ -3527,6 +3547,32 @@ mod tests {
         assert_eq!(Command::from_callback("status"), None);
         assert_eq!(Command::from_callback("cmd:size"), None); // arg-taking, not a button
         assert_eq!(Command::from_callback(""), None);
+    }
+
+    /// The withdrawal bug: every default withdrawal was refused as an "invalid
+    /// destination address", because the confirm button emits a trailing colon
+    /// when no wallet is named and the parse kept it on the address.
+    #[cfg(feature = "sniper")]
+    #[test]
+    fn withdraw_callback_tail_never_keeps_the_trailing_colon() {
+        const ADDR: &str = "DhqrThmdkwWbCfPPWme5DMWvyWVhExuvwDsg5QGhtHSX";
+
+        // The common case: armed wallet, no wallet named.
+        assert_eq!(split_wdgo_tail(&format!("{ADDR}:")), (ADDR, None));
+        // A named wallet still resolves.
+        assert_eq!(split_wdgo_tail(&format!("{ADDR}:primary")), (ADDR, Some("primary")));
+        // No wallet segment at all.
+        assert_eq!(split_wdgo_tail(ADDR), (ADDR, None));
+
+        // The property that actually matters: whatever the form, the address
+        // must parse as a pubkey.
+        for tail in [format!("{ADDR}:"), format!("{ADDR}:primary"), ADDR.to_string()] {
+            let (addr, _) = split_wdgo_tail(&tail);
+            assert!(
+                crate::tx::pk(addr).is_ok(),
+                "address must survive the split intact, got {addr:?}"
+            );
+        }
     }
 
     /// An unauthorized button tap must not execute — same guarantee as a typed

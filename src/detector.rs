@@ -1052,15 +1052,16 @@ impl Detector {
         // Best-effort — a missing supply or SOL price omits the figure rather
         // than delaying or blocking the alert.
         let entry_mcap = match &outcome {
+            // `tokens_out` is UI units on BOTH paths — see `buy_mint`. It was
+            // raw on one of them, and dividing here as well produced an entry
+            // valuation of $21.4B. No conversion belongs at this layer.
             crate::sniper::BuyOutcome::Submitted { sol_in, tokens_out, .. } if *tokens_out > 0.0 => {
-                let decimals = self.rpc.mint_info(mint).await.map(|i| i.decimals);
-                match (decimals, self.prices.sol_usd(Duration::from_secs(600))) {
-                    (Some(d), Some(sol_usd)) => {
-                        let ui = tokens_out / 10f64.powi(d as i32);
-                        match (ui > 0.0).then(|| ()).and(self.rpc.token_supply(mint).await) {
-                            Some(supply) => Some((sol_in / ui) * supply * sol_usd),
-                            None => None,
-                        }
+                match (
+                    self.prices.sol_usd(Duration::from_secs(600)),
+                    self.rpc.token_supply(mint).await,
+                ) {
+                    (Some(sol_usd), Some(supply)) => {
+                        Some((sol_in / tokens_out) * supply * sol_usd)
                     }
                     _ => None,
                 }

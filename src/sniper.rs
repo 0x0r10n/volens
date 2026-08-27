@@ -928,6 +928,36 @@ impl Sniper {
             }
         }
 
+        // CAN WE ACTUALLY AFFORD THIS?
+        //
+        // A buy costs the trade size PLUS rent for the token account it creates
+        // (~0.00204 SOL, reclaimed when the position closes) PLUS fees. Without
+        // this check the bot builds, simulates and submits a transaction that
+        // the System Program then rejects:
+        //
+        //   Transfer: insufficient lamports 42731585, need 49382715
+        //
+        // Every one of those costs a fee and produces nothing. They were the
+        // single largest failure category in the first live session — 62 of
+        // 123 — and read as a confusing `Custom: 1` rather than "out of money".
+        //
+        // Fails OPEN: an unreadable balance proceeds, because the alternative is
+        // an RPC hiccup silently stopping all trading. The chain still refuses
+        // an unaffordable trade; this only avoids paying to be told.
+        const ATA_RENT_SOL: f64 = 0.00204;
+        const FEE_HEADROOM_SOL: f64 = 0.0005;
+        if let Some(balance) = self.rpc.sol_balance(&owner).await {
+            let needed = size + ATA_RENT_SOL + FEE_HEADROOM_SOL;
+            if balance < needed {
+                return BuyOutcome::Refused {
+                    reason: format!(
+                        "insufficient balance: {balance:.6} SOL, need {needed:.6} \
+                         ({size} trade + rent + fees)"
+                    ),
+                };
+            }
+        }
+
         // Mint safety. The pool path has always refused a token whose
         // authorities are live; this path had NO checks at all beyond the caps
         // and the kill switch, so it would buy a mint whose owner can still
@@ -1081,9 +1111,14 @@ impl Sniper {
                 return BuyOutcome::Failed { mint: mint.into(), reason: format!("quote: {e:#}") };
             }
         };
-        // Raw units — the token's decimals are unknown here, and reporting a
-        // scaled figure we cannot verify would be worse than reporting none.
-        let tokens_out = quote.out_lamports().unwrap_or(0) as f64;
+        // UI units, matching the curve path. These two used to disagree —
+        // Jupiter reported RAW and the curve reported UI — while every consumer
+        // divided by decimals regardless. Curve buys were therefore scaled down
+        // a second time, which surfaced as an entry market cap of $21.4B on an
+        // alert. One meaning, set at the source, is the only version of this
+        // that stays correct as consumers are added.
+        let tokens_out =
+            quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
 
         // Price impact stands in for depth here. There is no pool to read a
         // reserve from on a routed entry, but a trade that moves the market
@@ -1103,7 +1138,7 @@ impl Sniper {
         // price we are about to pay, and it exists by definition here, so the
         // check cannot be skipped for want of an observation.
         if max_mcap > 0.0 {
-            let tokens_out = quote.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
+            // Already UI units above.
             let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
             match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
                 Some((sol_usd, supply)) => {
