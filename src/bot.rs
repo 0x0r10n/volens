@@ -1693,6 +1693,7 @@ impl Bot {
     /// Almost every position uses one stop and one target. Those get a line
     /// each here. The ladder still exists underneath and is reachable from
     /// "More targets"; nothing is lost, it is just no longer the default view.
+    #[cfg(feature = "sniper")]
     fn exits_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
@@ -1734,6 +1735,7 @@ impl Bot {
     }
 
     /// The full order list, for multi-rung ladders.
+    #[cfg(feature = "sniper")]
     fn ladder_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
@@ -1784,6 +1786,8 @@ impl Bot {
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
+    /// Editor for one order: the trigger, then the amount.
+    #[cfg(feature = "sniper")]
     fn order_screen(&self, idx: usize) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
