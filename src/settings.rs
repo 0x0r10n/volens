@@ -87,18 +87,27 @@ pub struct LiveSettings {
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
 
-    /// Refuse tokens whose total supply is at or above this. 0 = no limit.
+    /// Most of a token's total supply one position may hold, as a percent.
+    /// 0 = no limit.
     ///
-    /// Supply is not a safety property on its own — a 1e15 supply token is not
-    /// inherently worse than a 1e9 one. What it does is separate LAUNCH TYPES:
-    /// pump.fun mints 1e9, and a wildly different number usually means a
-    /// different kind of token arriving through the same detector.
+    /// # Why this matters more as the trade size grows
     ///
-    /// Kept as an operator filter rather than a guard for that reason. It is
-    /// off by default, because a supply ceiling that fires on a token the
-    /// cohort is buying is a preference, not a protection.
+    /// On an early token the supply is small and the curve is thin, so a fixed
+    /// SOL size buys a wildly varying SHARE of it. At 0.01 SOL that share is
+    /// negligible; at 0.5 SOL the same trade can take a double-digit percentage
+    /// of everything that exists.
+    ///
+    /// A position that large cannot be exited: selling it moves the price
+    /// against itself the whole way down, and there is nobody on the other side
+    /// for a fifth of the supply. Price impact catches some of this and misses
+    /// the rest, because impact measures the pool while this measures the
+    /// token.
+    ///
+    /// The trade is SIZED DOWN to fit rather than refused — a smaller position
+    /// in a token the cohort is buying beats no position, and the point is to
+    /// bound the holding, not to skip the trade.
     #[serde(default)]
-    pub max_token_supply: f64,
+    pub max_supply_pct: f64,
 
     /// Require volume confirmation on top of the wallet count.
     ///
@@ -191,7 +200,7 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             auto_buy_min_wallets: 0,
-            max_token_supply: 0.0,
+            max_supply_pct: 0.0,
             volume_mode: false,
             min_smart_sol_in: 0.0,
             min_token_volume_sol: 0.0,

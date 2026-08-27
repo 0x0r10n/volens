@@ -43,6 +43,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::{info, warn};
 
+/// Smallest trade worth making. Below this, fees and rent dominate the position
+/// so completely that the trade cannot express an opinion about the token.
+const MIN_TRADE_SOL: f64 = 0.005;
+
 /// How stale a price may be and still fire an exit.
 ///
 /// The detector tolerates an hour because it is describing a token; an exit is
@@ -979,13 +983,13 @@ impl Sniper {
         let lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let max_mcap = live.effective_max_market_cap(&env);
-        let max_supply = live.max_token_supply;
+        let max_supply_pct = live.max_supply_pct;
         let (mint_info, quote, supply) = tokio::join!(
             self.rpc.mint_info(mint),
             jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps),
             // Fetched when EITHER guard needs it, and not otherwise.
             async {
-                if max_mcap > 0.0 || max_supply > 0.0 {
+                if max_mcap > 0.0 || max_supply_pct > 0.0 {
                     self.rpc.token_supply(mint).await
                 } else {
                     None
@@ -1016,26 +1020,46 @@ impl Sniper {
             }
         };
 
-        // SUPPLY CEILING. Checked once, here, so both the curve path and the
-        // Jupiter path below inherit it.
+        // SUPPLY SHARE. Bound how much of the token this position may hold.
         //
-        // Fails CLOSED, like every other gate that reads the chain: the supply
-        // was already requested above, so an unreadable one means the RPC did
-        // not answer, and "I could not check" must never read as "the check
-        // passed".
-        if max_supply > 0.0 {
-            match supply {
-                Some(total) if total >= max_supply => {
+        // Sized down rather than refused: the aim is to bound the holding, not
+        // to skip a token the cohort is buying. Only ever shrinks the trade.
+        //
+        // Fails CLOSED when the limit is on and the supply cannot be read — the
+        // whole point is that we do not know how large a share we are taking,
+        // and that is precisely the state this guard exists to prevent.
+        let mut size = size;
+        if max_supply_pct > 0.0 {
+            let Some(total_supply) = supply else {
+                return BuyOutcome::Refused {
+                    reason: "token supply unreadable — cannot bound the supply share".into(),
+                };
+            };
+            let cap_tokens = total_supply * max_supply_pct / 100.0;
+            let would_get = match &quote {
+                Ok(q) => q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32),
+                Err(_) => 0.0,
+            };
+            if would_get > cap_tokens && would_get > 0.0 {
+                // Tokens scale close to linearly with SOL at these sizes, so
+                // one proportional step lands well inside the cap. The 2%
+                // margin absorbs the curve's convexity rather than re-quoting
+                // in a loop for a bound that does not need to be exact.
+                let scaled = size * (cap_tokens / would_get) * 0.98;
+                let share = 100.0 * would_get / total_supply;
+                if scaled < MIN_TRADE_SOL {
                     return BuyOutcome::Refused {
-                        reason: format!("supply {total:.0} at or above the {max_supply:.0} limit"),
+                        reason: format!(
+                            "{size} SOL would take {share:.2}% of supply; \
+                             staying under {max_supply_pct}% needs less than {MIN_TRADE_SOL} SOL"
+                        ),
                     };
                 }
-                None => {
-                    return BuyOutcome::Refused {
-                        reason: "token supply unreadable — cannot apply the supply limit".into(),
-                    };
-                }
-                _ => {}
+                warn!(
+                    %mint, from = size, to = scaled, share_pct = share, max_supply_pct,
+                    "sizing down: the trade would take too much of the supply"
+                );
+                size = scaled;
             }
         }
 
@@ -1515,17 +1539,17 @@ impl Sniper {
         })
     }
 
-    /// Refuse tokens at or above this total supply. 0 = no limit.
-    pub fn set_max_supply(&self, v: f64) -> Result<String, String> {
-        if v < 0.0 || !v.is_finite() {
-            return Err("value must be zero or a positive number".into());
+    /// Most of a token's supply one position may hold, as a percent. 0 = off.
+    pub fn set_max_supply_pct(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v > 100.0 || !v.is_finite() {
+            return Err("share must be between 0% and 100%".into());
         }
         self.settings.update(|s| {
-            s.max_token_supply = v;
+            s.max_supply_pct = v;
             Ok(if v == 0.0 {
-                "supply limit removed".to_string()
+                "supply-share limit removed".to_string()
             } else {
-                format!("refusing tokens with supply at or above {v:.0}")
+                format!("positions capped at {v}% of a token's supply")
             })
         })
     }
@@ -3152,27 +3176,38 @@ mod tests {
     }
 
     /// A dry-run bot holds no key, so withdraw must be refused before any
-    /// The supply ceiling must fail CLOSED. An unreadable supply means the RPC
-    /// did not answer, and every other chain-reading gate here treats that as a
-    /// refusal rather than a pass.
+    /// The supply-share cap SIZES DOWN rather than refusing, and refuses only
+    /// when even the smallest worthwhile trade would still take too much.
     #[test]
-    fn a_supply_limit_refuses_an_unreadable_supply() {
-        // Mirrors the guard in `buy_mint`: over refuses, unreadable refuses,
-        // under proceeds, disabled never refuses.
-        fn verdict(max: f64, supply: Option<f64>) -> Option<&'static str> {
-            if max <= 0.0 {
-                return None;
+    fn a_supply_share_cap_sizes_the_trade_down() {
+        // Mirrors the arithmetic in `buy_mint`.
+        fn plan(size: f64, tokens: f64, supply: f64, max_pct: f64) -> Result<f64, &'static str> {
+            if max_pct <= 0.0 {
+                return Ok(size);
             }
-            match supply {
-                Some(total) if total >= max => Some("over"),
-                None => Some("unreadable"),
-                _ => None,
+            let cap = supply * max_pct / 100.0;
+            if tokens <= cap {
+                return Ok(size);
             }
+            let scaled = size * (cap / tokens) * 0.98;
+            if scaled < MIN_TRADE_SOL { Err("too small") } else { Ok(scaled) }
         }
-        assert_eq!(verdict(0.0, None), None, "disabled means never refuse");
-        assert_eq!(verdict(1e9, Some(2e9)), Some("over"));
-        assert_eq!(verdict(1e9, Some(5e8)), None, "under the limit proceeds");
-        assert_eq!(verdict(1e9, None), Some("unreadable"), "must fail closed");
+
+        // Under the cap: untouched.
+        assert_eq!(plan(0.5, 1_000_000.0, 1e9, 2.0), Ok(0.5));
+
+        // 10% of supply against a 2% cap: scaled to roughly a fifth.
+        let got = plan(0.5, 100_000_000.0, 1e9, 2.0).unwrap();
+        assert!((got - 0.098).abs() < 1e-9, "expected ~0.098 SOL, got {got}");
+        // And the resulting holding is inside the cap, which is the point.
+        let held = 100_000_000.0 * (got / 0.5);
+        assert!(held <= 1e9 * 2.0 / 100.0, "still over the cap: {held}");
+
+        // A token so thin that staying inside the cap is not a trade at all.
+        assert_eq!(plan(0.5, 1e9, 1e9, 0.1), Err("too small"));
+
+        // Disabled changes nothing.
+        assert_eq!(plan(0.5, 1e9, 1e9, 0.0), Ok(0.5));
     }
 
     /// network call — the armed-only gate that stops a leaked token on a
