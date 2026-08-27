@@ -756,6 +756,8 @@ pub fn render_leaderboard(
     calls: &[crate::signals::SignalRecord],
     traded: &std::collections::HashSet<String>,
     window_secs: u64,
+    now: chrono::DateTime<chrono::Utc>,
+    tz_offset_hours: i32,
 ) -> String {
     const TOP: usize = 50;
 
@@ -787,11 +789,17 @@ pub fn render_leaderboard(
             c.mint.chars().take(10).collect::<String>()
         };
         let label: String = label.chars().take(14).collect();
+        // Age matters as much as the multiple: 3x in ten minutes and 3x over a
+        // day are different claims about the same number.
+        let age = crate::bot::format_window(
+            now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64,
+        );
         s.push_str(&format!(
-            "{:>2}. ${}  {}{}\n<code>{}</code>\n",
+            "{:>2}. ${}  {}  · {} ago{}\n<code>{}</code>\n",
             i + 1,
             escape_html(&label),
             crate::bot::format_multiple(c.last_multiple),
+            age,
             if traded.contains(&c.mint) { "  ●" } else { "" },
             escape_html(&c.mint),
         ));
@@ -801,6 +809,14 @@ pub fn render_leaderboard(
         s.push_str("\n<i>● taken by the bot · tap a mint to copy</i>");
     } else {
         s.push_str("\n<i>tap a mint to copy</i>");
+    }
+    // When these multiples were last true. A leaderboard with no timestamp is
+    // indistinguishable from a stale one.
+    if let Some(t) = calls.iter().filter_map(|c| c.last_checked_utc).max() {
+        s.push_str(&format!(
+            "\n<i>prices as of {}</i>",
+            crate::conviction::stamp(t, tz_offset_hours)
+        ));
     }
     s
 }

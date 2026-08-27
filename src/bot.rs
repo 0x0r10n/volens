@@ -2369,7 +2369,13 @@ impl Bot {
         let traded = crate::detector::read_traded_mints(&self.audit_log).await;
         #[cfg(not(feature = "sniper"))]
         let traded = std::collections::HashSet::new();
-        crate::alerts::render_leaderboard(&calls, &traded, self.track_for_secs)
+        crate::alerts::render_leaderboard(
+            &calls,
+            &traded,
+            self.track_for_secs,
+            now,
+            self.tz_offset_hours,
+        )
     }
 
     async fn render_wallets(&self) -> String {

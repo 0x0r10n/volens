@@ -386,6 +386,7 @@ impl Detector {
             let alerter = self.alerter.clone();
             let every = Duration::from_secs(self.cfg.tracked.leaderboard_every_secs.max(300));
             let window = self.cfg.tracked.track_for_secs;
+            let tz = self.cfg.tracked.display_utc_offset_hours;
             let audit_path = self.leaderboard_audit_path();
             let mut shutdown = shutdown.clone();
             info!(every_secs = every.as_secs(), "leaderboard scheduled");
@@ -409,7 +410,8 @@ impl Detector {
                     // its own trades after a restart is worse than one that
                     // never marked them.
                     let traded = read_traded_mints(&audit_path).await;
-                    let msg = crate::alerts::render_leaderboard(&calls, &traded, window);
+                    let msg =
+                        crate::alerts::render_leaderboard(&calls, &traded, window, now, tz);
                     alerter.send_html(msg).await;
                     info!(entries = calls.len(), taken = traded.len(), "leaderboard posted");
                 }
