@@ -1483,6 +1483,8 @@ impl Bot {
                  "callback_data": "set:maxtrades"},
                 {"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
                  "callback_data": "set:volume"},
+                {"text": format!("🪙 Max supply · {}", fmt_supply(live.max_token_supply)),
+                 "callback_data": "set:maxsupply"},
             ]));
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
@@ -1571,6 +1573,7 @@ impl Bot {
             "tpamount" => ("take-profit amount", "e.g. <code>50</code> (percent of the position)"),
             "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
+            "maxsupply" => ("max token supply", "e.g. <code>1000000000</code>, 0 = no limit"),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
@@ -1978,6 +1981,12 @@ impl Bot {
                     "How much of the position the take-profit sells.",
                     format!("{}%", live.exits.target().1),
                     vec![25.0, 50.0, 75.0, 100.0], "%", false),
+                "maxsupply" => ("🪙 Max token supply",
+                    "Refuse tokens at or above this total supply. pump.fun mints 1B, \
+                     so a much larger number usually means a different kind of token. \
+                     0 = no limit.",
+                    fmt_supply(live.max_token_supply),
+                    vec![0.0, 1e9, 1e10, 1e12, 1e15], "", false),
                 "smartsol" => ("💸 Smart-money inflow",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
@@ -2089,6 +2098,7 @@ impl Bot {
             "tpamount" => sniper.set_take_profit_amount(v as u8),
             "smartsol" => sniper.set_min_smart_sol_in(v),
             "tokenvol" => sniper.set_min_token_volume(v),
+            "maxsupply" => sniper.set_max_supply(v),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
@@ -2871,6 +2881,17 @@ fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String, Option<String
         return Err("that doesn't look like a Solana address".into());
     }
     Ok((sol, address.to_string(), wallet))
+}
+
+/// Supply for a button: 1B, 10B, 1T — never sixteen digits on a keyboard.
+fn fmt_supply(v: f64) -> String {
+    match v {
+        v if v <= 0.0 => "off".into(),
+        v if v >= 1e12 => format!("{:.0}T", v / 1e12),
+        v if v >= 1e9 => format!("{:.0}B", v / 1e9),
+        v if v >= 1e6 => format!("{:.0}M", v / 1e6),
+        v => format!("{v:.0}"),
+    }
 }
 
 /// `AAAA…ZZZZ` short form of a base58 string (mint or signature), for buttons.

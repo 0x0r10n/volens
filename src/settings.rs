@@ -87,6 +87,19 @@ pub struct LiveSettings {
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
 
+    /// Refuse tokens whose total supply is at or above this. 0 = no limit.
+    ///
+    /// Supply is not a safety property on its own — a 1e15 supply token is not
+    /// inherently worse than a 1e9 one. What it does is separate LAUNCH TYPES:
+    /// pump.fun mints 1e9, and a wildly different number usually means a
+    /// different kind of token arriving through the same detector.
+    ///
+    /// Kept as an operator filter rather than a guard for that reason. It is
+    /// off by default, because a supply ceiling that fires on a token the
+    /// cohort is buying is a preference, not a protection.
+    #[serde(default)]
+    pub max_token_supply: f64,
+
     /// Require volume confirmation on top of the wallet count.
     ///
     /// Smart money stays the trigger; this only ever makes entry HARDER. Both
@@ -178,6 +191,7 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             auto_buy_min_wallets: 0,
+            max_token_supply: 0.0,
             volume_mode: false,
             min_smart_sol_in: 0.0,
             min_token_volume_sol: 0.0,

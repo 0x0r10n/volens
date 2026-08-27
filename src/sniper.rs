@@ -979,12 +979,13 @@ impl Sniper {
         let lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let max_mcap = live.effective_max_market_cap(&env);
+        let max_supply = live.max_token_supply;
         let (mint_info, quote, supply) = tokio::join!(
             self.rpc.mint_info(mint),
             jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps),
-            // Not requested at all when the ceiling is off, as before.
+            // Fetched when EITHER guard needs it, and not otherwise.
             async {
-                if max_mcap > 0.0 {
+                if max_mcap > 0.0 || max_supply > 0.0 {
                     self.rpc.token_supply(mint).await
                 } else {
                     None
@@ -1014,6 +1015,29 @@ impl Sniper {
                 return BuyOutcome::Refused { reason: "could not verify the mint".into() };
             }
         };
+
+        // SUPPLY CEILING. Checked once, here, so both the curve path and the
+        // Jupiter path below inherit it.
+        //
+        // Fails CLOSED, like every other gate that reads the chain: the supply
+        // was already requested above, so an unreadable one means the RPC did
+        // not answer, and "I could not check" must never read as "the check
+        // passed".
+        if max_supply > 0.0 {
+            match supply {
+                Some(total) if total >= max_supply => {
+                    return BuyOutcome::Refused {
+                        reason: format!("supply {total:.0} at or above the {max_supply:.0} limit"),
+                    };
+                }
+                None => {
+                    return BuyOutcome::Refused {
+                        reason: "token supply unreadable — cannot apply the supply limit".into(),
+                    };
+                }
+                _ => {}
+            }
+        }
 
         // Hoisted: both the curve path and the Jupiter path apply this, and
         // the curve path now runs FIRST. `max_mcap` is already bound above,
@@ -1488,6 +1512,21 @@ impl Sniper {
             }
             s.exits.set_target(pct, amount);
             Ok(format!("take profit sells {amount}% at +{pct}%"))
+        })
+    }
+
+    /// Refuse tokens at or above this total supply. 0 = no limit.
+    pub fn set_max_supply(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || !v.is_finite() {
+            return Err("value must be zero or a positive number".into());
+        }
+        self.settings.update(|s| {
+            s.max_token_supply = v;
+            Ok(if v == 0.0 {
+                "supply limit removed".to_string()
+            } else {
+                format!("refusing tokens with supply at or above {v:.0}")
+            })
         })
     }
 
@@ -3113,6 +3152,29 @@ mod tests {
     }
 
     /// A dry-run bot holds no key, so withdraw must be refused before any
+    /// The supply ceiling must fail CLOSED. An unreadable supply means the RPC
+    /// did not answer, and every other chain-reading gate here treats that as a
+    /// refusal rather than a pass.
+    #[test]
+    fn a_supply_limit_refuses_an_unreadable_supply() {
+        // Mirrors the guard in `buy_mint`: over refuses, unreadable refuses,
+        // under proceeds, disabled never refuses.
+        fn verdict(max: f64, supply: Option<f64>) -> Option<&'static str> {
+            if max <= 0.0 {
+                return None;
+            }
+            match supply {
+                Some(total) if total >= max => Some("over"),
+                None => Some("unreadable"),
+                _ => None,
+            }
+        }
+        assert_eq!(verdict(0.0, None), None, "disabled means never refuse");
+        assert_eq!(verdict(1e9, Some(2e9)), Some("over"));
+        assert_eq!(verdict(1e9, Some(5e8)), None, "under the limit proceeds");
+        assert_eq!(verdict(1e9, None), Some("unreadable"), "must fail closed");
+    }
+
     /// network call — the armed-only gate that stops a leaked token on a
     /// dry-run bot from moving funds.
     #[tokio::test]
