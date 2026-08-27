@@ -624,7 +624,7 @@ pub fn spawn_tracker(
             // "no updates" and "not running" look identical from the outside.
             let started = std::time::Instant::now();
             let mut priced = 0usize;
-            let mut routeless = 0usize;
+            let mut unpriced = 0usize;
             let mut best = 0.0f64;
             if skipped > 0 {
                 tracing::warn!(
@@ -645,11 +645,20 @@ pub fn spawn_tracker(
             // and every record retried it.
             let sweep_rate = prices.sol_usd(std::time::Duration::from_secs(300));
 
-            // Consecutive failures abort the sweep. A provider that is
-            // refusing us will refuse the next 119 too, and continuing only
-            // hammers it — which is precisely what keeps a rate limit engaged.
-            const ABORT_AFTER: usize = 8;
-            let mut consecutive_fail = 0usize;
+            // NO ABORT. This used to stop the sweep after 8 consecutive
+            // failures, from when pricing was an HTTP quote and a refusing
+            // provider would refuse the next 119 too.
+            //
+            // Pricing now reads the in-process stream index: there is no
+            // endpoint to hammer, and "unpriced" is not a failure — it is the
+            // normal state of a token nobody has traded in the last hour.
+            //
+            // Aborting on it was actively harmful. The batch is sorted
+            // NEWEST-FIRST, and brand-new tokens are exactly the ones with no
+            // observations yet, so a cluster of them at the top ended the sweep
+            // before it reached the older, actively-traded calls below. A token
+            // at 273x stopped being re-priced for hours while the log blamed
+            // "the quote endpoint", which was not even in the code path.
             // Pricing is now free (it reads the in-process index), but the
             // identity/decimals backfills still hit the RPC. With a fast sweep
             // interval an unbounded backfill would hammer it, so only a few
@@ -661,15 +670,6 @@ pub fn spawn_tracker(
                 if *shutdown.borrow() {
                     return;
                 }
-                if consecutive_fail >= ABORT_AFTER {
-                    tracing::warn!(
-                        consecutive_fail,
-                        "aborting sweep: the quote endpoint is failing repeatedly. \
-                         Continuing would only hammer it — retrying next sweep."
-                    );
-                    break;
-                }
-
                 // Backfill an identity that was unresolvable at call time.
                 // Metadata can appear seconds AFTER the mint, and older records
                 // predate the Token-2022 lookup entirely, so a call announced
@@ -717,7 +717,6 @@ pub fn spawn_tracker(
                 // got hammered with no delay at all: 120 quotes in one second,
                 // which is a feedback loop that sustains its own rate limit.
                 if let Some(sol_now) = quoted {
-                    consecutive_fail = 0;
                     priced += 1;
                     if rec.reference_sol > 0.0 {
                         let multiple = sol_now / rec.reference_sol;
@@ -754,9 +753,8 @@ pub fn spawn_tracker(
                         }
                     }
                 } else {
-                    consecutive_fail += 1;
-                    routeless += 1;
-                    tracing::debug!(mint = %rec.mint, "no route or quote failed");
+                    unpriced += 1;
+                    tracing::debug!(mint = %rec.mint, "no recent fills — cannot price yet");
                 }
 
                 // No sleep here: `jupiter::throttle` spaces every request
@@ -770,7 +768,7 @@ pub fn spawn_tracker(
 
             tracing::info!(
                 priced,
-                routeless,
+                unpriced,
                 named,
                 best = format!("{best:.2}x"),
                 took_secs = started.elapsed().as_secs(),

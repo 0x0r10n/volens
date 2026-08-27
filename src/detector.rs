@@ -1994,7 +1994,7 @@ mod price_from_stream_probe {
 /// Only CONFIRMED buys count. A refused or failed attempt is not a position,
 /// and marking one on the leaderboard would claim credit for a trade that
 /// never happened.
-async fn read_traded_mints(path: &str) -> std::collections::HashSet<String> {
+pub async fn read_traded_mints(path: &str) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     if path.is_empty() {
         return out;

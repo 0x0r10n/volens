@@ -766,7 +766,7 @@ impl Bot {
             Command::Balance => self.render_balance().await,
             Command::Deposit => self.render_deposit(),
             Command::Positions => self.render_positions().await,
-            Command::Calls => self.render_calls(),
+            Command::Calls => self.render_calls().await,
             Command::Settings => self.render_settings(),
             Command::NewWallet(name) => self.render_new_wallet(name.as_deref()),
             Command::Wallets => self.render_wallets().await,
@@ -2351,72 +2351,22 @@ impl Bot {
     /// block's literal contents, so a shortened mint would copy a truncated
     /// string that is not a valid address — the tap would appear to work and
     /// silently yield something unusable.
-    fn render_calls(&self) -> String {
+    /// The leaderboard, on demand.
+    ///
+    /// Deliberately the SAME renderer the five-hourly post uses. A command that
+    /// formats its own version of the same data drifts from the scheduled one
+    /// the first time either is touched, and then the group is reading two
+    /// different truths about the same calls.
+    async fn render_calls(&self) -> String {
         let Some(signals) = self.signals.as_ref() else {
             return "<b>Alerts</b>\n\nSmart-money tracking is not enabled.".to_string();
         };
-
         let now = chrono::Utc::now();
         let calls = signals.ranked(now, self.track_for_secs as i64);
-        if calls.is_empty() {
-            return format!(
-                "<b>Alerts</b>\n\nNothing tracked in the last {}.",
-                format_window(self.track_for_secs)
-            );
-        }
-
-        let runners = calls.iter().filter(|c| c.last_multiple >= 2.0).count();
-        let mut s = format!(
-            "🔥 <b>Alerts</b> — {} tracked, {runners} at 2x+\n\n",
-            calls.len()
-        );
-
-        // Bounded: a day of calls can run to dozens and Telegram truncates a
-        // message at 4096 characters, which would cut the list mid-entry.
-        const MAX: usize = 25;
-        for c in calls.iter().take(MAX) {
-            let age = format_window(
-                now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64,
-            );
-            // Header line carries the TICKER; the mint sits below in a code
-            // block. When no ticker is known the header is skipped entirely
-            // rather than repeating the mint on both lines.
-            match (c.symbol.as_str(), c.name.as_str()) {
-                ("", "") => s.push_str(&format!(
-                    "<b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
-                    format_multiple(c.last_multiple),
-                    c.mint
-                )),
-                ("", name) => s.push_str(&format!(
-                    "{name}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
-                    format_multiple(c.last_multiple),
-                    c.mint
-                )),
-                (sym, _) => s.push_str(&format!(
-                    "${sym}  <b>{}</b>  ({age} ago)\n<code>{}</code>\n\n",
-                    format_multiple(c.last_multiple),
-                    c.mint
-                )),
-            }
-        }
-        if calls.len() > MAX {
-            s.push_str(&format!("\n…and {} more\n", calls.len() - MAX));
-        }
-
-        match calls.iter().filter_map(|c| c.last_checked_utc).max() {
-            Some(t) => s.push_str(&format!(
-                "\nPrices as of {}",
-                crate::conviction::stamp(t, self.tz_offset_hours)
-            )),
-            // Distinct from a stale price: nothing has been re-priced at all
-            // yet, so every multiple shown is still the 1.0 it was born with.
-            None => s.push_str("\n<i>Not yet re-priced — multiples are provisional.</i>"),
-        }
-        s
+        let traded = crate::detector::read_traded_mints(&self.audit_log).await;
+        crate::alerts::render_leaderboard(&calls, &traded, self.track_for_secs)
     }
 
-    /// List stored wallets with addresses and (if RPC available) balances,
-    /// marking the active one. Addresses only — never key material.
     async fn render_wallets(&self) -> String {
         #[cfg(not(feature = "sniper"))]
         {
