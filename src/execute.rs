@@ -1088,7 +1088,9 @@ pub async fn build_pumpfun_buy(
     // The curve takes native SOL, NOT wrapped — so no wrap/unwrap here, unlike
     // every AMM path in this module. Only the token side needs an account.
     instructions.push(tx::ensure_token_ata_with_program(owner, mint, &ctx.token_program));
-    instructions.push(crate::pumpfun::buy_ix(&ctx, &q));
+    // Exact-IN, not exact-out. See `pumpfun::buy_exact_sol_ix` for the
+    // transaction log that forced the change.
+    instructions.push(crate::pumpfun::buy_exact_sol_ix(&ctx, &q));
 
     Ok(ExecutionPlan {
         instructions,
@@ -1383,7 +1385,14 @@ mod pumpfun_sim {
         }
 
         // --- BUY ---
-        let buy = build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 300_000, 100_000)
+        // Sizeable from the environment: simulation still needs the payer to
+        // actually afford the trade plus ATA rent, so a wallet smaller than the
+        // default fails as InsufficientFunds and proves nothing about encoding.
+        let size: u64 = std::env::var("VOLENS_SIM_LAMPORTS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000_000);
+        let buy = build_pumpfun_buy(&rpc, &mint, &owner, size, 300, 0.0, 300_000, 100_000)
             .await
             .expect("build buy");
         let (err, units, logs) = simulate(buy, "BUY").await;
@@ -1409,7 +1418,7 @@ mod pumpfun_sim {
             // After the buy executes, the ATA really does hold tokens, so the
             // sell runs against genuine state rather than a hypothetical.
             println!("payer holds none — proving the sell by buy+sell in one transaction");
-            let buy = build_pumpfun_buy(&rpc, &mint, &owner, 10_000_000, 300, 0.0, 600_000, 100_000)
+            let buy = build_pumpfun_buy(&rpc, &mint, &owner, size, 300, 0.0, 600_000, 100_000)
                 .await
                 .expect("build buy");
             let sell_amount = buy.quote.minimum_out;

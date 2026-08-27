@@ -41,6 +41,13 @@ const SYSTEM_PROGRAM: Pubkey =
 /// Anchor discriminator for `global:buy` — sha256("global:buy")[..8].
 /// Confirmed byte-for-byte against live transactions.
 pub const BUY_DISCRIMINATOR: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+/// Anchor discriminator for `global:buy_exact_sol_in`.
+///
+/// The instruction real clients actually use — it was the first thing decoded
+/// off mainnet, before `buy` was even found. Same 16 accounts as `buy`; only
+/// the argument DIRECTION differs, and that direction is the whole point.
+pub const BUY_EXACT_SOL_DISCRIMINATOR: [u8; 8] =
+    [0x38, 0xfc, 0x74, 0x08, 0x9e, 0xdf, 0xcd, 0x5f];
 /// Anchor discriminator for `global:sell`.
 pub const SELL_DISCRIMINATOR: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
 /// Anchor discriminator of the `BondingCurve` ACCOUNT (not an instruction).
@@ -637,6 +644,47 @@ fn sell_accounts(ctx: &TradeContext, curve: &Pubkey, extra: &[AccountMeta]) -> V
     .collect()
 }
 
+/// Encode `buy_exact_sol_in` — spend a known amount of SOL.
+///
+/// # Why this and not `buy`
+///
+/// `buy` is exact-OUT: you name the TOKENS and cap the SOL. That reads
+/// backwards for our purpose (we want to spend 0.01 SOL, not acquire some
+/// specific token count) and it fails on exactly the tokens worth buying.
+///
+/// The curve is read, a token amount is derived from it, and by the time the
+/// transaction lands the price has moved — on a token several tracked wallets
+/// are buying at once, more than the slippage tolerance, routinely. Then the
+/// tokens we committed to cost more than the ceiling and the program refuses:
+///
+/// ```text
+/// AnchorError pump/src/lib.rs:444  TooMuchSolRequired
+///   Left:  10000000   <- our max_sol_cost, exactly 0.01 SOL
+///   Right: 10024952   <- what those tokens now cost, 0.25% more
+/// ```
+///
+/// Thirty transactions died that way in one session, all fees and no fills,
+/// and every one of them was a token moving fast enough to be worth buying.
+///
+/// Exact-IN removes the failure rather than tuning around it: a price tick
+/// between read and execution means slightly FEWER tokens, not a rejection.
+/// `min_tokens_out` still floors what we accept, so the protection is intact —
+/// it just protects the right side of the trade.
+pub fn buy_exact_sol_ix(ctx: &TradeContext, q: &BuyQuote) -> Instruction {
+    let curve = bonding_curve_pda(&ctx.mint);
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&BUY_EXACT_SOL_DISCRIMINATOR);
+    // spendable_sol_in — the budget, spent as fully as the curve allows.
+    data.extend_from_slice(&q.max_sol_cost.to_le_bytes());
+    // min_tokens_out — the slippage floor.
+    data.extend_from_slice(&q.amount.to_le_bytes());
+    Instruction {
+        program_id: PUMP_PROGRAM,
+        accounts: trade_accounts(ctx, &curve, &ctx.extra_accounts),
+        data,
+    }
+}
+
 /// Encode `sell`. Args are `amount` + `min_sol_output`.
 pub fn sell_ix(ctx: &TradeContext, q: &SellQuote) -> Instruction {
     let curve = bonding_curve_pda(&ctx.mint);
@@ -924,6 +972,60 @@ mod tests {
 
     /// The seed that mainnet simulation forced us to find. All five captured
     /// transactions agree.
+    /// The first mainnet instruction decoded in this project, before `buy` was
+    /// even identified. Args are (spendable_sol_in, min_tokens_out) — note the
+    /// SOL comes first here and the TOKENS come first in `buy`, which is the
+    /// entire difference between the two.
+    #[test]
+    fn golden_buy_exact_sol_matches_the_live_payload() {
+        let ctx = TradeContext {
+            mint: Pubkey::from_str("3RXfvoL5tDYRQfZZ9rweeHwCpv5kbdZ4BWrqxWLzpump").unwrap(),
+            user: Pubkey::from_str("GjKjTmzuoAMdxmKHJpQp9PTJLNuvN1SBXAEARr4GEB1c").unwrap(),
+            token_program: Pubkey::from_str("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb").unwrap(),
+            fee_recipient: Pubkey::from_str("CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM").unwrap(),
+            creator: Pubkey::from_str(FIXTURE_1_CREATOR).unwrap(),
+            extra_accounts: Vec::new(),
+        };
+        // spendable_sol_in = 0.1 SOL, min_tokens_out = 267_624_000_000.
+        let q = BuyQuote {
+            expected_tokens: 267_624_000_000,
+            amount: 267_624_000_000,
+            max_sol_cost: 100_000_000,
+        };
+        let ix = buy_exact_sol_ix(&ctx, &q);
+        assert_eq!(
+            hex(&ix.data),
+            "38fc74089edfcd5f00e1f50500000000002aa24f3e000000",
+            "payload must match the captured transaction byte for byte"
+        );
+        assert_eq!(ix.accounts.len(), 16, "same account list as buy");
+        // The curve for that mint, from the live transaction's slot [3].
+        assert_eq!(
+            ix.accounts[3].pubkey.to_string(),
+            "2smtDnwa2G6y1Wm2TW5ixAd4PuSBKRyQV7oKWiVPNA2V"
+        );
+    }
+
+    /// The two instructions must not be confused: same accounts, opposite args.
+    #[test]
+    fn exact_in_and_exact_out_put_their_arguments_in_opposite_order() {
+        let (mint, user, token_program, creator) = fixture_1();
+        let ctx = TradeContext {
+            mint, user, token_program, creator,
+            fee_recipient: Pubkey::from_str("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP")
+                .unwrap(),
+            extra_accounts: Vec::new(),
+        };
+        let q = BuyQuote { expected_tokens: 500, amount: 400, max_sol_cost: 900 };
+        let exact_out = buy_ix(&ctx, &q);
+        let exact_in = buy_exact_sol_ix(&ctx, &q);
+        assert_ne!(exact_out.data[..8], exact_in.data[..8], "different instructions");
+        // buy: tokens then SOL. buy_exact_sol_in: SOL then tokens.
+        assert_eq!(&exact_out.data[8..16], &400u64.to_le_bytes(), "buy leads with tokens");
+        assert_eq!(&exact_in.data[8..16], &900u64.to_le_bytes(), "exact-in leads with SOL");
+        assert_eq!(exact_out.accounts.len(), exact_in.accounts.len());
+    }
+
     #[test]
     fn golden_bonding_curve_v2_pda_matches_mainnet() {
         let (mint, ..) = fixture_1();
