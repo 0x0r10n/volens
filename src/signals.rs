@@ -84,6 +84,20 @@ pub struct SignalRecord {
     /// issuing a live quote per tracked signal.
     #[serde(default = "one")]
     pub last_multiple: f64,
+    /// Highest multiple ever measured for this call.
+    ///
+    /// # Why the leaderboard ranks on this and not `last_multiple`
+    ///
+    /// Ranking by the CURRENT price penalises exactly the calls that worked. A
+    /// token that ran to 1000x and settled at 649x outperformed one sitting
+    /// flat at 3x, and a board that puts the second above the first is
+    /// measuring when you happened to look rather than how the call did.
+    ///
+    /// Defaulted rather than required so records written before this field
+    /// existed load rather than being discarded; they converge on their real
+    /// peak from the next sweep onward.
+    #[serde(default)]
+    pub peak_multiple: f64,
     /// When `last_multiple` was measured, so a stale figure can say so.
     #[serde(default)]
     pub last_checked_utc: Option<DateTime<Utc>>,
@@ -95,6 +109,12 @@ fn one() -> f64 {
 
 impl SignalRecord {
     /// Age in seconds, used to retire signals from tracking.
+    /// The highest multiple seen, tolerating records written before the field
+    /// existed (they carry 0.0 until the next sweep re-measures them).
+    pub fn peak(&self) -> f64 {
+        self.peak_multiple.max(self.last_multiple)
+    }
+
     pub fn age_secs(&self, now: DateTime<Utc>) -> i64 {
         (now - self.first_seen_utc).num_seconds()
     }
@@ -194,6 +214,10 @@ impl SignalStore {
     pub fn mark_checked(&self, mint: &str, multiple: f64, at: DateTime<Utc>) {
         if let Some(rec) = self.lock().get_mut(mint) {
             rec.last_multiple = multiple;
+            // A peak only ever rises. `last_reported_multiple` is not a
+            // substitute: it is quantised to announcement rungs, so a call that
+            // ran to 7.4x and never crossed the next rung reads as 5x forever.
+            rec.peak_multiple = rec.peak_multiple.max(multiple);
             rec.last_checked_utc = Some(at);
         }
     }
@@ -206,14 +230,16 @@ impl SignalStore {
         out
     }
 
-    /// Every tracked signal, best performer first. For `/calls`.
+    /// Every tracked signal, best performer first.
+    ///
+    /// Ranked on the PEAK, not the current price — see `peak_multiple`.
     pub fn ranked(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
         let mut out = self.active(now, max_age_secs);
-        // Highest multiple first. Ties break on recency rather than HashMap
-        // order, so the list is stable between calls instead of reshuffling.
+        // Ties break on recency rather than HashMap order, so the list is
+        // stable between calls instead of reshuffling.
         out.sort_by(|a, b| {
-            b.last_multiple
-                .total_cmp(&a.last_multiple)
+            b.peak()
+                .total_cmp(&a.peak())
                 .then(b.first_seen_utc.cmp(&a.first_seen_utc))
         });
         out
@@ -801,6 +827,7 @@ mod tests {
             sol_usd_at_signal: Some(75.0),
             total_fees_sol: 0.042,
             last_multiple: 1.0,
+            peak_multiple: 1.0,
             last_checked_utc: None,
             last_reported_multiple: 1.0,
         }

@@ -1177,6 +1177,7 @@ impl Detector {
                     sol_usd_at_signal: market.map(|m| m.sol_usd),
                     last_reported_multiple: 1.0,
                     last_multiple: 1.0,
+                    peak_multiple: 1.0,
                     last_checked_utc: None,
                 });
             }

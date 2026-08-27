@@ -769,11 +769,11 @@ pub fn render_leaderboard(
     }
 
     let ranked: Vec<_> = calls.iter().take(TOP).collect();
-    let runners = calls.iter().filter(|c| c.last_multiple >= 2.0).count();
+    let runners = calls.iter().filter(|c| c.peak() >= 2.0).count();
     let took = ranked.iter().filter(|c| traded.contains(&c.mint)).count();
 
     let mut s = format!(
-        "🏆 <b>Top calls</b> · last {}\n{} tracked · {runners} above 2× · {took} taken\n\n",
+        "🏆 <b>Top calls</b> · last {}\n{} tracked · {runners} above 2× · {took} taken\n<i>ranked by peak</i>\n\n",
         crate::bot::format_window(window_secs),
         calls.len()
     );
@@ -794,11 +794,13 @@ pub fn render_leaderboard(
         let age = crate::bot::format_window(
             now.signed_duration_since(c.first_seen_utc).num_seconds().max(0) as u64,
         );
+        // ATH only. The board answers "how did the call do", and the peak is
+        // that answer; a second live number on every row is noise against it.
         s.push_str(&format!(
             "{:>2}. ${}  {}  · {} ago{}\n<code>{}</code>\n",
             i + 1,
             escape_html(&label),
-            crate::bot::format_multiple(c.last_multiple),
+            crate::bot::format_multiple(c.peak()),
             age,
             if traded.contains(&c.mint) { "  ●" } else { "" },
             escape_html(&c.mint),
