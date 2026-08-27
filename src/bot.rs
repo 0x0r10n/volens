@@ -2363,7 +2363,12 @@ impl Bot {
         };
         let now = chrono::Utc::now();
         let calls = signals.ranked(now, self.track_for_secs as i64);
+        // The audit log only exists in a sniper build; an alerts-only build has
+        // no trades to mark, so the list renders identically without the marks.
+        #[cfg(feature = "sniper")]
         let traded = crate::detector::read_traded_mints(&self.audit_log).await;
+        #[cfg(not(feature = "sniper"))]
+        let traded = std::collections::HashSet::new();
         crate::alerts::render_leaderboard(&calls, &traded, self.track_for_secs)
     }
 
