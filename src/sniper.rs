@@ -1444,6 +1444,68 @@ impl Sniper {
         self.rugged.lock().unwrap_or_else(|p| p.into_inner()).contains(mint)
     }
 
+    /// The single stop loss, as a negative percentage. 0 clears it.
+    pub fn set_stop_loss(&self, pct: i32) -> Result<String, String> {
+        if pct > 0 || pct <= -100 {
+            return Err("a stop must be between -1% and -99%".into());
+        }
+        self.settings.update(|s| {
+            s.exits.set_stop(pct);
+            Ok(if pct == 0 {
+                "stop loss removed — nothing closes a losing position".to_string()
+            } else {
+                format!("stop loss set to {pct}%")
+            })
+        })
+    }
+
+    /// The single take-profit trigger, keeping its current sell amount.
+    pub fn set_take_profit(&self, pct: i32) -> Result<String, String> {
+        if pct < 0 {
+            return Err("a target must be positive".into());
+        }
+        self.settings.update(|s| {
+            let (_, amt) = s.exits.target();
+            let amt = if amt == 0 { 100 } else { amt };
+            s.exits.set_target(pct, amt);
+            Ok(if pct == 0 {
+                "take profit removed".to_string()
+            } else {
+                format!("take profit set to +{pct}% (sell {amt}%)")
+            })
+        })
+    }
+
+    /// How much of the position the take-profit sells.
+    pub fn set_take_profit_amount(&self, amount: u8) -> Result<String, String> {
+        if !(1..=100).contains(&amount) {
+            return Err("amount must be between 1% and 100%".into());
+        }
+        self.settings.update(|s| {
+            let (pct, _) = s.exits.target();
+            if pct == 0 {
+                return Err("set a take-profit trigger first".to_string());
+            }
+            s.exits.set_target(pct, amount);
+            Ok(format!("take profit sells {amount}% at +{pct}%"))
+        })
+    }
+
+    /// Arm a break-even stop once the position has been up this much. 0 = off.
+    pub fn set_breakeven(&self, pct: u16) -> Result<String, String> {
+        if pct > 10_000 {
+            return Err("that is not a plausible arming level".into());
+        }
+        self.settings.update(|s| {
+            s.exits.breakeven_at_pct = pct;
+            Ok(if pct == 0 {
+                "break-even off".to_string()
+            } else {
+                format!("break-even arms at +{pct}%, then exits at cost")
+            })
+        })
+    }
+
     /// Turn volume confirmation on or off.
     ///
     /// A real bypass, not "thresholds at zero": switching it off cannot leave a

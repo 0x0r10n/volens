@@ -675,6 +675,10 @@ impl Bot {
             return Some(self.exits_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:ladder" {
+            return Some(self.ladder_screen());
+        }
+        #[cfg(feature = "sniper")]
         if let Some(n) = data.strip_prefix("set:order") {
             if let Ok(i) = n.parse::<usize>() {
                 return Some(self.order_screen(i));
@@ -1562,6 +1566,10 @@ impl Bot {
             "slippage" => ("slippage", "e.g. <code>250</code> (bps)"),
             "minliq" => ("minimum liquidity", "e.g. <code>20</code> (SOL)"),
             "curveliq" => ("curve minimum liquidity", "e.g. <code>0</code> for no floor"),
+            "stoploss" => ("stop loss", "e.g. <code>-15</code> (percent), 0 = none"),
+            "takeprofit" => ("take profit", "e.g. <code>100</code> (percent), 0 = none"),
+            "tpamount" => ("take-profit amount", "e.g. <code>50</code> (percent of the position)"),
+            "breakeven" => ("break-even arming level", "e.g. <code>30</code> (percent), 0 = off"),
             "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
@@ -1673,47 +1681,70 @@ impl Bot {
 
     /// The auto-sell screen: one list of orders, plus the trailing stop.
     #[cfg(feature = "sniper")]
+    /// Auto-sell, as four decisions instead of a variable-length ladder.
+    ///
+    /// # Why this replaced the order list
+    ///
+    /// The old screen presented N editable orders, each with its own trigger
+    /// and amount, and left the operator to work out what they added up to. It
+    /// could express anything — and made the common case (one stop, one target)
+    /// exactly as hard to read as the rare one.
+    ///
+    /// Almost every position uses one stop and one target. Those get a line
+    /// each here. The ladder still exists underneath and is reachable from
+    /// "More targets"; nothing is lost, it is just no longer the default view.
     fn exits_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
         let e = sniper.live().exits;
         let onoff = if e.enabled { "🟢 On" } else { "⚪ Off" };
+        let stop = e.stop_pct();
+        let (tp, tp_amt) = e.target();
 
-        // Split by kind. The old screen listed stops and targets together in
-        // config order, which made the actual plan — "what protects me, what
-        // takes profit" — something you had to reconstruct by reading signs.
-        let mut stops: Vec<crate::exits::SellOrder> =
-            e.orders.iter().copied().filter(|o| o.is_armed() && o.is_stop()).collect();
-        let mut targets: Vec<crate::exits::SellOrder> =
-            e.orders.iter().copied().filter(|o| o.is_armed() && !o.is_stop()).collect();
-        stops.sort_by_key(|o| -o.at_pct);
-        targets.sort_by_key(|o| o.at_pct);
-        let unset = e.orders.iter().filter(|o| !o.is_armed()).count();
+        let stop_s = if stop < 0 { format!("{stop}%") } else { "none".into() };
+        let tp_s = if tp > 0 { format!("+{tp}% · sell {tp_amt}%") } else { "none".into() };
+        let be_s = if e.breakeven_at_pct > 0 {
+            format!("at +{}%", e.breakeven_at_pct)
+        } else {
+            "off".into()
+        };
+        let tr_s = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
 
-        let mut body = String::new();
-
-        body.push_str("\n🛑 <b>STOPS</b>  <i>— checked first</i>\n");
-        if stops.is_empty() {
-            body.push_str("   <i>none — nothing closes a losing position</i>\n");
+        let mut text = format!(
+            "🎚 <b>Auto-sell</b> · {onoff}\n\n             🛑 Stop loss   <b>{stop_s}</b>\n             🎯 Take profit <b>{tp_s}</b>\n             🔒 Break-even  <b>{be_s}</b>\n             📉 Trailing    <b>{tr_s}</b>\n\n             <i>Break-even arms once the position has been up that much, then \
+             exits at cost rather than at a loss. Protective rules are always \
+             checked before targets.</i>"
+        );
+        if e.is_ladder() {
+            text.push_str("\n\n<i>Extra targets are set — see More targets.</i>");
         }
-        for o in &stops {
-            body.push_str(&format!("   {}% → sell {}%\n", o.at_pct, o.amount_pct));
-        }
 
-        body.push_str("\n🎯 <b>TARGETS</b>  <i>— lowest first</i>\n");
-        if targets.is_empty() {
-            body.push_str("   <i>none — only stops and the trailing stop can exit</i>\n");
-        }
-        // Running total is the thing people get wrong: amounts are shares of
-        // the ORIGINAL position, so they accumulate. Showing what is left after
-        // each rung makes a dead rung obvious instead of arithmetic.
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}],
+            [{"text": format!("🛑 Stop loss · {stop_s}"), "callback_data": "set:stoploss"},
+             {"text": format!("🎯 Take profit · {}", if tp > 0 { format!("+{tp}%") } else { "none".into() }),
+              "callback_data": "set:takeprofit"}],
+            [{"text": format!("🔒 Break-even · {be_s}"), "callback_data": "set:breakeven"},
+             {"text": format!("📉 Trailing · {tr_s}"), "callback_data": "set:trailing"}],
+            [{"text": "⚙️ More targets", "callback_data": "set:ladder"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
+    }
+
+    /// The full order list, for multi-rung ladders.
+    fn ladder_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let e = sniper.live().exits;
         let mut sold: u32 = 0;
-        let mut dead_from: Option<i32> = None;
+        let mut body = String::new();
+        let mut targets: Vec<_> =
+            e.orders.iter().copied().filter(|o| o.is_armed() && !o.is_stop()).collect();
+        targets.sort_by_key(|o| o.at_pct);
         for o in &targets {
-            if sold >= 100 && dead_from.is_none() {
-                dead_from = Some(o.at_pct);
-            }
             sold += o.amount_pct as u32;
             let left = 100i64 - sold as i64;
             body.push_str(&format!(
@@ -1723,46 +1754,21 @@ impl Bot {
                 if left <= 0 { "nothing".to_string() } else { format!("{left}%") }
             ));
         }
-
-        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
-        body.push_str(&format!("\n📉 <b>Trailing</b>: {tr}\n"));
-
-        // The warning that matters most, and the one this screen previously
-        // expressed only as a percentage you had to interpret.
-        if let Some(at) = dead_from {
-            body.push_str(&format!(
-                "\n⚠️ The position is fully sold before +{at}%. Every target from \
-                 there up can never fire.\n"
-            ));
-        } else if sold > 0 && sold < 100 {
-            body.push_str(&format!(
-                "\n<i>{}% of the position keeps running past the last target.</i>\n",
-                100 - sold
-            ));
+        if targets.is_empty() {
+            body.push_str("   <i>none</i>\n");
         }
-        if unset > 0 {
-            body.push_str(&format!("\n<i>{unset} order(s) not set up yet.</i>\n"));
-        }
-
         let text = format!(
-            "🎚 <b>Auto-sell</b> · {onoff}\n{body}\n\
-             <i>Amounts are shares of the ORIGINAL position. A stop fires \
-             before any target, so a position that gaps from +300% to −60% \
-             exits rather than taking a target on the way past.</i>"
+            "⚙️ <b>Targets</b>\n\n{body}\n             <i>Amounts are shares of the ORIGINAL position, so they add up. \
+             Anything past 100% can never fire.</i>"
         );
-
-        let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
-            {"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}
-        ])];
-        // Buttons stay in config order so the index in the callback keeps
-        // pointing at the same order the list above describes.
+        let mut rows: Vec<serde_json::Value> = Vec::new();
         for (i, o) in e.orders.iter().enumerate() {
             let label = if !o.is_armed() {
                 "⚪ not set".to_string()
             } else if o.is_stop() {
                 format!("🛑 stop {}% → sell {}%", o.at_pct, o.amount_pct)
             } else {
-                format!("🎯 target +{}% → sell {}%", o.at_pct, o.amount_pct)
+                format!("🎯 +{}% → sell {}%", o.at_pct, o.amount_pct)
             };
             rows.push(serde_json::json!([
                 {"text": label, "callback_data": format!("set:order{i}")},
@@ -1771,18 +1777,13 @@ impl Bot {
         }
         if e.orders.len() < crate::exits::MAX_ORDERS {
             rows.push(serde_json::json!([
-                {"text": "➕ Add order", "callback_data": "setv:addorder:1"}
+                {"text": "➕ Add target", "callback_data": "setv:addorder:1"}
             ]));
         }
-        rows.push(serde_json::json!([
-            {"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
-            {"text": "◀️ Back", "callback_data": "cmd:settings"},
-        ]));
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "set:exits"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
-    /// Editor for one order: the trigger, then the amount.
-    #[cfg(feature = "sniper")]
     fn order_screen(&self, idx: usize) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
@@ -1956,12 +1957,31 @@ impl Bot {
                 "size" => ("💰 Trade size", "How much SOL each buy spends.",
                     format!("{} SOL", live.trade_size_sol),
                     vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", false),
-                "slippage" => ("📉 Slippage", "Tighten-only. Lower means fewer fills but less sandwich exposure.",
+                "slippage" => ("📉 Slippage",
+                    "How far the price may move against you between quote and fill. \
+                     Too tight and fast tokens reject the trade; too loose and you \
+                     pay whatever the market asks. 300 = 3%.",
                     format!("{} bps", live.slippage_bps),
-                    vec![50.0, 100.0, 200.0, 300.0, 500.0, 1000.0], " bps", false),
+                    vec![100.0, 300.0, 500.0, 800.0, 1000.0, 1500.0], " bps", false),
                 "minliq" => ("💧 Pool liquidity floor", "AMM pools below this are refused. Raise-only.",
                     format!("{} SOL", live.min_liquidity_sol),
                     vec![5.0, 10.0, 15.0, 25.0, 50.0, 100.0], " SOL", false),
+                "stoploss" => ("🛑 Stop loss",
+                    "Sells the whole position if it falls this far below cost. 0 removes it.",
+                    { let v = live.exits.stop_pct(); if v < 0 { format!("{v}%") } else { "none".into() } },
+                    vec![0.0, -10.0, -15.0, -20.0, -30.0, -50.0], "%", false),
+                "takeprofit" => ("🎯 Take profit",
+                    "Sells when the position is up this much. 0 removes it.",
+                    { let (v, a) = live.exits.target(); if v > 0 { format!("+{v}% · sell {a}%") } else { "none".into() } },
+                    vec![0.0, 25.0, 50.0, 100.0, 200.0, 400.0], "%", false),
+                "tpamount" => ("🎯 Take-profit amount",
+                    "How much of the position the take-profit sells.",
+                    format!("{}%", live.exits.target().1),
+                    vec![25.0, 50.0, 75.0, 100.0], "%", false),
+                "breakeven" => ("🔒 Break-even",
+                    "Once the position has been up this much, it exits at COST instead of at a loss. 0 = off.",
+                    if live.exits.breakeven_at_pct > 0 { format!("+{}%", live.exits.breakeven_at_pct) } else { "off".into() },
+                    vec![0.0, 20.0, 30.0, 50.0, 100.0], "%", false),
                 "smartsol" => ("💸 Smart-money inflow",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
@@ -2068,6 +2088,10 @@ impl Bot {
             "slippage" => sniper.set_slippage_bps(v as u16),
             "minliq" => sniper.set_min_liquidity(v),
             "curveliq" => sniper.set_curve_min_liquidity(v),
+            "stoploss" => sniper.set_stop_loss(v as i32),
+            "takeprofit" => sniper.set_take_profit(v as i32),
+            "tpamount" => sniper.set_take_profit_amount(v as u8),
+            "breakeven" => sniper.set_breakeven(v.max(0.0) as u16),
             "smartsol" => sniper.set_min_smart_sol_in(v),
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsize" => sniper.set_max_trade_size(v),
@@ -3272,30 +3296,30 @@ mod tests {
         let vk = b.volume_screen().1.to_string();
         assert!(vk.contains("setv:volume_on:toggle"), "no volume switch");
 
-        // Auto-sell screen: stops and targets must be separated, and the
-        // dead-rung case must be stated rather than left as arithmetic. The
-        // live ladder (-15/100, +25/100, then three more) closes the whole
-        // position at +25%, so everything above it can never fire.
-        let (et, _ek) = b.exits_screen();
-        assert!(et.contains("STOPS"), "stops section missing");
-        assert!(et.contains("TARGETS"), "targets section missing");
-        // Default ladder totals exactly 100%, so it must NOT warn.
-        assert!(
-            !et.contains("can never fire"),
-            "the default ladder does not close early:\n{et}"
-        );
+        // Auto-sell is now four decisions, not a variable-length order list.
+        // Each has to be reachable, and the screen has to read as a policy
+        // rather than as arithmetic the operator performs themselves.
+        let (et, ek) = b.exits_screen();
+        let ekb = ek.to_string();
+        for want in ["set:stoploss", "set:takeprofit", "set:breakeven", "set:trailing"] {
+            assert!(ekb.contains(want), "{want} not reachable from auto-sell");
+        }
+        assert!(ekb.contains("set:ladder"), "multi-target ladder must stay reachable");
+        for want in ["Stop loss", "Take profit", "Break-even", "Trailing"] {
+            assert!(et.contains(want), "{want} missing from the auto-sell screen");
+        }
 
-        // Now make the first target close the whole position. Every rung above
-        // it becomes unreachable, and the screen has to say so rather than
-        // leaving it as arithmetic across four lines.
+        // The ladder view keeps the running total, because THAT is where an
+        // order that can never fire becomes possible again.
         let orders = sn2.live().exits.orders;
         let first_target = orders.iter().position(|o| o.is_armed() && !o.is_stop()).unwrap();
         sn2.set_order_amount(first_target, 100).unwrap();
-        let (et2, _) = b.exits_screen();
+        let (lt, _) = b.ladder_screen();
         assert!(
-            et2.contains("can never fire"),
-            "a ladder that fully closes before its last target must say so:\n{et2}"
+            lt.contains("nothing left"),
+            "a target that closes the position must say what remains:\n{lt}"
         );
+
         assert!(vk.contains("set:smartsol"), "no smart-money inflow button");
         assert!(vk.contains("set:tokenvol"), "no token volume button");
         for gone in ["set:accel", "set:smartshare", "set:volwindow"] {
@@ -3304,12 +3328,16 @@ mod tests {
         assert!(ab.contains("setv:autobuy_min:"), "no wallet threshold");
         assert!(!ab.contains("cohort") && !ab.contains("group"), "cohorts must not be editable here");
 
-        // The whole exit policy is reachable by tapping, nothing typed.
+        // The whole exit policy is reachable by tapping, nothing typed. The
+        // simple screen carries the four decisions; add/remove live on the
+        // ladder view behind "More targets".
         let exits = b.exits_screen().1.to_string();
         assert!(exits.contains("setv:exits_on:toggle"), "no on/off");
         assert!(exits.contains("set:trailing"), "no trailing stop");
-        assert!(exits.contains("setv:addorder:"), "cannot add an order");
-        assert!(exits.contains("setv:delorder:"), "cannot remove an order");
+        let ladder = b.ladder_screen().1.to_string();
+        assert!(ladder.contains("setv:addorder:"), "cannot add an order");
+        assert!(ladder.contains("setv:delorder:"), "cannot remove an order");
+        let exits = ladder;
         // Every default order opens an editor with presets and a typed option.
         for i in 0..5 {
             assert!(exits.contains(&format!("set:order{i}")), "order {i} not tappable");

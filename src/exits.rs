@@ -87,6 +87,23 @@ pub struct ExitRules {
     pub trailing_pct: u8,
     /// Sell everything when the pool's liquidity is pulled.
     pub exit_on_liquidity_pull: bool,
+    /// Arm a break-even stop once the position has been up this much. 0 = off.
+    ///
+    /// # What this does that a fixed stop cannot
+    ///
+    /// A stop at a fixed level is set once and never moves. Break-even is a
+    /// stop that ACTIVATES: nothing happens until the position has been up by
+    /// `breakeven_at_pct`, and from then on it exits at cost.
+    ///
+    /// The point is to stop giving back a winner. A position that runs to +40%
+    /// and slides back to −15% hit its stop and lost money on a trade that was
+    /// working; with break-even armed at +30% it exits flat instead.
+    ///
+    /// It keys off the PEAK, not the current price, so arming is permanent for
+    /// the life of the position — a dip below the arming level cannot disarm a
+    /// protection that has already been earned.
+    #[serde(default)]
+    pub breakeven_at_pct: u16,
 }
 
 impl Default for ExitRules {
@@ -104,11 +121,53 @@ impl Default for ExitRules {
             ],
             trailing_pct: 0,
             exit_on_liquidity_pull: true,
+            breakeven_at_pct: 0,
         }
     }
 }
 
 impl ExitRules {
+    /// The single stop, as a negative percentage. 0 = none set.
+    ///
+    /// The simple screen presents ONE stop and ONE target because that is what
+    /// almost every position actually uses, and a variable-length ladder made
+    /// the common case as hard to read as the rare one. The ladder underneath
+    /// is unchanged — these are views onto it.
+    pub fn stop_pct(&self) -> i32 {
+        self.orders.iter().filter(|o| o.is_armed() && o.is_stop()).map(|o| o.at_pct).max().unwrap_or(0)
+    }
+
+    /// The first (lowest) target, as (trigger %, amount %). 0 = none set.
+    pub fn target(&self) -> (i32, u8) {
+        self.orders
+            .iter()
+            .filter(|o| o.is_armed() && !o.is_stop())
+            .min_by_key(|o| o.at_pct)
+            .map(|o| (o.at_pct, o.amount_pct))
+            .unwrap_or((0, 0))
+    }
+
+    /// Replace the stop, keeping every target untouched.
+    pub fn set_stop(&mut self, pct: i32) {
+        self.orders.retain(|o| !o.is_stop());
+        if pct < 0 {
+            self.orders.insert(0, SellOrder { at_pct: pct, amount_pct: 100 });
+        }
+    }
+
+    /// Replace the single target, keeping the stop untouched.
+    pub fn set_target(&mut self, pct: i32, amount: u8) {
+        self.orders.retain(|o| o.is_stop());
+        if pct > 0 && amount > 0 {
+            self.orders.push(SellOrder { at_pct: pct, amount_pct: amount.min(100) });
+        }
+    }
+
+    /// Are there more orders than the simple screen can show?
+    pub fn is_ladder(&self) -> bool {
+        self.orders.iter().filter(|o| o.is_armed() && !o.is_stop()).count() > 1
+    }
+
     /// Total of the TARGET amounts. Stops are excluded: a stop closes the
     /// position, so counting it would always read as over 100.
     pub fn target_total_pct(&self) -> u32 {
@@ -183,6 +242,25 @@ pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> 
                 reason: format!(
                     "trailing stop −{}% (peak {:.2}x, now {multiple:.2}x)",
                     rules.trailing_pct, state.peak_multiple
+                ),
+            };
+        }
+    }
+
+    // BREAK-EVEN, checked with the stops and before every target.
+    //
+    // Placed here deliberately: it is protective, so a target must never
+    // pre-empt it, and it must outrank the configured stop — once armed, exiting
+    // at cost is strictly better than exiting at a loss.
+    if rules.breakeven_at_pct > 0 {
+        let arm_at = 1.0 + rules.breakeven_at_pct as f64 / 100.0;
+        // Armed off the PEAK: protection already earned cannot be lost by a dip.
+        if state.peak_multiple >= arm_at && multiple <= 1.0 {
+            return ExitAction::Sell {
+                amount_pct_of_original: 100,
+                reason: format!(
+                    "break-even stop (peaked {:.2}x, back to cost)",
+                    state.peak_multiple
                 ),
             };
         }
@@ -774,5 +852,75 @@ mod tests {
             "must be the target; got: {}",
             sells[0].reason
         );
+    }
+
+    /// Break-even is the answer to the failure it was added for: a position
+    /// that runs, fades, and hits a fixed stop — losing money on a trade that
+    /// was working.
+    #[test]
+    fn breakeven_exits_at_cost_instead_of_at_a_loss() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![SellOrder { at_pct: -15, amount_pct: 100 }],
+            breakeven_at_pct: 30,
+            ..Default::default()
+        };
+        let mut st = PositionState::default();
+
+        // Runs to +40%: arms break-even, sells nothing.
+        assert!(matches!(evaluate(&rules, &mut st, 1.40), ExitAction::Hold));
+        // Fades back to cost: exits flat, BEFORE the -15% stop is reached.
+        match evaluate(&rules, &mut st, 1.00) {
+            ExitAction::Sell { amount_pct_of_original, reason } => {
+                assert_eq!(amount_pct_of_original, 100);
+                assert!(reason.contains("break-even"), "got: {reason}");
+            }
+            other => panic!("expected a break-even exit, got {other:?}"),
+        }
+    }
+
+    /// Never arms on a position that has not been up. Otherwise it is just a
+    /// second stop at 0%, and it would close a fresh entry on ordinary
+    /// slippage before the position had a chance to move.
+    #[test]
+    fn breakeven_does_not_arm_before_the_position_runs() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![],
+            breakeven_at_pct: 30,
+            ..Default::default()
+        };
+        let mut st = PositionState::default();
+        // Straight down from entry: never reached +30%, so nothing arms.
+        assert!(matches!(evaluate(&rules, &mut st, 0.95), ExitAction::Hold));
+        assert!(matches!(evaluate(&rules, &mut st, 0.80), ExitAction::Hold));
+    }
+
+    /// Once earned, protection cannot be lost by a dip below the arming level.
+    #[test]
+    fn breakeven_stays_armed_after_a_dip() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![],
+            breakeven_at_pct: 30,
+            ..Default::default()
+        };
+        let mut st = PositionState::default();
+        evaluate(&rules, &mut st, 1.50); // arms
+        evaluate(&rules, &mut st, 1.10); // dips below the arming level
+        assert!(
+            matches!(evaluate(&rules, &mut st, 1.0), ExitAction::Sell { .. }),
+            "arming keys off the peak, not the current price"
+        );
+    }
+
+    /// Zero means off — the default, and it must not behave as a 0% stop.
+    #[test]
+    fn breakeven_off_by_default() {
+        let rules = ExitRules { enabled: true, orders: vec![], ..Default::default() };
+        assert_eq!(rules.breakeven_at_pct, 0);
+        let mut st = PositionState::default();
+        evaluate(&rules, &mut st, 2.0);
+        assert!(matches!(evaluate(&rules, &mut st, 1.0), ExitAction::Hold));
     }
 }

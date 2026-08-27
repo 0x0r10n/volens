@@ -428,7 +428,7 @@ pool_cooldown_secs = 3600
 # purpose: unknown liquidity is alertable but NOT tradable. Set to 15 to
 # match the alert floor and keep thin-pool rugs off the trade path.
 min_liquidity_sol = 15.0
-slippage_bps = 300
+slippage_bps = 1500
 # Touch this file to halt all execution immediately — no restart needed.
 kill_switch_file = "HALT"
 # Append-only record of every decision, allowed or denied.
@@ -557,4 +557,4 @@ export_ttl_secs = 60
 
 # Slippage tolerance for exits (bps). Higher than the buy default: selling out
 # of a thin/moving pool needs room to fill. 500 = 5%.
-sell_slippage_bps = 500
+sell_slippage_bps = 1500
