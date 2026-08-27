@@ -49,6 +49,28 @@ impl Alerter {
         let _ = self.send_html_returning_id(text, None).await;
     }
 
+    /// Send with an inline keyboard attached.
+    ///
+    /// Used by messages the reader can act on in place — the leaderboard posts
+    /// collapsed and expands where it sits, rather than pushing a 4000-character
+    /// wall into a group nobody can scroll past.
+    pub async fn send_html_with_keyboard(
+        &self,
+        text: String,
+        keyboard: serde_json::Value,
+    ) -> Option<i64> {
+        if !self.enabled {
+            return None;
+        }
+        match self.post_message_kb(&text, Some(keyboard)).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = %e, "telegram keyboard alert failed");
+                None
+            }
+        }
+    }
+
     /// Send and return Telegram's `message_id`.
     ///
     /// The id is what makes a later update a *reply* to the original call
@@ -138,6 +160,33 @@ impl Alerter {
         let payload: serde_json::Value = resp.json().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!("telegram sendPhoto {status}: {payload}");
+        }
+        Ok(payload
+            .get("result")
+            .and_then(|r| r.get("message_id"))
+            .and_then(|v| v.as_i64()))
+    }
+
+    async fn post_message_kb(
+        &self,
+        text: &str,
+        keyboard: Option<serde_json::Value>,
+    ) -> anyhow::Result<Option<i64>> {
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let mut body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": true,
+        });
+        if let Some(kb) = keyboard {
+            body["reply_markup"] = kb;
+        }
+        let resp = self.client.post(&url).json(&body).send().await?;
+        let status = resp.status();
+        let payload: serde_json::Value = resp.json().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("telegram {status}: {payload}");
         }
         Ok(payload
             .get("result")
@@ -574,10 +623,15 @@ use crate::bot::escape_html;
 /// bot that only speaks up when things go well leaves the operator unable to
 /// tell "no signal" from "signal, and the buy failed".
 #[cfg(feature = "sniper")]
+/// `entry_mcap_usd` is the fully-diluted valuation at the moment of the fill,
+/// or `None` when it could not be computed. Shown because "how big was it when
+/// we got in" is the first thing anyone asks about an entry, and reconstructing
+/// it afterwards means re-deriving a price that has already moved.
 pub fn render_smart_buy(
     mint: &str,
     _wallets: usize,
     outcome: &crate::sniper::BuyOutcome,
+    entry_mcap_usd: Option<f64>,
 ) -> Option<String> {
     use crate::sniper::BuyOutcome;
     let short = crate::conviction::short_mint(mint);
@@ -597,8 +651,12 @@ pub fn render_smart_buy(
             if *would_succeed { "would succeed" } else { "would FAIL" }
         ),
         BuyOutcome::Submitted { sol_in, result, .. } => format!(
-            "🟢 <b>SMART BUY</b> · <code>{}</code>\n{sol_in} SOL\n{}",
+            "🟢 <b>SMART BUY</b> · <code>{}</code>\n{sol_in} SOL{}\n{}",
             escape_html(&short),
+            match entry_mcap_usd {
+                Some(m) if m > 0.0 => format!("  ·  entry {}", short_usd(m)),
+                _ => String::new(),
+            },
             escape_html(&describe_submission(result))
         ),
     })
@@ -672,4 +730,87 @@ pub fn render_unpriceable(mint: &str) -> Option<String> {
          <i>Auto-sell is holding rather than acting on a price it does not have.</i>",
         escape_html(&crate::conviction::short_mint(mint))
     ))
+}
+
+/// The five-hourly leaderboard: best-performing calls, collapsed by default.
+///
+/// # Why a blockquote and not a button
+///
+/// Telegram collapses `<blockquote expandable>` natively — the message arrives
+/// short with a "show more" affordance built in, and opens in place with no
+/// callback, no message edit, and no state to keep. A button would need all
+/// three to achieve the same thing.
+///
+/// # Why the mint sits under the ticker
+///
+/// A ticker is what a reader recognises; the mint is what they need to paste.
+/// Telegram cannot show one and copy the other — `<code>` copies exactly the
+/// text it displays — so both appear, ticker for reading and mint for tapping.
+///
+/// # Why restrained formatting
+///
+/// Bold on every row is emphasis applied to everything, which is emphasis
+/// applied to nothing. One bold heading, aligned multiples, and a single mark
+/// for the rows that matter most: the ones the bot actually traded.
+pub fn render_leaderboard(
+    calls: &[crate::signals::SignalRecord],
+    traded: &std::collections::HashSet<String>,
+    window_secs: u64,
+) -> String {
+    const TOP: usize = 50;
+
+    if calls.is_empty() {
+        return format!(
+            "🏆 <b>Top calls</b>\n\nNothing tracked in the last {}.",
+            crate::bot::format_window(window_secs)
+        );
+    }
+
+    let ranked: Vec<_> = calls.iter().take(TOP).collect();
+    let runners = calls.iter().filter(|c| c.last_multiple >= 2.0).count();
+    let took = ranked.iter().filter(|c| traded.contains(&c.mint)).count();
+
+    let mut s = format!(
+        "🏆 <b>Top calls</b> · last {}\n{} tracked · {runners} above 2× · {took} taken\n\n",
+        crate::bot::format_window(window_secs),
+        calls.len()
+    );
+    s.push_str("<blockquote expandable>");
+    for (i, c) in ranked.iter().enumerate() {
+        // Ticker, else name, else the mint's leading characters — never blank,
+        // because a row you cannot identify is a row you cannot act on.
+        let label = if !c.symbol.is_empty() {
+            c.symbol.clone()
+        } else if !c.name.is_empty() {
+            c.name.clone()
+        } else {
+            c.mint.chars().take(10).collect::<String>()
+        };
+        let label: String = label.chars().take(14).collect();
+        s.push_str(&format!(
+            "{:>2}. ${}  {}{}\n<code>{}</code>\n",
+            i + 1,
+            escape_html(&label),
+            crate::bot::format_multiple(c.last_multiple),
+            if traded.contains(&c.mint) { "  ●" } else { "" },
+            escape_html(&c.mint),
+        ));
+    }
+    s.push_str("</blockquote>");
+    if took > 0 {
+        s.push_str("\n<i>● taken by the bot · tap a mint to copy</i>");
+    } else {
+        s.push_str("\n<i>tap a mint to copy</i>");
+    }
+    s
+}
+
+/// Compact USD for inline use: $41.2K, $1.8M.
+fn short_usd(v: f64) -> String {
+    match v {
+        v if v >= 1e9 => format!("${:.1}B", v / 1e9),
+        v if v >= 1e6 => format!("${:.1}M", v / 1e6),
+        v if v >= 1e3 => format!("${:.1}K", v / 1e3),
+        v => format!("${v:.0}"),
+    }
 }

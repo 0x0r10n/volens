@@ -374,6 +374,48 @@ impl Detector {
             });
         }
 
+        // LEADERBOARD. Every `leaderboard_every_secs`, post the best-performing
+        // calls to the group. 0 disables.
+        //
+        // Deliberately NOT anchored to the wall clock: a fixed 00:00/05:00
+        // schedule would drift relative to when the process actually started,
+        // and a restart would either skip a post or double one. An interval
+        // from boot is predictable and has no edge cases.
+        if self.cfg.tracked.leaderboard_every_secs > 0 {
+            let signals = self.signals.clone();
+            let alerter = self.alerter.clone();
+            let every = Duration::from_secs(self.cfg.tracked.leaderboard_every_secs.max(300));
+            let window = self.cfg.tracked.track_for_secs;
+            let audit_path = self.leaderboard_audit_path();
+            let mut shutdown = shutdown.clone();
+            info!(every_secs = every.as_secs(), "leaderboard scheduled");
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(every) => {}
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return; }
+                            continue;
+                        }
+                    }
+                    let now = chrono::Utc::now();
+                    let calls = signals.ranked(now, window as i64);
+                    if calls.is_empty() {
+                        continue;
+                    }
+                    // Which of these the bot actually took a position in. Read
+                    // from the audit log so it survives a restart — the
+                    // in-memory set does not, and a leaderboard that forgets
+                    // its own trades after a restart is worse than one that
+                    // never marked them.
+                    let traded = read_traded_mints(&audit_path).await;
+                    let msg = crate::alerts::render_leaderboard(&calls, &traded, window);
+                    alerter.send_html(msg).await;
+                    info!(entries = calls.len(), taken = traded.len(), "leaderboard posted");
+                }
+            });
+        }
+
         let min = Duration::from_secs(self.cfg.grpc.backoff_min_secs.max(1));
         let max = Duration::from_secs(self.cfg.grpc.backoff_max_secs.max(1));
         let mut backoff = min;
@@ -1002,9 +1044,38 @@ impl Detector {
             let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
             seen.remove(mint);
         }
-        if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome) {
+        // Entry valuation, computed from the fill we just got rather than a
+        // fresh quote: `tokens_out` and `sol_in` are the price we actually
+        // paid, and by the time an alert renders the market has already moved.
+        // Best-effort — a missing supply or SOL price omits the figure rather
+        // than delaying or blocking the alert.
+        let entry_mcap = match &outcome {
+            crate::sniper::BuyOutcome::Submitted { sol_in, tokens_out, .. } if *tokens_out > 0.0 => {
+                let decimals = self.rpc.mint_info(mint).await.map(|i| i.decimals);
+                match (decimals, self.prices.sol_usd(Duration::from_secs(600))) {
+                    (Some(d), Some(sol_usd)) => {
+                        let ui = tokens_out / 10f64.powi(d as i32);
+                        match (ui > 0.0).then(|| ()).and(self.rpc.token_supply(mint).await) {
+                            Some(supply) => Some((sol_in / ui) * supply * sol_usd),
+                            None => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome, entry_mcap) {
             self.alerter.send_html(msg).await;
         }
+    }
+
+    /// Where the trade record lives, for marking leaderboard rows.
+    fn leaderboard_audit_path(&self) -> String {
+        #[cfg(feature = "sniper")]
+        { self.cfg.sniper.audit_log.clone() }
+        #[cfg(not(feature = "sniper"))]
+        { String::new() }
     }
 
     /// Enrich a conviction signal and announce it.
@@ -1916,4 +1987,34 @@ mod price_from_stream_probe {
         }
         assert!(!obs.is_empty(), "no WSOL/USDC swaps seen — SOL/USD not derivable this way");
     }
+}
+
+/// Mints the bot actually opened a position in, from the audit log.
+///
+/// Only CONFIRMED buys count. A refused or failed attempt is not a position,
+/// and marking one on the leaderboard would claim credit for a trade that
+/// never happened.
+async fn read_traded_mints(path: &str) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    if path.is_empty() {
+        return out;
+    }
+    let Ok(body) = tokio::fs::read_to_string(path).await else { return out };
+    for line in body.lines() {
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if rec.get("action").and_then(|a| a.as_str()) != Some("smart_buy") {
+            continue;
+        }
+        let confirmed = rec
+            .get("outcome")
+            .and_then(|o| o.as_str())
+            .is_some_and(|o| o.starts_with("confirmed"));
+        if !confirmed {
+            continue;
+        }
+        if let Some(m) = rec.get("mint").and_then(|m| m.as_str()) {
+            out.insert(m.to_string());
+        }
+    }
+    out
 }

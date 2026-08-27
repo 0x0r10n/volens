@@ -101,6 +101,11 @@ pub struct TrackedConfig {
     /// Stop tracking a signal after this long.
     #[serde(default = "default_track_for")]
     pub track_for_secs: u64,
+    /// Seconds between leaderboard posts to the group. 0 disables.
+    /// Five hours by default — often enough to be useful, rare enough that a
+    /// fifty-row message is not competing with the live alerts around it.
+    #[serde(default = "default_leaderboard_every")]
+    pub leaderboard_every_secs: u64,
     /// Most signals re-priced in one sweep.
     ///
     /// A safety bound, not a performance one: prices come from an in-process
@@ -193,6 +198,10 @@ fn default_update_check() -> u64 {
 fn default_track_for() -> u64 {
     86_400
 }
+
+fn default_leaderboard_every() -> u64 {
+    5 * 60 * 60
+}
 fn default_update_multiples() -> Vec<f64> {
     vec![
         1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 7.5, 10.0, 15.0, 20.0, 25.0, 50.0, 100.0,
@@ -230,6 +239,7 @@ impl Default for TrackedConfig {
             signals_path: default_signals_path(),
             update_check_secs: default_update_check(),
             track_for_secs: default_track_for(),
+            leaderboard_every_secs: default_leaderboard_every(),
             max_repriced_per_sweep: default_max_per_sweep(),
             update_multiples: default_update_multiples(),
             jupiter_base_url: default_jupiter_url(),

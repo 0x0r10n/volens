@@ -5,9 +5,14 @@ dependencies: one file, one stylesheet inlined, fonts from Google Fonts.
 
 ## Deploying on Vercel
 
-Import the repository, then set **Root Directory** to `site`. Framework preset
-is **Other**; leave build and output commands empty — Vercel serves the
-directory as static files.
+Import the repository. Nothing to configure — the `vercel.json` at the repo
+root pins the framework to none and the output directory to `site/`.
+
+That file exists because of a real trap: Vercel autodetects **Zola** from a
+`config.toml` in the repo root, and volens has one — the bot's own config. Left
+to autodetection the build fails with *"A base URL is required in config.toml
+with key `base_url`"*, which is Zola complaining about a file that has nothing
+to do with the website. Pinning `framework: null` stops the guessing.
 
 Every push to `main` redeploys. The manual is therefore updated the same way
 everything else in this repo is: edit, commit, push.

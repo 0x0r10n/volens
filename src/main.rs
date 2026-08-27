@@ -131,6 +131,9 @@ async fn main() -> Result<()> {
             detector.metrics(),
             cfg.sniper.kill_switch_file.clone(),
         )?
+        // The alert group gets read-only commands, so people can ask the bot
+        // what it is doing without also being able to change what it spends.
+        .with_group_chat(cfg.alerts.telegram_chat_id.parse::<i64>().ok())
         .with_rpc(detector.rpc())
         .with_signals(
             detector.signals(),

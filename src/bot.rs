@@ -57,6 +57,12 @@ pub struct Bot {
     bot_token: String,
     /// Chat IDs permitted to issue commands. Never empty — see `new`.
     allowed: HashSet<i64>,
+    /// The alert group, if it is not already a fully authorised chat.
+    ///
+    /// Read-only commands work here so the group can ask what the bot is doing
+    /// without every member also being able to change what it spends. See
+    /// `Command::allowed_in_group`.
+    group_chat: Option<i64>,
     metrics: Arc<Metrics>,
     kill_switch_file: PathBuf,
     started: Instant,
@@ -136,6 +142,7 @@ impl Bot {
             client,
             bot_token,
             allowed,
+            group_chat: None,
             metrics,
             kill_switch_file: kill_switch_file.into(),
             started: Instant::now(),
@@ -202,6 +209,14 @@ impl Bot {
     #[cfg(feature = "sniper")]
     pub fn with_sniper(mut self, sniper: Arc<crate::sniper::Sniper>) -> Self {
         self.sniper = Some(sniper);
+        self
+    }
+
+    /// Let the alert group run read-only commands.
+    ///
+    /// Separate from the allowlist on purpose: this grants strictly less.
+    pub fn with_group_chat(mut self, chat_id: Option<i64>) -> Self {
+        self.group_chat = chat_id.filter(|id| !self.allowed.contains(id));
         self
     }
 
@@ -333,7 +348,13 @@ impl Bot {
         let chat_id = msg.chat.id;
 
         // Authorization first, before parsing or acting on anything.
-        if !self.allowed.contains(&chat_id) {
+        //
+        // Two tiers: the allowlist gets everything, and the alert group gets
+        // the read-only subset plus /halt. A chat in neither gets silence — a
+        // reply would confirm to a prober that the bot exists.
+        let full = self.allowed.contains(&chat_id);
+        let group = Some(chat_id) == self.group_chat;
+        if !full && !group {
             // Log the id so a legitimate user who got the config wrong can find
             // theirs; stay silent to the sender.
             warn!(
@@ -341,6 +362,15 @@ impl Bot {
                 command = truncate(text, 32),
                 "ignoring telegram command from unauthorized chat"
             );
+            return;
+        }
+        if group && let Some(cmd) = Command::parse(text) && !cmd.allowed_in_group() {
+            warn!(
+                chat_id,
+                command = truncate(text, 32),
+                "refusing a control command in the alert group — private chat only"
+            );
+            self.reply(chat_id, "That one is private-chat only.".to_string()).await;
             return;
         }
 
@@ -2323,21 +2353,21 @@ impl Bot {
     /// silently yield something unusable.
     fn render_calls(&self) -> String {
         let Some(signals) = self.signals.as_ref() else {
-            return "<b>Calls</b>\n\nSmart-money tracking is not enabled.".to_string();
+            return "<b>Alerts</b>\n\nSmart-money tracking is not enabled.".to_string();
         };
 
         let now = chrono::Utc::now();
         let calls = signals.ranked(now, self.track_for_secs as i64);
         if calls.is_empty() {
             return format!(
-                "<b>Calls</b>\n\nNo calls in the last {}.",
+                "<b>Alerts</b>\n\nNothing tracked in the last {}.",
                 format_window(self.track_for_secs)
             );
         }
 
         let runners = calls.iter().filter(|c| c.last_multiple >= 2.0).count();
         let mut s = format!(
-            "🔥 <b>Calls</b> — {} tracked, {runners} at 2x+\n\n",
+            "🔥 <b>Alerts</b> — {} tracked, {runners} at 2x+\n\n",
             calls.len()
         );
 
@@ -2741,7 +2771,7 @@ impl Bot {
                 {"command": "deposit", "description": "show the wallet address to send funds to"},
                 {"command": "withdraw", "description": "send SOL out: /withdraw 0.5 <address> (armed only)"},
                 {"command": "positions", "description": "token positions + PnL"},
-                {"command": "calls", "description": "smart-money calls and how they performed"},
+                {"command": "alerts", "description": "smart-money alerts, best performer first"},
                 {"command": "wallets", "description": "list wallets, mark active"},
                 {"command": "new_wallet", "description": "create a wallet to fund (optional name)"},
                 {"command": "use", "description": "pick active wallet: /use name"},
@@ -2800,7 +2830,7 @@ impl DeleteHandle {
 }
 
 /// `2m`, `3h`, `1d4h` — coarse age for a call list.
-fn format_window(secs: u64) -> String {
+pub fn format_window(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
@@ -2813,7 +2843,7 @@ fn format_window(secs: u64) -> String {
 }
 
 /// `x2.4`, `x13` — matches the alert vocabulary.
-fn format_multiple(m: f64) -> String {
+pub fn format_multiple(m: f64) -> String {
     if m >= 10.0 { format!("x{m:.0}") } else { format!("x{m:.1}") }
 }
 
@@ -3003,6 +3033,29 @@ enum Command {
 }
 
 impl Command {
+    /// May this run in the ALERT GROUP, where everyone present can type?
+    ///
+    /// The group is not the operator's private chat. Authorising it outright
+    /// would hand every member `/settings`, `/size` and `/withdraw` — the
+    /// controls that decide how much the bot spends and where funds go.
+    ///
+    /// So the group gets what it is for: reading. Plus `/halt`, deliberately —
+    /// stopping the bot is a SAFE failure, and someone who can see a problem in
+    /// the group should be able to stop it without finding the operator. That
+    /// asymmetry is the point: anyone may pull the brake, nobody may steer.
+    fn allowed_in_group(&self) -> bool {
+        matches!(
+            self,
+            Command::Status
+                | Command::Metrics
+                | Command::Balance
+                | Command::Positions
+                | Command::Calls
+                | Command::Halt
+                | Command::Help
+        )
+    }
+
     /// Parse a command and its (single) optional argument from message text.
     ///
     /// Handles the `/cmd@BotName` form Telegram uses in groups. Only the first
@@ -3023,7 +3076,7 @@ impl Command {
             "balance" => Command::Balance,
             "deposit" | "receive" | "fund" => Command::Deposit,
             "positions" | "pnl" | "pos" => Command::Positions,
-            "calls" | "signals" | "sm" => Command::Calls,
+            "alerts" | "calls" | "signals" | "sm" => Command::Calls,
             "settings" | "config" | "params" => Command::Settings,
             "new-wallet" | "newwallet" | "new_wallet" | "genwallet" => Command::NewWallet(arg),
             "wallets" | "list" => Command::Wallets,
@@ -3055,7 +3108,7 @@ impl Command {
             Command::Balance => "balance",
             Command::Deposit => "deposit",
             Command::Positions => "positions",
-            Command::Calls => "calls",
+            Command::Calls => "alerts",
             Command::Settings => "settings",
             Command::NewWallet(_) => "new-wallet",
             Command::Wallets => "wallets",
