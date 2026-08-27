@@ -1569,7 +1569,6 @@ impl Bot {
             "stoploss" => ("stop loss", "e.g. <code>-15</code> (percent), 0 = none"),
             "takeprofit" => ("take profit", "e.g. <code>100</code> (percent), 0 = none"),
             "tpamount" => ("take-profit amount", "e.g. <code>50</code> (percent of the position)"),
-            "breakeven" => ("break-even arming level", "e.g. <code>30</code> (percent), 0 = off"),
             "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
@@ -1705,11 +1704,7 @@ impl Bot {
 
         let stop_s = if stop < 0 { format!("{stop}%") } else { "none".into() };
         let tp_s = if tp > 0 { format!("+{tp}% · sell {tp_amt}%") } else { "none".into() };
-        let be_s = if e.breakeven_at_pct > 0 {
-            format!("at +{}%", e.breakeven_at_pct)
-        } else {
-            "off".into()
-        };
+        let be_s = if e.breakeven { "on".to_string() } else { "off".into() };
         let tr_s = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
 
         let mut text = format!(
@@ -1726,7 +1721,7 @@ impl Bot {
             [{"text": format!("🛑 Stop loss · {stop_s}"), "callback_data": "set:stoploss"},
              {"text": format!("🎯 Take profit · {}", if tp > 0 { format!("+{tp}%") } else { "none".into() }),
               "callback_data": "set:takeprofit"}],
-            [{"text": format!("🔒 Break-even · {be_s}"), "callback_data": "set:breakeven"},
+            [{"text": format!("🔒 Break-even · {be_s}"), "callback_data": "setv:breakeven_on:toggle"},
              {"text": format!("📉 Trailing · {tr_s}"), "callback_data": "set:trailing"}],
             [{"text": "⚙️ More targets", "callback_data": "set:ladder"},
              {"text": "◀️ Back", "callback_data": "cmd:settings"}],
@@ -1892,6 +1887,7 @@ impl Bot {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
             "autobuy_on" => (sniper.toggle_auto_buy(), "autobuy".into()),
             "volume_on" => (sniper.toggle_volume_mode(), "volume".into()),
+            "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
             "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "exits".into()),
@@ -1982,10 +1978,6 @@ impl Bot {
                     "How much of the position the take-profit sells.",
                     format!("{}%", live.exits.target().1),
                     vec![25.0, 50.0, 75.0, 100.0], "%", false),
-                "breakeven" => ("🔒 Break-even",
-                    "Once the position has been up this much, it exits at COST instead of at a loss. 0 = off.",
-                    if live.exits.breakeven_at_pct > 0 { format!("+{}%", live.exits.breakeven_at_pct) } else { "off".into() },
-                    vec![0.0, 20.0, 30.0, 50.0, 100.0], "%", false),
                 "smartsol" => ("💸 Smart-money inflow",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
@@ -2095,7 +2087,6 @@ impl Bot {
             "stoploss" => sniper.set_stop_loss(v as i32),
             "takeprofit" => sniper.set_take_profit(v as i32),
             "tpamount" => sniper.set_take_profit_amount(v as u8),
-            "breakeven" => sniper.set_breakeven(v.max(0.0) as u16),
             "smartsol" => sniper.set_min_smart_sol_in(v),
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsize" => sniper.set_max_trade_size(v),
@@ -3305,9 +3296,14 @@ mod tests {
         // rather than as arithmetic the operator performs themselves.
         let (et, ek) = b.exits_screen();
         let ekb = ek.to_string();
-        for want in ["set:stoploss", "set:takeprofit", "set:breakeven", "set:trailing"] {
+        for want in ["set:stoploss", "set:takeprofit", "set:trailing"] {
             assert!(ekb.contains(want), "{want} not reachable from auto-sell");
         }
+        // Break-even is a TOGGLE, not a level — there is nothing to configure.
+        assert!(
+            ekb.contains("setv:breakeven_on:toggle"),
+            "break-even must be a switch, not an editor"
+        );
         assert!(ekb.contains("set:ladder"), "multi-target ladder must stay reachable");
         for want in ["Stop loss", "Take profit", "Break-even", "Trailing"] {
             assert!(et.contains(want), "{want} missing from the auto-sell screen");

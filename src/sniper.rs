@@ -1491,17 +1491,17 @@ impl Sniper {
         })
     }
 
-    /// Arm a break-even stop once the position has been up this much. 0 = off.
-    pub fn set_breakeven(&self, pct: u16) -> Result<String, String> {
-        if pct > 10_000 {
-            return Err("that is not a plausible arming level".into());
-        }
+    /// Turn break-even on or off.
+    ///
+    /// A toggle, not a level: the rule is "it went up, it came back to cost,
+    /// get out flat", which has nothing to configure.
+    pub fn toggle_breakeven(&self) -> Result<String, String> {
         self.settings.update(|s| {
-            s.exits.breakeven_at_pct = pct;
-            Ok(if pct == 0 {
-                "break-even off".to_string()
+            s.exits.breakeven = !s.exits.breakeven;
+            Ok(if s.exits.breakeven {
+                "break-even ON — a position that returns to cost is closed flat".to_string()
             } else {
-                format!("break-even arms at +{pct}%, then exits at cost")
+                "break-even off".to_string()
             })
         })
     }
