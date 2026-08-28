@@ -1597,17 +1597,17 @@ impl Bot {
             fmt_usd_cap(live.max_market_cap_usd)
         );
         let rows = serde_json::json!({ "inline_keyboard": [
-            [{"text": format!("💰 Default size · {} SOL", live.trade_size_sol),
-              "callback_data": "set:size"}],
-            [{"text": format!("🏦 Max market cap · {}", fmt_usd_cap(live.max_market_cap_usd)),
-              "callback_data": "set:maxmcap"}],
-            [{"text": format!("📊 Market-cap bands · {}", if live.buy_tiers.is_empty() {
+            [{"text": format!("💰 Size · {} SOL", live.trade_size_sol),
+              "callback_data": "set:size"},
+             {"text": format!("📉 Slippage · {} bps", live.slippage_bps),
+              "callback_data": "set:slippage"}],
+            [{"text": format!("🏦 Max MC · {}", fmt_usd_cap(live.max_market_cap_usd)),
+              "callback_data": "set:maxmcap"},
+             {"text": format!("📊 MC bands · {}", if live.buy_tiers.is_empty() {
                 "off".to_string() } else { live.buy_tiers.len().to_string() }),
               "callback_data": "set:tiers"}],
-            [{"text": format!("📉 Slippage · {} bps", live.slippage_bps),
-              "callback_data": "set:slippage"}],
-            [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -1635,12 +1635,12 @@ impl Bot {
             live.min_liquidity_sol,
         );
         let rows = serde_json::json!({ "inline_keyboard": [
-            [{"text": format!("📊 Volume mode · {}", if live.volume_mode { "on" } else { "off" }),
-              "callback_data": "set:volume"}],
-            [{"text": format!("💧 Pool liquidity · {} SOL", live.min_liquidity_sol),
-              "callback_data": "set:minliq"},
-             {"text": format!("🌱 Curve floor · {curve}"), "callback_data": "set:curveliq"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
+              "callback_data": "set:volume"},
+             {"text": format!("💧 Pool liq · {} SOL", live.min_liquidity_sol),
+              "callback_data": "set:minliq"}],
+            [{"text": format!("🌱 Curve floor · {curve}"), "callback_data": "set:curveliq"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -1664,8 +1664,8 @@ impl Bot {
              day, however many signals arrive.</i>"
         );
         let rows = serde_json::json!({ "inline_keyboard": [
-            [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -1819,8 +1819,8 @@ impl Bot {
         ])];
         rows.push(serde_json::json!([
             {"text": format!("💸 Smart volume · {sol_s}"), "callback_data": "set:smartsol"},
+            {"text": "◀️ Back", "callback_data": "cmd:settings"},
         ]));
-        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
@@ -1930,7 +1930,7 @@ impl Bot {
                 })
             })
             .collect();
-        for chunk in btns.chunks(4) {
+        for chunk in btns.chunks(2) {
             rows.push(serde_json::Value::Array(chunk.to_vec()));
         }
         rows.push(serde_json::json!([
@@ -1962,8 +1962,8 @@ impl Bot {
             [{"text": if on { "🟢 On — tap to disable" } else { "⚪ Off — tap to enable" },
               "callback_data": "setv:supplycap_on:toggle"}],
             [{"text": format!("📐 Ceiling · {}", fmt_supply_pct(pct)),
-              "callback_data": "set:maxsupply"}],
-            [{"text": "◀️ Back", "callback_data": "set:buying"}],
+              "callback_data": "set:maxsupply"},
+             {"text": "◀️ Back", "callback_data": "set:buying"}],
         ]});
         (text, rows)
     }
@@ -1997,8 +1997,8 @@ impl Bot {
         rows.push(serde_json::json!([
             {"text": format!("📈 Token volume · {}", fmt(live.min_token_volume_sol)),
              "callback_data": "set:tokenvol"},
+            {"text": "◀️ Back", "callback_data": "cmd:settings"},
         ]));
-        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
