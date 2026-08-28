@@ -349,7 +349,7 @@ impl SnipeMode {
 /// Working values now live in [`crate::settings::SettingsStore`], which
 /// persists them. They used to sit in a plain in-memory struct here, so every
 /// value set from Telegram was silently reverted to `config.toml` on restart.
-pub use crate::settings::{Envelope, LiveSettings};
+pub use crate::settings::{Envelope, Lane, LiveSettings};
 
 /// Render a SOL ceiling for display: 0 means the cap is disabled (unlimited).
 fn fmt_cap_sol(v: f64) -> String {
@@ -1891,36 +1891,6 @@ impl Sniper {
         })
     }
 
-    /// Take profit for Alpha entries, in percent. 0 clears it.
-    pub fn set_alpha_tp(&self, pct: i32) -> Result<String, String> {
-        if pct < 0 {
-            return Err("take profit must be positive".into());
-        }
-        self.settings.update(|s| {
-            s.alpha_tp_pct = pct;
-            Ok(if pct > 0 {
-                format!("alpha take profit at +{pct}%")
-            } else {
-                "alpha take profit cleared".to_string()
-            })
-        })
-    }
-
-    /// Stop loss for Alpha entries, as a positive percent below entry.
-    pub fn set_alpha_sl(&self, pct: i32) -> Result<String, String> {
-        if !(0..100).contains(&pct) {
-            return Err("stop loss must be between 0 and 99".into());
-        }
-        self.settings.update(|s| {
-            s.alpha_sl_pct = pct;
-            Ok(if pct > 0 {
-                format!("alpha stop loss at -{pct}%")
-            } else {
-                "alpha stop loss cleared".to_string()
-            })
-        })
-    }
-
     /// The wallets currently trusted with Alpha money.
     ///
     /// Recomputed on demand from the signal history rather than cached: the
@@ -1971,13 +1941,14 @@ impl Sniper {
     ///
     /// A toggle, not a level: the rule is "it went up, it came back to cost,
     /// get out flat", which has nothing to configure.
-    pub fn toggle_breakeven(&self) -> Result<String, String> {
+    pub fn toggle_breakeven(&self, lane: Lane) -> Result<String, String> {
         self.settings.update(|s| {
-            s.exits.breakeven = !s.exits.breakeven;
-            Ok(if s.exits.breakeven {
-                "break-even ON — a position that returns to cost is closed flat".to_string()
+            let r = s.rules_mut(lane);
+            r.breakeven = !r.breakeven;
+            Ok(if r.breakeven {
+                format!("{} break-even ON", lane.label())
             } else {
-                "break-even off".to_string()
+                format!("{} break-even off", lane.label())
             })
         })
     }
@@ -2062,35 +2033,39 @@ impl Sniper {
     }
 
     /// Add an empty order for the operator to configure.
-    pub fn add_order(&self) -> Result<String, String> {
+    pub fn add_order(&self, lane: Lane) -> Result<String, String> {
         self.settings.update(|s| {
-            if s.exits.orders.len() >= crate::exits::MAX_ORDERS {
+            let r = s.rules_mut(lane);
+            if r.orders.len() >= crate::exits::MAX_ORDERS {
                 return Err(format!("at most {} orders", crate::exits::MAX_ORDERS));
             }
             // Added disarmed: an order that started live would begin selling on
             // a trigger nobody chose.
-            s.exits.orders.push(crate::exits::SellOrder { at_pct: 0, amount_pct: 0 });
-            Ok(format!("order {} added — set its trigger", s.exits.orders.len()))
+            r.orders.push(crate::exits::SellOrder { at_pct: 0, amount_pct: 0 });
+            Ok(format!("order {} added — set its trigger", r.orders.len()))
         })
     }
 
-    pub fn remove_order(&self, idx: usize) -> Result<String, String> {
+    pub fn remove_order(&self, lane: Lane, idx: usize) -> Result<String, String> {
         self.settings.update(|s| {
-            if idx >= s.exits.orders.len() {
+            let r = s.rules_mut(lane);
+            if idx >= r.orders.len() {
                 return Err("no such order".into());
             }
-            let gone = s.exits.orders.remove(idx);
+            let gone = r.orders.remove(idx);
             Ok(format!("removed {}", gone.label()))
         })
     }
 
     /// Set an order's trigger, as a percent move from cost. Negative is a stop.
-    pub fn set_order_trigger(&self, idx: usize, at_pct: i32) -> Result<String, String> {
+    pub fn set_order_trigger(&self, lane: Lane, idx: usize, at_pct: i32) -> Result<String, String> {
         if !(-99..=100_000).contains(&at_pct) {
             return Err("trigger must be between -99% and +100000%".into());
         }
         self.settings.update(|s| {
-            let Some(o) = s.exits.orders.get_mut(idx) else { return Err("no such order".into()) };
+            let Some(o) = s.rules_mut(lane).orders.get_mut(idx) else {
+                return Err("no such order".into());
+            };
             o.at_pct = at_pct;
             Ok(if at_pct == 0 {
                 format!("order {} off", idx + 1)
@@ -2103,14 +2078,21 @@ impl Sniper {
     }
 
     /// Set how much of the ORIGINAL position an order sells.
-    pub fn set_order_amount(&self, idx: usize, amount_pct: u8) -> Result<String, String> {
+    pub fn set_order_amount(
+        &self,
+        lane: Lane,
+        idx: usize,
+        amount_pct: u8,
+    ) -> Result<String, String> {
         if amount_pct > 100 {
             return Err("amount cannot exceed 100%".into());
         }
         self.settings.update(|s| {
-            let Some(o) = s.exits.orders.get_mut(idx) else { return Err("no such order".into()) };
+            let Some(o) = s.rules_mut(lane).orders.get_mut(idx) else {
+                return Err("no such order".into());
+            };
             o.amount_pct = amount_pct;
-            let total = s.exits.target_total_pct();
+            let total = s.rules(lane).target_total_pct();
             Ok(if amount_pct == 0 {
                 format!("order {} off", idx + 1)
             } else if total > 100 {
@@ -2123,13 +2105,17 @@ impl Sniper {
         })
     }
 
-    pub fn set_trailing(&self, pct: u8) -> Result<String, String> {
+    pub fn set_trailing(&self, lane: Lane, pct: u8) -> Result<String, String> {
         if pct >= 100 {
             return Err("a 100% trailing stop would never trigger".into());
         }
         self.settings.update(|s| {
-            s.exits.trailing_pct = pct;
-            Ok(if pct == 0 { "trailing stop off".into() } else { format!("trailing stop at -{pct}% from peak") })
+            s.rules_mut(lane).trailing_pct = pct;
+            Ok(if pct == 0 {
+                format!("{} trailing stop off", lane.label())
+            } else {
+                format!("{} trailing stop at -{pct}% from peak", lane.label())
+            })
         })
     }
 

@@ -752,19 +752,35 @@ impl Bot {
         if data == "set:alpha" {
             return Some(self.alpha_screen());
         }
+        // Order screens for BOTH ladders. The `a` prefix selects Alpha; the
+        // bare form is the normal one.
         #[cfg(feature = "sniper")]
         if data == "set:ladder" {
-            return Some(self.ladder_screen());
+            return Some(self.ladder_screen(crate::sniper::Lane::Normal));
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:aladder" {
+            return Some(self.ladder_screen(crate::sniper::Lane::Alpha));
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(n) = data.strip_prefix("set:aorder") {
+            if let Ok(i) = n.parse::<usize>() {
+                return Some(self.order_screen(crate::sniper::Lane::Alpha, i));
+            }
         }
         #[cfg(feature = "sniper")]
         if let Some(n) = data.strip_prefix("set:order") {
             if let Ok(i) = n.parse::<usize>() {
-                return Some(self.order_screen(i));
+                return Some(self.order_screen(crate::sniper::Lane::Normal, i));
             }
         }
         #[cfg(feature = "sniper")]
         if data == "set:trailing" {
             return Some(self.stop_screen("trailing"));
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:atrailing" {
+            return Some(self.stop_screen("atrailing"));
         }
         #[cfg(feature = "sniper")]
         if let Some(field) = data.strip_prefix("set:") {
@@ -1633,9 +1649,7 @@ impl Bot {
              Slippage · <b>{} bps</b>\n\
              Max market cap · <b>{}</b>\n\
              Supply cap · <b>{cap}</b>\n\n\
-             <i>Max market cap refuses a token outright. Bands only choose the \
-             SIZE for tokens that pass it — a token inside a band buys that \
-             band's amount, everything else uses the default.</i>",
+",
             live.trade_size_sol,
             live.slippage_bps,
             fmt_usd_cap(live.max_market_cap_usd)
@@ -1673,8 +1687,7 @@ impl Bot {
              Volume mode · <b>{}</b>\n\
              Pool liquidity · <b>{} SOL</b>\n\
              Curve floor · <b>{curve}</b>\n\n\
-             <i>Smart money always decides WHEN. These only ever refuse a \
-             signal — none of them can create one.</i>",
+",
             if live.volume_mode { "on" } else { "off" },
             live.min_liquidity_sol,
         );
@@ -1704,8 +1717,7 @@ impl Bot {
         let text = format!(
             "🛡 <b>Limits</b>\n\n\
              Trades per day · <b>{trades}</b>\n\n\
-             <i>The main brake on a runaway: how many entries may happen in a \
-             day, however many signals arrive.</i>"
+"
         );
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"},
@@ -1789,8 +1801,6 @@ impl Bot {
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
             "alphabuy" => ("alpha buy amount", "e.g. <code>0.05</code> (SOL)"),
-            "alphatp" => ("alpha take profit", "e.g. <code>150</code> (percent), 0 = none"),
-            "alphasl" => ("alpha stop loss", "e.g. <code>25</code> (percent below entry), 0 = none"),
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -1800,11 +1810,13 @@ impl Bot {
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
             "maxmcap" => ("max market cap", "e.g. <code>75000</code> (USD)"),
             "maximpact" => ("max price impact", "e.g. <code>400</code> (bps)"),
-            f if f.starts_with("ordt") => (
+            f if f.starts_with("ordt") || f.starts_with("aordt") => (
                 "trigger",
                 "e.g. <code>150</code> for a +150% target, or <code>-30</code> for a stop",
             ),
-            f if f.starts_with("orda") => ("amount", "e.g. <code>35</code> (% of the original position)"),
+            f if f.starts_with("orda") || f.starts_with("aorda") => {
+                ("amount", "e.g. <code>35</code> (% of the original position)")
+            }
             "wd_amount" => ("amount to withdraw", "e.g. <code>0.25</code> (SOL)"),
             f if f.starts_with("wd_dest") => (
                 "destination address",
@@ -1852,10 +1864,7 @@ impl Bot {
             "🤖 <b>Auto-buy</b>\n\n\
              Status · <b>{}</b>\n\
              Smart volume · <b>{sol_s}</b>\n\n\
-             <i>Buys once the tracked cohort has put this much SOL into a token \
-             inside the {win}-minute window. Size is the signal — five wallets \
-             at 0.05 SOL each is not the same conviction as two at 5 SOL, and a \
-             headcount cannot tell them apart.</i>",
+<i>Over the last {win} min.</i>",
             if active { "🟢 on" } else { "⚪ off" },
             win = self.track_for_secs.max(60) / 60,
         );
@@ -1890,9 +1899,7 @@ impl Bot {
             body.push_str("<i>none — every token uses the default</i>\n");
         }
         let text = format!(
-            "📊 <b>Buy by market cap</b>\n\nDefault buy: <b>{} SOL</b>\n\n{body}\n<i>A token that falls in a band buys that amount; anything else \
-             uses the default. Bands cannot overlap, so every token matches at \
-             most one.</i>",
+            "📊 <b>Buy by market cap</b>\n\nDefault buy: <b>{} SOL</b>\n\n{body}",
             live.trade_size_sol
         );
         let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -1933,8 +1940,7 @@ impl Bot {
             (2e6, 5e6),
             (5e6, 0.0),
         ];
-        let text = "📊 <b>Add a band</b>\n\nPick the market-cap range.\n\n                    <i>Bands cannot overlap, so a range that clashes with one \
-                    you already have will be refused.</i>"
+        let text = "📊 <b>Add a band</b>\n\nPick the market-cap range."
             .to_string();
         let mut rows: Vec<serde_json::Value> = Vec::new();
         let btns: Vec<serde_json::Value> = RANGES
@@ -1997,11 +2003,7 @@ impl Bot {
         let pct = live.max_supply_pct;
 
         let text = format!(
-            "🪙 <b>Supply cap</b>\n\nStatus: <b>{}</b>\nCeiling: <b>{}</b>\n\n<i>Buys always execute at their configured size. Afterwards the \
-             position is measured against the token's total supply, and only \
-             the EXCESS is sold — a position at or under the ceiling is left \
-             alone. Checked right after each buy, and again on every \
-             reconciliation sweep as a fallback.</i>",
+            "🪙 <b>Supply cap</b>\n\nStatus: <b>{}</b>\nCeiling: <b>{}</b>",
             if on { "🟢 on" } else { "⚪ off" },
             if pct > 0.0 { format!("{pct}% of supply") } else { "not set".into() },
         );
@@ -2029,9 +2031,7 @@ impl Bot {
             "📊 <b>Volume mode</b>\n\n\
              Status · <b>{}</b>\n\
              Token volume · <b>{}</b>\n\n\
-             <i>Corroboration only: it can block a signal the trigger admitted, \
-             never create one. Measured over the same {win}-minute window as \
-             the signal itself.</i>",
+<i>Over the last {win} min.</i>",
             if on { "🟢 on" } else { "⚪ off" },
             fmt(live.min_token_volume_sol),
             win = self.track_for_secs.max(60) / 60,
@@ -2065,47 +2065,57 @@ impl Bot {
     /// "More targets"; nothing is lost, it is just no longer the default view.
     #[cfg(feature = "sniper")]
     fn exits_screen(&self) -> (String, serde_json::Value) {
+        use crate::sniper::Lane;
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
         let e = sniper.live().exits;
         let onoff = if e.enabled { "🟢 On" } else { "⚪ Off" };
-        let stop = e.stop_pct();
-        let (tp, tp_amt) = e.target();
 
-        let stop_s = if stop < 0 { format!("{stop}%") } else { "none".into() };
-        let tp_s = if tp > 0 { format!("+{tp}% · sell {tp_amt}%") } else { "none".into() };
-        let be_s = if e.breakeven { "on".to_string() } else { "off".into() };
-        let tr_s = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
+        // The whole strategy as a table, the way it actually fires: stops
+        // first, then targets low to high. One screen that shows what will
+        // happen beats four screens that each show a fragment of it.
+        let mut shown: Vec<crate::exits::SellOrder> =
+            e.orders.iter().copied().filter(|o| o.is_armed()).collect();
+        shown.sort_by_key(|o| (!o.is_stop(), o.at_pct));
+        let mut body = String::new();
+        for o in &shown {
+            body.push_str(&format!(
+                "{}{}%  →  sell {}%\n",
+                if o.at_pct > 0 { "+" } else { "" },
+                o.at_pct,
+                o.amount_pct
+            ));
+        }
+        if body.is_empty() {
+            body.push_str("none\n");
+        }
 
+        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
+        let be = if e.breakeven { "on" } else { "off" };
+        let total = e.target_total_pct();
         let mut text = format!(
-            "🎚 <b>Auto-sell</b> · {onoff}\n\n🛑 Stop loss   <b>{stop_s}</b>\n🎯 Take profit <b>{tp_s}</b>\n🔒 Break-even  <b>{be_s}</b>\n📉 Trailing    <b>{tr_s}</b>\n\n<i>Break-even arms once the position has been up that much, then \
-             exits at cost rather than at a loss. Protective rules are always \
-             checked before targets.</i>"
+            "🎚 <b>Auto-sell</b> · {onoff}\n\n<code>{body}</code>\n\
+             Trailing <b>{tr}</b>   Break-even <b>{be}</b>\n\
+             Targets total <b>{total}%</b>"
         );
-        if e.is_ladder() {
-            text.push_str("\n\n<i>Extra targets are set — see More targets.</i>");
+        if total > 100 {
+            text.push_str("  ⚠️ over 100%");
         }
 
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("Auto-sell · {onoff}"), "callback_data": "setv:exits_on:toggle"}],
-            [{"text": format!("🛑 Stop loss · {stop_s}"), "callback_data": "set:stoploss"},
-             {"text": format!("🎯 Take profit · {}", if tp > 0 { format!("+{tp}%") } else { "none".into() }),
-              "callback_data": "set:takeprofit"}],
-            [{"text": format!("🔒 Break-even · {be_s}"), "callback_data": "setv:breakeven_on:toggle"},
-             {"text": format!("📉 Trailing · {tr_s}"), "callback_data": "set:trailing"}],
-            [{"text": "⚙️ More targets", "callback_data": "set:ladder"},
-             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": "📋 Orders", "callback_data": "set:ladder"}],
+            [{"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
+             {"text": format!("🔒 Break-even · {be}"),
+              "callback_data": "setv:breakeven_on:toggle"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
+        let _ = Lane::Normal;
         (text, rows)
     }
 
-    /// ALPHA SMART MONEY MODE — four controls and nothing else.
-    ///
-    /// The wallet scores and the bar they must clear are deliberately absent:
-    /// they are host-side, and a screen that showed them would invite tuning
-    /// the qualification between trades, which is how a performance measure
-    /// stops measuring anything.
+    /// ALPHA SMART MONEY MODE.
     #[cfg(feature = "sniper")]
     fn alpha_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
@@ -2114,117 +2124,127 @@ impl Bot {
         let live = sniper.live();
         let onoff = if live.alpha_enabled { "🟢 On" } else { "⚪ Off" };
         let amt_s = format!("{} SOL", live.alpha_buy_sol);
-        let tp_s =
-            if live.alpha_tp_pct > 0 { format!("+{}%", live.alpha_tp_pct) } else { "none".into() };
-        let sl_s =
-            if live.alpha_sl_pct > 0 { format!("-{}%", live.alpha_sl_pct) } else { "none".into() };
 
         let mut text = format!(
-            "⭐ <b>Alpha smart money</b> · {onoff}\n\n\
-             💰 Buy amount  <b>{amt_s}</b>\n\
-             🎯 Take profit <b>{tp_s}</b>\n\
-             🛑 Stop loss   <b>{sl_s}</b>\n\n\
-             <i>Buys when a wallet with a proven track record buys — on its own \
-             size and its own exits, whatever the volume trigger does. Both can \
-             fire on the same token.</i>"
+            "⭐ <b>Alpha</b> · {onoff}\n\n\
+             Buy amount  <b>{amt_s}</b>\n\
+             Orders      <b>{}</b>",
+            crate::exits::describe(&live.alpha_exits)
         );
-        // Said plainly rather than left to be discovered: enabled with no
-        // amount looks armed and does nothing.
         if live.alpha_enabled && live.alpha_buy_sol <= 0.0 {
-            text.push_str("\n\n⚠️ <b>Set a buy amount</b> — Alpha cannot trade without one.");
+            text.push_str("\n\n⚠️ Set a buy amount.");
         }
-        if live.alpha_enabled && live.alpha_tp_pct == 0 && live.alpha_sl_pct == 0 {
-            text.push_str(
-                "\n\n⚠️ <b>No Alpha exits set</b> — Alpha positions fall back to the \
-                 normal auto-sell rules until you set a target or a stop here.",
-            );
+        if live.alpha_enabled && !live.alpha_exits.orders.iter().any(|o| o.is_armed()) {
+            text.push_str("\n\n⚠️ No orders — Alpha uses the auto-sell ladder until you add one.");
         }
 
         let rows = serde_json::json!({ "inline_keyboard": [
-            [{"text": format!("Alpha mode · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
-            [{"text": format!("💰 Buy amount · {amt_s}"), "callback_data": "set:alphabuy"},
-             {"text": format!("🎯 Take profit · {tp_s}"), "callback_data": "set:alphatp"}],
-            [{"text": format!("🛑 Stop loss · {sl_s}"), "callback_data": "set:alphasl"},
-             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("Alpha · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
+            [{"text": format!("💰 Buy · {amt_s}"), "callback_data": "set:alphabuy"},
+             {"text": "📋 Orders", "callback_data": "set:aladder"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
 
-    /// The full order list, for multi-rung ladders.
+    /// The order table for a lane — the whole exit strategy in one screen.
+    ///
+    /// Both lanes render through this. The normal ladder and Alpha's are
+    /// separate strategies but identical controls, and two copies of a screen
+    /// this fiddly would drift.
     #[cfg(feature = "sniper")]
-    fn ladder_screen(&self) -> (String, serde_json::Value) {
+    fn ladder_screen(&self, lane: crate::sniper::Lane) -> (String, serde_json::Value) {
+        use crate::sniper::Lane;
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let e = sniper.live().exits;
-        let mut sold: u32 = 0;
+        let live = sniper.live();
+        let e = live.rules(lane).clone();
+        let tag = lane.tag();
+
+        // Sorted the way they fire: stops first, then targets low to high.
+        let mut shown: Vec<(usize, crate::exits::SellOrder)> =
+            e.orders.iter().copied().enumerate().collect();
+        shown.sort_by_key(|(_, o)| (!o.is_stop(), o.at_pct));
+
+        let total = e.target_total_pct();
         let mut body = String::new();
-        let mut targets: Vec<_> =
-            e.orders.iter().copied().filter(|o| o.is_armed() && !o.is_stop()).collect();
-        targets.sort_by_key(|o| o.at_pct);
-        for o in &targets {
-            sold += o.amount_pct as u32;
-            let left = 100i64 - sold as i64;
+        for (_, o) in shown.iter().filter(|(_, o)| o.is_armed()) {
             body.push_str(&format!(
-                "   +{}% → sell {}%   <i>({} left)</i>\n",
+                "{}{}%  →  sell {}%\n",
+                if o.at_pct > 0 { "+" } else { "" },
                 o.at_pct,
-                o.amount_pct,
-                if left <= 0 { "nothing".to_string() } else { format!("{left}%") }
+                o.amount_pct
             ));
         }
-        if targets.is_empty() {
-            body.push_str("   <i>none</i>\n");
+        if body.is_empty() {
+            body.push_str("none\n");
         }
-        let text = format!(
-            "⚙️ <b>Targets</b>\n\n{body}\n<i>Amounts are shares of the ORIGINAL position, so they add up. \
-             Anything past 100% can never fire.</i>"
-        );
+
+        let mut text = format!("📋 <b>{} orders</b>\n\n<code>{body}</code>", lane.label());
+        text.push_str(&format!("\nTargets total <b>{total}%</b>"));
+        if total > 100 {
+            text.push_str("  ⚠️ over 100%");
+        }
+
         let mut rows: Vec<serde_json::Value> = Vec::new();
-        for (i, o) in e.orders.iter().enumerate() {
+        for (i, o) in shown {
             let label = if !o.is_armed() {
                 "⚪ not set".to_string()
             } else if o.is_stop() {
-                format!("🛑 stop {}% → sell {}%", o.at_pct, o.amount_pct)
+                format!("🛑 {}% → {}%", o.at_pct, o.amount_pct)
             } else {
-                format!("🎯 +{}% → sell {}%", o.at_pct, o.amount_pct)
+                format!("🎯 +{}% → {}%", o.at_pct, o.amount_pct)
             };
             rows.push(serde_json::json!([
-                {"text": label, "callback_data": format!("set:order{i}")},
-                {"text": "✕", "callback_data": format!("setv:delorder:{i}")},
+                {"text": label, "callback_data": format!("set:{tag}order{i}")},
+                {"text": "✕", "callback_data": format!("setv:{tag}delorder:{i}")},
             ]));
         }
         if e.orders.len() < crate::exits::MAX_ORDERS {
             rows.push(serde_json::json!([
-                {"text": "➕ Add target", "callback_data": "setv:addorder:1"}
+                {"text": "➕ Add order", "callback_data": format!("setv:{tag}addorder:1")}
             ]));
         }
-        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "set:exits"}]));
+        // Trailing and break-even belong to the strategy, so each lane carries
+        // its own rather than Alpha silently inheriting the normal one.
+        let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
+        let be = if e.breakeven { "on" } else { "off" };
+        rows.push(serde_json::json!([
+            {"text": format!("📉 Trailing · {tr}"), "callback_data": format!("set:{tag}trailing")},
+            {"text": format!("🔒 Break-even · {be}"),
+             "callback_data": format!("setv:{tag}breakeven_on:toggle")},
+        ]));
+        let back = match lane {
+            Lane::Normal => "set:exits".to_string(),
+            Lane::Alpha => "set:alpha".to_string(),
+        };
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": back}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
-    /// Editor for one order: the trigger, then the amount.
     #[cfg(feature = "sniper")]
-    fn order_screen(&self, idx: usize) -> (String, serde_json::Value) {
+    fn order_screen(&self, lane: crate::sniper::Lane, idx: usize) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let orders = sniper.live().exits.orders;
+        let live = sniper.live();
+        let orders = live.rules(lane).orders.clone();
+        let tag = lane.tag();
         let Some(o) = orders.get(idx).copied() else {
-            return self.exits_screen();
+            return self.ladder_screen(lane);
         };
         // Named by what it IS, not by its index. "Order 3" told you nothing
         // about whether you were editing protection or profit-taking.
-        let (kind, blurb) = if !o.is_armed() {
-            ("⚪ <b>Not set</b>", "Pick a trigger below. Negative = stop, positive = target.")
+        let kind = if !o.is_armed() {
+            "⚪ <b>Not set</b>"
         } else if o.is_stop() {
-            ("🛑 <b>Stop</b>", "Fires when the position falls this far below cost. \
-              Stops are checked before any target.")
+            "🛑 <b>Stop</b>"
         } else {
-            ("🎯 <b>Target</b>", "Fires when the position is up this much. \
-              Targets fire lowest-first, once each.")
+            "🎯 <b>Target</b>"
         };
         let text = format!(
-            "{kind}\n\nTrigger: <b>{}</b>\nSells: <b>{}</b> of the original position\n\n<i>{blurb}</i>",
+            "{kind}\n\nTrigger <b>{}</b>\nSells   <b>{}</b>",
             if o.at_pct == 0 {
                 "not set".to_string()
             } else {
@@ -2244,7 +2264,7 @@ impl Bot {
                 .map(|t| serde_json::json!({
                     "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
                                     if *t > 0 { "+" } else { "" }, t),
-                    "callback_data": format!("setv:ordt{idx}:{t}"),
+                    "callback_data": format!("setv:{tag}ordt{idx}:{t}"),
                 }))
                 .collect()
         };
@@ -2252,50 +2272,53 @@ impl Bot {
             .iter()
             .map(|a| serde_json::json!({
                 "text": format!("{}{}%", if *a == o.amount_pct { "✓ " } else { "" }, a),
-                "callback_data": format!("setv:orda{idx}:{a}"),
+                "callback_data": format!("setv:{tag}orda{idx}:{a}"),
             }))
             .collect();
+        let noop = format!("set:{tag}order{idx}");
         let kb = serde_json::json!({"inline_keyboard": [
-            [{"text": "🛑 — stop below cost —", "callback_data": format!("set:order{idx}")}],
+            [{"text": "🛑 — stop below cost —", "callback_data": noop}],
             row(&[-50, -35, -25, -15]),
-            [{"text": "🎯 — target above cost —", "callback_data": format!("set:order{idx}")}],
+            [{"text": "🎯 — target above cost —", "callback_data": noop}],
             row(&[50, 100, 250]),
             row(&[400, 900, 2000]),
-            [{"text": "— how much to sell —", "callback_data": format!("set:order{idx}")}],
+            [{"text": "— how much to sell —", "callback_data": noop}],
             amts[..3].to_vec(),
             amts[3..].to_vec(),
-            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:ordt{idx}")},
-             {"text": "✏️ Custom amount", "callback_data": format!("ask:orda{idx}")}],
-            [{"text": "✕ Remove", "callback_data": format!("setv:delorder:{idx}")},
-             {"text": "◀️ Back", "callback_data": "set:exits"}],
+            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:{tag}ordt{idx}")},
+             {"text": "✏️ Custom amount", "callback_data": format!("ask:{tag}orda{idx}")}],
+            [{"text": "✕ Remove", "callback_data": format!("setv:{tag}delorder:{idx}")},
+             {"text": "◀️ Back", "callback_data": format!("set:{tag}ladder")}],
         ]});
         (text, kb)
     }
 
     /// Editor for the trailing stop.
     #[cfg(feature = "sniper")]
-    fn stop_screen(&self, _which: &str) -> (String, serde_json::Value) {
+    fn stop_screen(&self, which: &str) -> (String, serde_json::Value) {
+        use crate::sniper::Lane;
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let cur = sniper.live().exits.trailing_pct;
+        let lane = if which.starts_with('a') { Lane::Alpha } else { Lane::Normal };
+        let tag = lane.tag();
+        let cur = sniper.live().rules(lane).trailing_pct;
         let text = format!(
-            "📉 <b>Trailing stop</b>\n\nCurrent: <b>{}</b>\n\n<i>Sells everything once the position falls this far from its PEAK. \
-             Only acts after the position has been in profit, so it cannot close \
-             a fresh entry on ordinary slippage.</i>",
+            "📉 <b>{} trailing stop</b>\n\nCurrent <b>{}</b>",
+            lane.label(),
             if cur > 0 { format!("−{cur}%") } else { "off".into() }
         );
         let opts: Vec<serde_json::Value> = [20u8, 30, 40, 50, 60, 75]
             .iter()
             .map(|p| serde_json::json!({
                 "text": format!("{}−{}%", if *p == cur { "✓ " } else { "" }, p),
-                "callback_data": format!("setv:trail:{p}"),
+                "callback_data": format!("setv:{tag}trail:{p}"),
             }))
             .collect();
         let kb = serde_json::json!({"inline_keyboard": [
             opts[..3].to_vec(), opts[3..].to_vec(),
-            [{"text": "🚫 Off", "callback_data": "setv:trail:0"}],
-            [{"text": "◀️ Back", "callback_data": "set:exits"}],
+            [{"text": "🚫 Off", "callback_data": format!("setv:{tag}trail:0")}],
+            [{"text": "◀️ Back", "callback_data": format!("set:{tag}ladder")}],
         ]});
         (text, kb)
     }
@@ -2303,6 +2326,7 @@ impl Bot {
     /// Apply an auto-sell change. Returns None if `field` is not one of ours.
     #[cfg(feature = "sniper")]
     fn apply_exit_setting(&self, field: &str, value: &str) -> Option<(String, serde_json::Value)> {
+        use crate::sniper::Lane as L;
         let sniper = self.sniper.as_ref()?;
         let (res, screen): (Result<String, String>, String) = match field {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
@@ -2311,26 +2335,46 @@ impl Bot {
             "supplycap_on" => (sniper.toggle_supply_cap(), "supplycap".into()),
             "cleartiers" => (sniper.clear_buy_tiers(), "tiers".into()),
             "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
-            "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
+            "breakeven_on" => (sniper.toggle_breakeven(L::Normal), "ladder".into()),
+            "abreakeven_on" => (sniper.toggle_breakeven(L::Alpha), "aladder".into()),
             "alpha_on" => (sniper.toggle_alpha(), "alpha".into()),
-            "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
-            "addorder" => (sniper.add_order(), "exits".into()),
-            "delorder" => (sniper.remove_order(value.parse().ok()?), "exits".into()),
+            "trail" => (sniper.set_trailing(L::Normal, value.parse().ok()?), "trailing".into()),
+            "atrail" => (sniper.set_trailing(L::Alpha, value.parse().ok()?), "atrailing".into()),
+            "addorder" => (sniper.add_order(L::Normal), "ladder".into()),
+            "aaddorder" => (sniper.add_order(L::Alpha), "aladder".into()),
+            "delorder" => (sniper.remove_order(L::Normal, value.parse().ok()?), "ladder".into()),
+            "adelorder" => (sniper.remove_order(L::Alpha, value.parse().ok()?), "aladder".into()),
+            f if f.starts_with("aordt") => {
+                let i: usize = f[5..].parse().ok()?;
+                (sniper.set_order_trigger(L::Alpha, i, value.parse().ok()?), format!("aorder{i}"))
+            }
+            f if f.starts_with("aorda") => {
+                let i: usize = f[5..].parse().ok()?;
+                (sniper.set_order_amount(L::Alpha, i, value.parse().ok()?), format!("aorder{i}"))
+            }
             f if f.starts_with("ordt") => {
                 let i: usize = f[4..].parse().ok()?;
-                (sniper.set_order_trigger(i, value.parse().ok()?), format!("order{i}"))
+                (sniper.set_order_trigger(L::Normal, i, value.parse().ok()?), format!("order{i}"))
             }
             f if f.starts_with("orda") => {
                 let i: usize = f[4..].parse().ok()?;
-                (sniper.set_order_amount(i, value.parse().ok()?), format!("order{i}"))
+                (sniper.set_order_amount(L::Normal, i, value.parse().ok()?), format!("order{i}"))
             }
             _ => return None,
         };
         info!(field, value, ok = res.is_ok(), "auto-sell setting changed from telegram");
-        let (text, kb) = if let Some(n) = screen.strip_prefix("order") {
-            self.order_screen(n.parse().unwrap_or(0))
+        let (text, kb) = if let Some(n) = screen.strip_prefix("aorder") {
+            self.order_screen(L::Alpha, n.parse().unwrap_or(0))
+        } else if let Some(n) = screen.strip_prefix("order") {
+            self.order_screen(L::Normal, n.parse().unwrap_or(0))
+        } else if screen == "ladder" {
+            self.ladder_screen(L::Normal)
+        } else if screen == "aladder" {
+            self.ladder_screen(L::Alpha)
         } else if screen == "trailing" {
             self.stop_screen("trailing")
+        } else if screen == "atrailing" {
+            self.stop_screen("atrailing")
         } else if screen == "autobuy" {
             self.autobuy_screen()
         } else if screen == "volume" {
@@ -2384,50 +2428,36 @@ impl Bot {
         // (title, note, current, presets, unit, clearable)
         let (title, note, current, presets, unit, clearable): (&str, &str, String, Vec<f64>, &str, bool) =
             match field {
-                "size" => ("💰 Trade size", "How much SOL each buy spends.",
+                "size" => ("💰 Trade size", "SOL per buy.",
                     format!("{} SOL", live.trade_size_sol),
                     vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", false),
                 "slippage" => ("📉 Slippage",
-                    "How far the price may move against you between quote and fill. \
-                     Too tight and fast tokens reject the trade; too loose and you \
-                     pay whatever the market asks. 300 = 3%.",
+                    "Max price move between quote and fill. 300 = 3%.",
                     format!("{} bps", live.slippage_bps),
                     vec![100.0, 300.0, 500.0, 800.0, 1000.0, 1500.0], " bps", false),
-                "minliq" => ("💧 Pool liquidity floor", "AMM pools below this are refused. Raise-only.",
+                "minliq" => ("💧 Pool liquidity floor", "AMM pools below this are refused.",
                     format!("{} SOL", live.min_liquidity_sol),
                     vec![5.0, 10.0, 15.0, 25.0, 50.0, 100.0], " SOL", false),
                 "stoploss" => ("🛑 Stop loss",
-                    "Sells the whole position if it falls this far below cost. 0 removes it.",
+                    "0 removes it.",
                     { let v = live.exits.stop_pct(); if v < 0 { format!("{v}%") } else { "none".into() } },
                     vec![0.0, -10.0, -15.0, -20.0, -30.0, -50.0], "%", false),
                 "takeprofit" => ("🎯 Take profit",
-                    "Sells when the position is up this much. 0 removes it.",
+                    "0 removes it.",
                     { let (v, a) = live.exits.target(); if v > 0 { format!("+{v}% · sell {a}%") } else { "none".into() } },
                     vec![0.0, 25.0, 50.0, 100.0, 200.0, 400.0], "%", false),
                 "tpamount" => ("🎯 Take-profit amount",
-                    "How much of the position the take-profit sells.",
+                    "Share of the position sold.",
                     format!("{}%", live.exits.target().1),
                     vec![25.0, 50.0, 75.0, 100.0], "%", false),
                 "maxsupply" => ("📐 Supply ceiling",
-                    "Most of a token's supply one position may hold. Enforced AFTER \
-                     the buy: only the excess is sold, and the buy itself is never \
-                     resized. Matters as the trade size grows — on an early token a \
-                     large buy can take a share nobody will take back off you.",
+                    "Max share of a token's supply. Excess is sold after the buy.",
                     fmt_supply_pct(live.max_supply_pct),
                     vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], "%", false),
                 "alphabuy" => ("⭐ Alpha buy amount",
-                    "SOL per Alpha entry. Independent of the normal trade size, \
-                     and never resized by the market-cap bands.",
+                    "SOL per Alpha entry.",
                     format!("{} SOL", live.alpha_buy_sol),
                     vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5], " SOL", false),
-                "alphatp" => ("⭐ Alpha take profit",
-                    "Sells an Alpha position when it is up this much. 0 removes it.",
-                    if live.alpha_tp_pct > 0 { format!("+{}%", live.alpha_tp_pct) } else { "none".into() },
-                    vec![0.0, 50.0, 100.0, 150.0, 250.0, 500.0], "%", false),
-                "alphasl" => ("⭐ Alpha stop loss",
-                    "Sells an Alpha position if it falls this far below cost. 0 removes it.",
-                    if live.alpha_sl_pct > 0 { format!("-{}%", live.alpha_sl_pct) } else { "none".into() },
-                    vec![0.0, 10.0, 15.0, 20.0, 30.0, 50.0], "%", false),
                 "smartsol" => ("💸 Smart-money volume",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
@@ -2439,24 +2469,24 @@ impl Bot {
                     else { format!("{} SOL", live.min_token_volume_sol) },
                     vec![0.0, 5.0, 15.0, 30.0, 60.0, 120.0], " SOL", false),
                 "curveliq" => ("🌱 Curve liquidity floor",
-                    "pump.fun bonding curves only. 0 = no floor, so early entries are not refused for being small.",
+                    "pump.fun curves only. 0 = no floor.",
                     if live.curve_min_liquidity_sol == 0.0 { "off".to_string() }
                     else { format!("{} SOL", live.curve_min_liquidity_sol) },
                     vec![0.0, 1.0, 2.0, 5.0, 10.0, 20.0], " SOL", false),
-                "maxsize" => ("🧢 Max trade size", "Per-trade ceiling. Lowering it also lowers the trade size.",
+                "maxsize" => ("🧢 Max trade size", "Per-trade ceiling.",
                     fmt_eff(live.max_trade_size_sol, env.max_trade_size_sol, " SOL"),
                     vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0], " SOL", true),
-                "dailycap" => ("📆 Daily spend cap", "Most SOL this bot may spend in a day.",
+                "dailycap" => ("📆 Daily spend cap", "Daily spend ceiling.",
                     fmt_eff(live.daily_cap_sol, env.daily_cap_sol, " SOL"),
                     vec![0.1, 0.2, 0.5, 1.0, 2.0, 5.0], " SOL", true),
                 "maxtrades" => ("🔢 Trades per day",
-                    "How many buys may happen in a day. 0 = unlimited.",
+                    "Buys per day. 0 = unlimited.",
                     fmt_eff_u(live.max_trades_per_day, env.max_trades_per_day),
                     vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0], "", true),
-                "maxmcap" => ("🏦 Max market cap", "Refuse entries valued at or above this.",
+                "maxmcap" => ("🏦 Max market cap", "Refuse entries at or above this.",
                     fmt_eff(live.max_market_cap_usd, env.max_market_cap_usd, ""),
                     vec![10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0], " USD", true),
-                "maximpact" => ("💥 Max price impact", "Refuse a trade that would move the pool more than this.",
+                "maximpact" => ("💥 Max price impact", "Max pool move.",
                     fmt_eff_u(live.max_price_impact_bps, env.max_price_impact_bps),
                     vec![100.0, 200.0, 500.0, 1000.0, 2000.0], " bps", true),
                 _ => return ("Unknown setting.".to_string(), back_to_settings()),
@@ -2545,8 +2575,6 @@ impl Bot {
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsupply" => sniper.set_max_supply_pct(v),
             "alphabuy" => sniper.set_alpha_buy_sol(v),
-            "alphatp" => sniper.set_alpha_tp(v as i32),
-            "alphasl" => sniper.set_alpha_sl(v as i32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
@@ -3817,12 +3845,13 @@ mod tests {
         let vk = b.volume_screen().1.to_string();
         assert!(vk.contains("setv:volume_on:toggle"), "no volume switch");
 
-        // Auto-sell is now four decisions, not a variable-length order list.
-        // Each has to be reachable, and the screen has to read as a policy
-        // rather than as arithmetic the operator performs themselves.
+        // Auto-sell is ONE order table plus the two rules that are not orders.
+        // Stops and targets used to have their own buttons as well as appearing
+        // in the order list, so the same level could be edited from two places
+        // that disagreed about what it was.
         let (et, ek) = b.exits_screen();
         let ekb = ek.to_string();
-        for want in ["set:stoploss", "set:takeprofit", "set:trailing"] {
+        for want in ["set:ladder", "set:trailing"] {
             assert!(ekb.contains(want), "{want} not reachable from auto-sell");
         }
         // Break-even is a TOGGLE, not a level — there is nothing to configure.
@@ -3831,7 +3860,7 @@ mod tests {
             "break-even must be a switch, not an editor"
         );
         assert!(ekb.contains("set:ladder"), "multi-target ladder must stay reachable");
-        for want in ["Stop loss", "Take profit", "Break-even", "Trailing"] {
+        for want in ["Auto-sell", "Break-even", "Trailing"] {
             assert!(et.contains(want), "{want} missing from the auto-sell screen");
         }
 
@@ -3839,11 +3868,11 @@ mod tests {
         // order that can never fire becomes possible again.
         let orders = sn2.live().exits.orders;
         let first_target = orders.iter().position(|o| o.is_armed() && !o.is_stop()).unwrap();
-        sn2.set_order_amount(first_target, 100).unwrap();
-        let (lt, _) = b.ladder_screen();
+        sn2.set_order_amount(crate::sniper::Lane::Normal, first_target, 100).unwrap();
+        let (lt, _) = b.ladder_screen(crate::sniper::Lane::Normal);
         assert!(
-            lt.contains("nothing left"),
-            "a target that closes the position must say what remains:\n{lt}"
+            lt.contains("Targets total"),
+            "the ladder must show the running total:\n{lt}"
         );
 
         assert!(vk.contains("set:tokenvol"), "no token volume button");
@@ -3885,14 +3914,14 @@ mod tests {
         let exits = b.exits_screen().1.to_string();
         assert!(exits.contains("setv:exits_on:toggle"), "no on/off");
         assert!(exits.contains("set:trailing"), "no trailing stop");
-        let ladder = b.ladder_screen().1.to_string();
+        let ladder = b.ladder_screen(crate::sniper::Lane::Normal).1.to_string();
         assert!(ladder.contains("setv:addorder:"), "cannot add an order");
         assert!(ladder.contains("setv:delorder:"), "cannot remove an order");
         let exits = ladder;
         // Every default order opens an editor with presets and a typed option.
         for i in 0..5 {
             assert!(exits.contains(&format!("set:order{i}")), "order {i} not tappable");
-            let ord = b.order_screen(i).1.to_string();
+            let ord = b.order_screen(crate::sniper::Lane::Normal, i).1.to_string();
             assert!(ord.contains(&format!("setv:ordt{i}:")), "order {i} has no trigger presets");
             assert!(ord.contains(&format!("setv:orda{i}:")), "order {i} has no amount presets");
             assert!(ord.contains(&format!("ask:ordt{i}")), "order {i} has no custom trigger");

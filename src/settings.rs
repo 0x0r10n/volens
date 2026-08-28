@@ -35,6 +35,35 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
 
+/// Which exit ladder a control acts on.
+///
+/// The normal trigger and Alpha keep entirely separate exits — they enter on
+/// different evidence and are managed on different terms — but the CONTROLS are
+/// identical, so they are written once and pointed at one lane or the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    Normal,
+    Alpha,
+}
+
+impl Lane {
+    /// Prefix used in callback data and screen routing, so a tap can say which
+    /// ladder it meant.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Lane::Normal => "",
+            Lane::Alpha => "a",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Lane::Normal => "Auto-sell",
+            Lane::Alpha => "Alpha",
+        }
+    }
+}
+
 /// Working values the operator can change at runtime.
 ///
 /// Cheaply cloneable on purpose: a decision snapshots it once and works from
@@ -115,13 +144,18 @@ pub struct LiveSettings {
     /// buy — an independent trigger is not an independent spending limit.
     #[serde(default)]
     pub alpha_buy_sol: f64,
-    /// Take profit for Alpha entries, in percent. 0 = no target.
+    /// Exit orders for ALPHA positions — a full ladder of its own.
+    ///
+    /// Not a single take-profit and stop. Alpha is the higher-conviction
+    /// trigger, and the whole point of a ladder is to hold a runner while still
+    /// taking the initial stake off the table; collapsing that to one target
+    /// forces a choice between the two on exactly the trades least worth
+    /// guessing on.
+    ///
+    /// Completely separate from `exits`. The two triggers enter on different
+    /// evidence and are meant to be managed on different terms.
     #[serde(default)]
-    pub alpha_tp_pct: i32,
-    /// Stop loss for Alpha entries, as a POSITIVE percent below entry.
-    /// 0 = no stop.
-    #[serde(default)]
-    pub alpha_sl_pct: i32,
+    pub alpha_exits: crate::exits::ExitRules,
 
     /// Enforce the supply-share ceiling. Separate from the percentage so the
     /// rule can be switched off without losing the number you tuned.
@@ -304,8 +338,7 @@ impl LiveSettings {
             buy_tiers: Vec::new(),
             alpha_enabled: false,
             alpha_buy_sol: 0.0,
-            alpha_tp_pct: 0,
-            alpha_sl_pct: 0,
+            alpha_exits: crate::exits::ExitRules::default(),
             supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
@@ -327,30 +360,38 @@ impl LiveSettings {
     /// trailing stop would keep closing Alpha trades before their own target
     /// could ever be reached. Alpha's exits are its TP and its SL.
     pub fn alpha_exit_rules(&self, base: &crate::exits::ExitRules) -> crate::exits::ExitRules {
-        // Alpha with NEITHER level set is not a request to hold unprotected —
-        // it is a mode that has not been configured yet. Falling back to the
-        // normal ladder keeps those positions governed by something; the
-        // alternative is an open position with no stop and no target, which is
-        // the one outcome no setting should be able to produce silently.
-        if self.alpha_tp_pct <= 0 && self.alpha_sl_pct <= 0 {
+        // An Alpha ladder with nothing armed is a mode that has not been
+        // configured yet, not a request to hold unprotected. Falling back keeps
+        // those positions governed by something; the alternative is an open
+        // position with no stop and no target, which is the one outcome no
+        // setting should be able to produce silently.
+        if !self.alpha_exits.orders.iter().any(|o| o.is_armed()) {
             return base.clone();
         }
-        let mut orders = Vec::new();
-        if self.alpha_sl_pct > 0 {
-            orders.push(crate::exits::SellOrder {
-                at_pct: -self.alpha_sl_pct,
-                amount_pct: 100,
-            });
-        }
-        if self.alpha_tp_pct > 0 {
-            orders.push(crate::exits::SellOrder { at_pct: self.alpha_tp_pct, amount_pct: 100 });
-        }
         crate::exits::ExitRules {
+            // Safety behaviour is not strategy: the master switch and the rug
+            // exit come from the normal rules either way.
             enabled: base.enabled,
-            orders,
-            trailing_pct: 0,
             exit_on_liquidity_pull: base.exit_on_liquidity_pull,
-            breakeven: false,
+            orders: self.alpha_exits.orders.clone(),
+            trailing_pct: self.alpha_exits.trailing_pct,
+            breakeven: self.alpha_exits.breakeven,
+        }
+    }
+
+    /// The rule set a lane edits. Lets one set of order controls drive both
+    /// ladders instead of two near-identical copies that can drift apart.
+    pub fn rules_mut(&mut self, lane: Lane) -> &mut crate::exits::ExitRules {
+        match lane {
+            Lane::Normal => &mut self.exits,
+            Lane::Alpha => &mut self.alpha_exits,
+        }
+    }
+
+    pub fn rules(&self, lane: Lane) -> &crate::exits::ExitRules {
+        match lane {
+            Lane::Normal => &self.exits,
+            Lane::Alpha => &self.alpha_exits,
         }
     }
 
@@ -691,11 +732,24 @@ mod tests {
         }
     }
 
+    /// Alpha with a real ladder: an optional stop and an optional target.
     fn live_with_alpha(tp: i32, sl: i32) -> LiveSettings {
         let env = env();
         let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
-        s.alpha_tp_pct = tp;
-        s.alpha_sl_pct = sl;
+        let mut orders = Vec::new();
+        if sl > 0 {
+            orders.push(crate::exits::SellOrder { at_pct: -sl, amount_pct: 100 });
+        }
+        if tp > 0 {
+            orders.push(crate::exits::SellOrder { at_pct: tp, amount_pct: 100 });
+        }
+        s.alpha_exits = crate::exits::ExitRules {
+            enabled: false,
+            orders,
+            trailing_pct: 0,
+            exit_on_liquidity_pull: false,
+            breakeven: false,
+        };
         s
     }
 
@@ -745,6 +799,46 @@ mod tests {
         // position is still governed by something.
         let neither = live_with_alpha(0, 0).alpha_exit_rules(&base_rules());
         assert_eq!(neither, base_rules(), "an unconfigured alpha inherits the normal ladder");
+    }
+
+    /// The two lanes must not share storage. Alpha exists to be managed on
+    /// different terms from the normal trigger, and a control that wrote
+    /// through to both would silently make them one strategy.
+    #[test]
+    fn the_two_ladders_are_independent() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.exits.orders = vec![crate::exits::SellOrder { at_pct: -25, amount_pct: 100 }];
+        s.alpha_exits.orders = vec![crate::exits::SellOrder { at_pct: 300, amount_pct: 50 }];
+
+        s.rules_mut(Lane::Alpha).trailing_pct = 40;
+        assert_eq!(s.exits.trailing_pct, 0, "editing alpha must not touch the normal ladder");
+        assert_eq!(s.alpha_exits.trailing_pct, 40);
+
+        s.rules_mut(Lane::Normal).breakeven = true;
+        assert!(!s.alpha_exits.breakeven, "and the reverse");
+
+        assert_eq!(s.rules(Lane::Normal).orders[0].at_pct, -25);
+        assert_eq!(s.rules(Lane::Alpha).orders[0].at_pct, 300);
+    }
+
+    /// A full Alpha ladder is carried through intact — this is the whole point
+    /// of the rebuild: Alpha takes profit in rungs like the normal one.
+    #[test]
+    fn an_alpha_ladder_reaches_the_exit_rules_intact() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_exits.orders = vec![
+            crate::exits::SellOrder { at_pct: -25, amount_pct: 100 },
+            crate::exits::SellOrder { at_pct: 100, amount_pct: 50 },
+            crate::exits::SellOrder { at_pct: 250, amount_pct: 20 },
+            crate::exits::SellOrder { at_pct: 900, amount_pct: 10 },
+        ];
+        s.alpha_exits.trailing_pct = 35;
+        let r = s.alpha_exit_rules(&base_rules());
+        assert_eq!(r.orders.len(), 4, "every rung survives");
+        assert_eq!(r.trailing_pct, 35, "and alpha's own trailing stop");
+        assert!(r.exit_on_liquidity_pull, "while safety behaviour is still inherited");
     }
 }
 
