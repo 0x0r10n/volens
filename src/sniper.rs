@@ -378,10 +378,14 @@ pub fn smart_buy_record(
     reason: &str,
     outcome: &str,
     armed: bool,
+    alpha: bool,
 ) -> serde_json::Value {
     serde_json::json!({
         "ts": Utc::now().to_rfc3339(),
-        "action": "smart_buy",
+        // The tag is how an ALPHA position is recognised later: it is what
+        // routes the position to the Alpha exit rules instead of the normal
+        // ones, and it is the only record of which trigger opened the trade.
+        "action": if alpha { "alpha_buy" } else { "smart_buy" },
         "owner": owner,
         "mint": mint,
         "sol": sol,
@@ -883,6 +887,39 @@ impl Sniper {
     /// sell route, so its exit is quote-API-dependent until pool discovery
     /// exists. That is the main reason to keep the size small.
     pub async fn buy_mint(&self, mint: &str, reason: &str) -> BuyOutcome {
+        self.buy_mint_sized(mint, reason, None, false).await
+    }
+
+    /// An ALPHA entry: same token, same guards, its own size and its own tag.
+    ///
+    /// Deliberately routed through `buy_mint_sized` rather than given a path of
+    /// its own. Every veto — kill switch, rug blacklist, daily caps,
+    /// affordability, mint safety, liquidity floor, price impact, market-cap
+    /// ceiling — is written once and applies to both triggers. A parallel buy
+    /// path would be a second place for a guard to be forgotten, and the guards
+    /// are the part that must never diverge.
+    pub async fn alpha_buy(&self, mint: &str, reason: &str) -> BuyOutcome {
+        let live = self.settings.snapshot();
+        if !live.alpha_enabled {
+            return BuyOutcome::Refused { reason: "alpha mode off".into() };
+        }
+        if live.alpha_buy_sol <= 0.0 {
+            return BuyOutcome::Refused { reason: "alpha buy amount not set".into() };
+        }
+        self.buy_mint_sized(mint, reason, Some(live.alpha_buy_sol), true).await
+    }
+
+    /// The shared body. `size_override` replaces the configured size and
+    /// suppresses market-cap banding; `alpha` only changes how the trade is
+    /// TAGGED in the audit log, which is what later routes it to the Alpha
+    /// exit rules.
+    async fn buy_mint_sized(
+        &self,
+        mint: &str,
+        reason: &str,
+        size_override: Option<f64>,
+        alpha: bool,
+    ) -> BuyOutcome {
         use crate::jupiter::Jupiter;
         use crate::model::WSOL_MINT;
 
@@ -907,7 +944,8 @@ impl Sniper {
 
         let live = self.settings.snapshot();
         let env = self.settings.envelope();
-        let size = live.trade_size_sol;
+        // An Alpha entry brings its own size; otherwise use the configured one.
+        let size = size_override.unwrap_or(live.trade_size_sol);
         let max_size = live.effective_max_trade_size(&env);
         if size <= 0.0 || (max_size > 0.0 && size > max_size) {
             return BuyOutcome::Refused {
@@ -1039,7 +1077,11 @@ impl Sniper {
         // trade. One extra round trip, and only when a band actually applies.
         let mut size = size;
         let mut quote = quote;
-        if !live.buy_tiers.is_empty()
+        // Bands are skipped for an explicit size. Alpha's amount IS the
+        // decision; re-sizing it off a market-cap table would silently
+        // overrule the one number the operator set for this strategy.
+        if size_override.is_none()
+            && !live.buy_tiers.is_empty()
             && let Ok(q) = &quote
         {
             let tokens_ui = q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
@@ -1161,7 +1203,7 @@ impl Sniper {
                             }
                         }
                         return self
-                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now)
+                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now, alpha)
                             .await;
                     }
                     Err(e) => {
@@ -1244,7 +1286,7 @@ impl Sniper {
                 info!(%mint, size, tokens_out, would_succeed, %reason,
                       "sniper: DRY RUN SMART BUY (nothing signed)");
                 self.audit_smart_buy(&owner, mint, size, reason,
-                    if would_succeed { "would-succeed" } else { "would-FAIL" }).await;
+                    if would_succeed { "would-succeed" } else { "would-FAIL" }, alpha).await;
                 BuyOutcome::Rehearsed { mint: mint.into(), sol_in: size, tokens_out, would_succeed }
             }
             Mode::Armed(cap) => {
@@ -1255,7 +1297,7 @@ impl Sniper {
                 self.reserve(mint, size, now);
                 let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(&owner, mint, size, reason, &outcome).await;
+                self.audit_smart_buy(&owner, mint, size, reason, &outcome, alpha).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1276,12 +1318,13 @@ impl Sniper {
         reason: &str,
         plan: crate::execute::ExecutionPlan,
         now: DateTime<Utc>,
+        alpha: bool,
     ) -> BuyOutcome {
         match &self.mode {
             Mode::DryRun { .. } => {
                 info!(%mint, size, tokens_out, %reason,
                       "sniper: DRY RUN CURVE BUY (nothing signed)");
-                self.audit_smart_buy(owner, mint, size, reason, "would-succeed").await;
+                self.audit_smart_buy(owner, mint, size, reason, "would-succeed", alpha).await;
                 BuyOutcome::Rehearsed {
                     mint: mint.into(),
                     sol_in: size,
@@ -1298,7 +1341,7 @@ impl Sniper {
                     .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
                     .await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(owner, mint, size, reason, &outcome).await;
+                self.audit_smart_buy(owner, mint, size, reason, &outcome, alpha).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1381,12 +1424,20 @@ impl Sniper {
         None
     }
 
-    async fn audit_smart_buy(&self, owner: &str, mint: &str, sol: f64, reason: &str, outcome: &str) {
+    async fn audit_smart_buy(
+        &self,
+        owner: &str,
+        mint: &str,
+        sol: f64,
+        reason: &str,
+        outcome: &str,
+        alpha: bool,
+    ) {
         if self.cfg.audit_log.is_empty() {
             return;
         }
         let armed = matches!(self.mode, Mode::Armed(_));
-        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed);
+        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed, alpha);
         if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
             warn!(error = %e, "failed to write smart buy audit");
         }
@@ -1606,8 +1657,30 @@ impl Sniper {
         // leaves the rule able to return the capital.
         let breakeven_buffer =
             (self.cfg.sell_slippage_bps as f64 / 10_000.0).clamp(0.01, 0.03);
-        let (sells, closed) =
-            crate::exits::plan_exits(&rules, state, &holdings, breakeven_buffer);
+
+        // ALPHA positions are planned under the Alpha TP/SL, everything else
+        // under the normal ladder. Two calls over disjoint sets rather than one
+        // rule set with exceptions inside it: `plan_exits` stays a pure
+        // function of (rules, positions), and the normal ladder is not touched
+        // by Alpha existing.
+        let live = self.settings.snapshot();
+        let alpha_mints = if live.alpha_enabled {
+            crate::positions::alpha_mints_from_audit(&audit)
+        } else {
+            std::collections::HashSet::new()
+        };
+        let (alpha_held, normal_held): (Vec<_>, Vec<_>) =
+            holdings.iter().cloned().partition(|h| alpha_mints.contains(&h.mint));
+
+        let (mut sells, mut closed) =
+            crate::exits::plan_exits(&rules, state, &normal_held, breakeven_buffer);
+        if !alpha_held.is_empty() {
+            let arules = live.alpha_exit_rules(&rules);
+            let (a_sells, a_closed) =
+                crate::exits::plan_exits(&arules, state, &alpha_held, breakeven_buffer);
+            sells.extend(a_sells);
+            closed.extend(a_closed);
+        }
         for mint in closed {
             state.forget(&mint);
         }
@@ -1756,6 +1829,89 @@ impl Sniper {
     }
 
     /// Turn the supply-share ceiling on or off, keeping the tuned percentage.
+    /// ALPHA SMART MONEY MODE on/off.
+    pub fn toggle_alpha(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            s.alpha_enabled = !s.alpha_enabled;
+            Ok(if s.alpha_enabled {
+                if s.alpha_buy_sol > 0.0 {
+                    format!("alpha mode ON — {} SOL per alpha entry", s.alpha_buy_sol)
+                } else {
+                    "alpha mode ON — set a buy amount before it can trade".to_string()
+                }
+            } else {
+                "alpha mode off".to_string()
+            })
+        })
+    }
+
+    /// SOL per Alpha entry. Bounded by the same ceiling as every other buy.
+    pub fn set_alpha_buy_sol(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("amount must be zero or positive".into());
+        }
+        let env = self.settings.envelope();
+        let live = self.settings.snapshot();
+        let max = live.effective_max_trade_size(&env);
+        if max > 0.0 && v > max {
+            return Err(format!("alpha buy {v} SOL exceeds the {max} SOL ceiling"));
+        }
+        self.settings.update(|s| {
+            s.alpha_buy_sol = v;
+            Ok(if v > 0.0 {
+                format!("alpha buy amount set to {v} SOL")
+            } else {
+                "alpha buy amount cleared — alpha cannot trade until it is set".to_string()
+            })
+        })
+    }
+
+    /// Take profit for Alpha entries, in percent. 0 clears it.
+    pub fn set_alpha_tp(&self, pct: i32) -> Result<String, String> {
+        if pct < 0 {
+            return Err("take profit must be positive".into());
+        }
+        self.settings.update(|s| {
+            s.alpha_tp_pct = pct;
+            Ok(if pct > 0 {
+                format!("alpha take profit at +{pct}%")
+            } else {
+                "alpha take profit cleared".to_string()
+            })
+        })
+    }
+
+    /// Stop loss for Alpha entries, as a positive percent below entry.
+    pub fn set_alpha_sl(&self, pct: i32) -> Result<String, String> {
+        if !(0..100).contains(&pct) {
+            return Err("stop loss must be between 0 and 99".into());
+        }
+        self.settings.update(|s| {
+            s.alpha_sl_pct = pct;
+            Ok(if pct > 0 {
+                format!("alpha stop loss at -{pct}%")
+            } else {
+                "alpha stop loss cleared".to_string()
+            })
+        })
+    }
+
+    /// The wallets currently trusted with Alpha money.
+    ///
+    /// Recomputed on demand from the signal history rather than cached: the
+    /// history moves continuously as calls resolve, and a wallet that fell
+    /// below the bar an hour ago must not still be buying on yesterday's score.
+    pub fn alpha_rules(&self) -> crate::alpha::AlphaRules {
+        crate::alpha::AlphaRules {
+            min_samples: self.cfg.alpha_min_samples,
+            min_hit_rate: self.cfg.alpha_min_hit_rate,
+            hit_multiple: self.cfg.alpha_hit_multiple,
+            lookback_secs: self.cfg.alpha_lookback_hours * 3600,
+            recency_secs: self.cfg.alpha_recency_hours * 3600,
+            maturity_secs: self.cfg.alpha_maturity_mins * 60,
+        }
+    }
+
     pub fn toggle_supply_cap(&self) -> Result<String, String> {
         self.settings.update(|s| {
             s.supply_cap = !s.supply_cap;
@@ -2854,6 +3010,12 @@ mod tests {
             max_trade_size_sol: 1.0,
             daily_cap_sol: 1.0,
             max_trades_per_day: 5,
+            alpha_min_samples: 8,
+            alpha_min_hit_rate: 0.35,
+            alpha_hit_multiple: 2.0,
+            alpha_lookback_hours: 168,
+            alpha_recency_hours: 72,
+            alpha_maturity_mins: 60,
             // Off by default in tests so existing cases that reuse the same
             // pool address keep exercising what they were written to test.
             // Cooldown behaviour is covered explicitly below.

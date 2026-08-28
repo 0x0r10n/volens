@@ -155,6 +155,13 @@ impl SignalStore {
         self.lock().len()
     }
 
+    /// Every tracked signal. Backs Alpha wallet scoring, which needs the whole
+    /// history rather than the active window — a wallet's record is made of
+    /// calls that have already finished running.
+    pub fn all(&self) -> Vec<SignalRecord> {
+        self.lock().values().cloned().collect()
+    }
+
     #[cfg(test)]
     pub fn contains(&self, mint: &str) -> bool {
         self.lock().contains_key(mint)

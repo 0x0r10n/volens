@@ -95,6 +95,34 @@ pub struct LiveSettings {
     #[serde(default)]
     pub buy_tiers: Vec<BuyTier>,
 
+    /// ALPHA SMART MONEY MODE — a second buy trigger, independent of the
+    /// volume one. See `crate::alpha`.
+    ///
+    /// Fires when a wallet with a qualifying track record buys, whatever the
+    /// aggregate volume did. Both triggers may fire on the same token; each
+    /// keeps its own size and its own exits.
+    ///
+    /// The BAR a wallet must clear lives in `config.toml`, not here. Which
+    /// wallets get trusted with money is a decision to make deliberately at the
+    /// host, not a slider to move between trades.
+    #[serde(default)]
+    pub alpha_enabled: bool,
+    /// SOL per Alpha entry. Its own size, unrelated to `trade_size_sol` and not
+    /// touched by the market-cap bands: an Alpha entry is a different bet, so
+    /// sizing it off the normal ladder would defeat the point.
+    ///
+    /// Still bounded by the same `max_trade_size_sol` ceiling as every other
+    /// buy — an independent trigger is not an independent spending limit.
+    #[serde(default)]
+    pub alpha_buy_sol: f64,
+    /// Take profit for Alpha entries, in percent. 0 = no target.
+    #[serde(default)]
+    pub alpha_tp_pct: i32,
+    /// Stop loss for Alpha entries, as a POSITIVE percent below entry.
+    /// 0 = no stop.
+    #[serde(default)]
+    pub alpha_sl_pct: i32,
+
     /// Enforce the supply-share ceiling. Separate from the percentage so the
     /// rule can be switched off without losing the number you tuned.
     #[serde(default)]
@@ -274,11 +302,55 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             buy_tiers: Vec::new(),
+            alpha_enabled: false,
+            alpha_buy_sol: 0.0,
+            alpha_tp_pct: 0,
+            alpha_sl_pct: 0,
             supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
             min_smart_sol_in: 0.0,
             min_token_volume_sol: 0.0,
+        }
+    }
+
+    /// Exit rules for an ALPHA position: its own TP and SL, and nothing else.
+    ///
+    /// Only the two levels Alpha owns are replaced. The protections that are
+    /// not about price levels — selling out when liquidity is pulled, and the
+    /// master `enabled` switch — are inherited from the normal rules, because
+    /// they are safety behaviour rather than strategy. An Alpha position must
+    /// not quietly lose the rug exit by virtue of being an Alpha position.
+    ///
+    /// Breakeven and the trailing stop are deliberately NOT inherited: both act
+    /// on the same peak the Alpha target is measured against, and an inherited
+    /// trailing stop would keep closing Alpha trades before their own target
+    /// could ever be reached. Alpha's exits are its TP and its SL.
+    pub fn alpha_exit_rules(&self, base: &crate::exits::ExitRules) -> crate::exits::ExitRules {
+        // Alpha with NEITHER level set is not a request to hold unprotected —
+        // it is a mode that has not been configured yet. Falling back to the
+        // normal ladder keeps those positions governed by something; the
+        // alternative is an open position with no stop and no target, which is
+        // the one outcome no setting should be able to produce silently.
+        if self.alpha_tp_pct <= 0 && self.alpha_sl_pct <= 0 {
+            return base.clone();
+        }
+        let mut orders = Vec::new();
+        if self.alpha_sl_pct > 0 {
+            orders.push(crate::exits::SellOrder {
+                at_pct: -self.alpha_sl_pct,
+                amount_pct: 100,
+            });
+        }
+        if self.alpha_tp_pct > 0 {
+            orders.push(crate::exits::SellOrder { at_pct: self.alpha_tp_pct, amount_pct: 100 });
+        }
+        crate::exits::ExitRules {
+            enabled: base.enabled,
+            orders,
+            trailing_pct: 0,
+            exit_on_liquidity_pull: base.exit_on_liquidity_pull,
+            breakeven: false,
         }
     }
 
@@ -605,6 +677,74 @@ mod tests {
         assert_eq!(s.size_for_mcap(Some(1e6)), s.trade_size_sol, "below it, default");
         // And nothing may overlap it.
         assert!(s.add_tier(BuyTier { min_usd: 3e6, max_usd: 4e6, sol: 0.5 }).is_err());
+    }
+    fn base_rules() -> crate::exits::ExitRules {
+        crate::exits::ExitRules {
+            enabled: true,
+            orders: vec![
+                crate::exits::SellOrder { at_pct: -25, amount_pct: 100 },
+                crate::exits::SellOrder { at_pct: 100, amount_pct: 50 },
+            ],
+            trailing_pct: 30,
+            exit_on_liquidity_pull: true,
+            breakeven: true,
+        }
+    }
+
+    fn live_with_alpha(tp: i32, sl: i32) -> LiveSettings {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_tp_pct = tp;
+        s.alpha_sl_pct = sl;
+        s
+    }
+
+    #[test]
+    fn alpha_exits_are_its_own_tp_and_sl_only() {
+        let r = live_with_alpha(150, 20).alpha_exit_rules(&base_rules());
+        assert_eq!(r.orders.len(), 2);
+        assert!(r.orders.iter().any(|o| o.at_pct == -20 && o.amount_pct == 100), "stop at -20%");
+        assert!(r.orders.iter().any(|o| o.at_pct == 150 && o.amount_pct == 100), "target at +150%");
+        assert!(
+            !r.orders.iter().any(|o| o.at_pct == -25 || o.at_pct == 100),
+            "the normal ladder must not leak into an alpha position"
+        );
+    }
+
+    /// Breakeven and the trailing stop both act on the same peak the Alpha
+    /// target is measured against. Inherited, they would keep closing Alpha
+    /// trades before the Alpha target could ever be reached.
+    #[test]
+    fn alpha_does_not_inherit_breakeven_or_trailing() {
+        let r = live_with_alpha(150, 20).alpha_exit_rules(&base_rules());
+        assert!(!r.breakeven);
+        assert_eq!(r.trailing_pct, 0);
+    }
+
+    /// Safety behaviour is not strategy: an Alpha position must not quietly
+    /// lose the rug exit, or the master switch, by being an Alpha position.
+    #[test]
+    fn alpha_still_inherits_the_safety_behaviour() {
+        let r = live_with_alpha(150, 20).alpha_exit_rules(&base_rules());
+        assert!(r.exit_on_liquidity_pull);
+        assert!(r.enabled);
+
+        let mut off = base_rules();
+        off.enabled = false;
+        assert!(!live_with_alpha(150, 20).alpha_exit_rules(&off).enabled, "the master switch wins");
+    }
+
+    #[test]
+    fn an_unset_alpha_level_produces_no_order() {
+        let only_stop = live_with_alpha(0, 20).alpha_exit_rules(&base_rules());
+        assert_eq!(only_stop.orders.len(), 1);
+        assert_eq!(only_stop.orders[0].at_pct, -20);
+
+        // Neither set is an UNCONFIGURED mode, not a request to hold with no
+        // stop and no target. It falls back to the normal ladder so the
+        // position is still governed by something.
+        let neither = live_with_alpha(0, 0).alpha_exit_rules(&base_rules());
+        assert_eq!(neither, base_rules(), "an unconfigured alpha inherits the normal ladder");
     }
 }
 

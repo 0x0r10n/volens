@@ -749,6 +749,10 @@ impl Bot {
             return Some(self.exits_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:alpha" {
+            return Some(self.alpha_screen());
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:ladder" {
             return Some(self.ladder_screen());
         }
@@ -967,7 +971,28 @@ impl Bot {
             };
 
             let sol = rpc.sol_balance(&address).await;
-            let tokens = rpc.token_account_count(&address).await;
+            // Counted from the tokens the bot actually bought, not by asking
+            // the provider to enumerate the account.
+            //
+            // Enumerating means `getTokenAccountsByOwner`, which is a SCAN, and
+            // the configured provider refuses scans permanently — so this line
+            // read "⚠️ could not read" every single time. The audit log already
+            // names every mint the bot has touched, and their balances come
+            // back in one batched read that the provider does allow.
+            //
+            // It counts POSITIONS rather than raw accounts: an emptied token
+            // account left behind by a completed sell is not a holding, and a
+            // token bought outside this bot is not something it can report on.
+            let tokens = match tokio::fs::read_to_string(&self.audit_log).await {
+                Ok(audit) => {
+                    let mints: Vec<String> =
+                        crate::positions::cost_basis_from_audit(&audit).into_keys().collect();
+                    rpc.token_balances_raw(&address, &mints)
+                        .await
+                        .map(|b| b.values().filter(|(raw, _)| *raw > 0).count())
+                }
+                Err(_) => None,
+            };
 
             // Unreadable is reported as unknown, never as zero. Someone reading
             // "0 SOL" concludes they were drained; "could not read" is the truth.
@@ -976,8 +1001,8 @@ impl Bot {
                 None => "<b>SOL:</b> ⚠️ could not read (RPC error — not zero)".to_string(),
             };
             let token_line = match tokens {
-                Some(n) => format!("<b>Token accounts:</b> {n}"),
-                None => "<b>Token accounts:</b> ⚠️ could not read".to_string(),
+                Some(n) => format!("<b>Open positions:</b> {n}"),
+                None => "<b>Open positions:</b> ⚠️ could not read".to_string(),
             };
 
             format!(
@@ -1568,6 +1593,14 @@ impl Bot {
                 {"text": format!("🎚 Selling · {}", crate::exits::describe(&live.exits)),
                  "callback_data": "set:exits"},
             ]));
+            let al = if live.alpha_enabled {
+                format!("on · {} SOL", live.alpha_buy_sol)
+            } else {
+                "off".to_string()
+            };
+            rows.push(serde_json::json!([
+                {"text": format!("⭐ Alpha · {al}"), "callback_data": "set:alpha"}
+            ]));
             rows.push(serde_json::json!([
                 {"text": format!("🔎 Filters · {}", if live.volume_mode { "on" } else { "off" }),
                  "callback_data": "set:filters"},
@@ -1755,6 +1788,9 @@ impl Bot {
             "smartsol" => ("smart-money volume", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
+            "alphabuy" => ("alpha buy amount", "e.g. <code>0.05</code> (SOL)"),
+            "alphatp" => ("alpha take profit", "e.g. <code>150</code> (percent), 0 = none"),
+            "alphasl" => ("alpha stop loss", "e.g. <code>25</code> (percent below entry), 0 = none"),
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -2064,6 +2100,56 @@ impl Bot {
         (text, rows)
     }
 
+    /// ALPHA SMART MONEY MODE — four controls and nothing else.
+    ///
+    /// The wallet scores and the bar they must clear are deliberately absent:
+    /// they are host-side, and a screen that showed them would invite tuning
+    /// the qualification between trades, which is how a performance measure
+    /// stops measuring anything.
+    #[cfg(feature = "sniper")]
+    fn alpha_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let onoff = if live.alpha_enabled { "🟢 On" } else { "⚪ Off" };
+        let amt_s = format!("{} SOL", live.alpha_buy_sol);
+        let tp_s =
+            if live.alpha_tp_pct > 0 { format!("+{}%", live.alpha_tp_pct) } else { "none".into() };
+        let sl_s =
+            if live.alpha_sl_pct > 0 { format!("-{}%", live.alpha_sl_pct) } else { "none".into() };
+
+        let mut text = format!(
+            "⭐ <b>Alpha smart money</b> · {onoff}\n\n\
+             💰 Buy amount  <b>{amt_s}</b>\n\
+             🎯 Take profit <b>{tp_s}</b>\n\
+             🛑 Stop loss   <b>{sl_s}</b>\n\n\
+             <i>Buys when a wallet with a proven track record buys — on its own \
+             size and its own exits, whatever the volume trigger does. Both can \
+             fire on the same token.</i>"
+        );
+        // Said plainly rather than left to be discovered: enabled with no
+        // amount looks armed and does nothing.
+        if live.alpha_enabled && live.alpha_buy_sol <= 0.0 {
+            text.push_str("\n\n⚠️ <b>Set a buy amount</b> — Alpha cannot trade without one.");
+        }
+        if live.alpha_enabled && live.alpha_tp_pct == 0 && live.alpha_sl_pct == 0 {
+            text.push_str(
+                "\n\n⚠️ <b>No Alpha exits set</b> — Alpha positions fall back to the \
+                 normal auto-sell rules until you set a target or a stop here.",
+            );
+        }
+
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("Alpha mode · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
+            [{"text": format!("💰 Buy amount · {amt_s}"), "callback_data": "set:alphabuy"},
+             {"text": format!("🎯 Take profit · {tp_s}"), "callback_data": "set:alphatp"}],
+            [{"text": format!("🛑 Stop loss · {sl_s}"), "callback_data": "set:alphasl"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
+    }
+
     /// The full order list, for multi-rung ladders.
     #[cfg(feature = "sniper")]
     fn ladder_screen(&self) -> (String, serde_json::Value) {
@@ -2226,6 +2312,7 @@ impl Bot {
             "cleartiers" => (sniper.clear_buy_tiers(), "tiers".into()),
             "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
             "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
+            "alpha_on" => (sniper.toggle_alpha(), "alpha".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "exits".into()),
             "delorder" => (sniper.remove_order(value.parse().ok()?), "exits".into()),
@@ -2252,6 +2339,8 @@ impl Bot {
             self.supply_cap_screen()
         } else if screen == "tiers" {
             self.tiers_screen()
+        } else if screen == "alpha" {
+            self.alpha_screen()
         } else {
             self.exits_screen()
         };
@@ -2326,6 +2415,19 @@ impl Bot {
                      large buy can take a share nobody will take back off you.",
                     fmt_supply_pct(live.max_supply_pct),
                     vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], "%", false),
+                "alphabuy" => ("⭐ Alpha buy amount",
+                    "SOL per Alpha entry. Independent of the normal trade size, \
+                     and never resized by the market-cap bands.",
+                    format!("{} SOL", live.alpha_buy_sol),
+                    vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5], " SOL", false),
+                "alphatp" => ("⭐ Alpha take profit",
+                    "Sells an Alpha position when it is up this much. 0 removes it.",
+                    if live.alpha_tp_pct > 0 { format!("+{}%", live.alpha_tp_pct) } else { "none".into() },
+                    vec![0.0, 50.0, 100.0, 150.0, 250.0, 500.0], "%", false),
+                "alphasl" => ("⭐ Alpha stop loss",
+                    "Sells an Alpha position if it falls this far below cost. 0 removes it.",
+                    if live.alpha_sl_pct > 0 { format!("-{}%", live.alpha_sl_pct) } else { "none".into() },
+                    vec![0.0, 10.0, 15.0, 20.0, 30.0, 50.0], "%", false),
                 "smartsol" => ("💸 Smart-money volume",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
@@ -2397,9 +2499,13 @@ impl Bot {
                 {"text": "🚫 Clear (use host setting)", "callback_data": format!("setv:{field}:0")}
             ]));
         }
+        // Back goes to the screen this editor was opened FROM, not the root.
+        // Setting an Alpha level and landing in the top-level settings menu
+        // makes the next Alpha change a three-tap journey.
+        let back = if field.starts_with("alpha") { "set:alpha" } else { "cmd:settings" };
         rows.push(serde_json::json!([
             {"text": "✏️ Custom value", "callback_data": format!("ask:{field}")},
-            {"text": "◀️ Back", "callback_data": "cmd:settings"},
+            {"text": "◀️ Back", "callback_data": back},
         ]));
 
         let text = format!(
@@ -2438,6 +2544,9 @@ impl Bot {
             "smartsol" => sniper.set_min_smart_sol_in(v),
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsupply" => sniper.set_max_supply_pct(v),
+            "alphabuy" => sniper.set_alpha_buy_sol(v),
+            "alphatp" => sniper.set_alpha_tp(v as i32),
+            "alphasl" => sniper.set_alpha_sl(v as i32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),

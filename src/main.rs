@@ -6,6 +6,7 @@
 //! structured logs + Telegram alerts + persistence.
 
 mod alerts;
+mod alpha;
 mod bot;
 mod config;
 mod conviction;

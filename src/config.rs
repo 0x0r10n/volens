@@ -418,6 +418,31 @@ pub struct SniperConfig {
     /// smart-money test learns nothing.
     #[serde(default = "default_true")]
     pub pool_auto_buy: bool,
+
+    // --- ALPHA SMART MONEY MODE: which wallets earn the trigger.
+    //
+    // Host-side on purpose. The Telegram controls decide whether Alpha runs
+    // and how much it spends; THESE decide who gets trusted, which is a
+    // slower, more considered decision than a button should carry.
+    /// Resolved calls a wallet needs before it can qualify.
+    #[serde(default = "default_alpha_min_samples")]
+    pub alpha_min_samples: usize,
+    /// Share of a wallet's samples that must be hits, 0.0–1.0.
+    #[serde(default = "default_alpha_min_hit_rate")]
+    pub alpha_min_hit_rate: f64,
+    /// The multiple that counts as a hit.
+    #[serde(default = "default_alpha_hit_multiple")]
+    pub alpha_hit_multiple: f64,
+    /// How far back to look for samples.
+    #[serde(default = "default_alpha_lookback_hours")]
+    pub alpha_lookback_hours: i64,
+    /// A wallet must have bought inside this window to stay qualified.
+    #[serde(default = "default_alpha_recency_hours")]
+    pub alpha_recency_hours: i64,
+    /// How old a call must be before it counts as a sample. See
+    /// `crate::alpha::AlphaRules::maturity_secs`.
+    #[serde(default = "default_alpha_maturity_mins")]
+    pub alpha_maturity_mins: i64,
     /// Where sell routes are recorded, one JSON line per position entered.
     ///
     /// Written at BUY time because some accounts cannot be recovered later —
@@ -679,6 +704,27 @@ fn default_recheck_interval() -> u64 { 120 }
 fn default_max_watch() -> u64 { 600 }
 fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
 fn default_kill_switch() -> String { "HALT".into() }
+fn default_alpha_min_samples() -> usize {
+    8
+}
+/// A bar set from what the tracked book actually does. Most wallets sit well
+/// under this; the ones that clear it are the reason Alpha exists.
+fn default_alpha_min_hit_rate() -> f64 {
+    0.35
+}
+fn default_alpha_hit_multiple() -> f64 {
+    2.0
+}
+fn default_alpha_lookback_hours() -> i64 {
+    168
+}
+fn default_alpha_recency_hours() -> i64 {
+    72
+}
+fn default_alpha_maturity_mins() -> i64 {
+    60
+}
+
 fn default_audit_log() -> String { "sniper_audit.jsonl".into() }
 fn default_wallet_dir() -> String { "wallets".into() }
 fn default_max_impact() -> u32 { 1_000 }
@@ -763,6 +809,12 @@ impl Default for SniperConfig {
             slippage_bps: default_slippage_bps(),
             kill_switch_file: default_kill_switch(),
             audit_log: default_audit_log(),
+            alpha_min_samples: default_alpha_min_samples(),
+            alpha_min_hit_rate: default_alpha_min_hit_rate(),
+            alpha_hit_multiple: default_alpha_hit_multiple(),
+            alpha_lookback_hours: default_alpha_lookback_hours(),
+            alpha_recency_hours: default_alpha_recency_hours(),
+            alpha_maturity_mins: default_alpha_maturity_mins(),
             settings_path: default_settings_path(),
             pool_auto_buy: true,
             sell_routes_path: default_routes_path(),

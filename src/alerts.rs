@@ -662,6 +662,45 @@ pub fn render_smart_buy(
     })
 }
 
+/// Announce an ALPHA entry.
+///
+/// Kept visually distinct from a smart buy — different marker, and it names the
+/// wallet that triggered it. When both triggers fire on one token two messages
+/// arrive, which is correct: they are two decisions and two sizes, and merging
+/// them would hide that the position is now twice what either intended.
+#[cfg(feature = "sniper")]
+pub fn render_alpha_buy(
+    mint: &str,
+    wallet_label: &str,
+    outcome: &crate::sniper::BuyOutcome,
+) -> Option<String> {
+    use crate::sniper::BuyOutcome;
+    let short = crate::conviction::short_mint(mint);
+    Some(match outcome {
+        // Silent on a refusal. Alpha evaluates every buy by a qualifying
+        // wallet, so a standing condition — mode off, amount unset, balance too
+        // low — would otherwise repeat the same message all day.
+        BuyOutcome::Refused { .. } => return None,
+        BuyOutcome::Failed { reason, .. } => format!(
+            "❌ <b>Alpha buy FAILED</b> · <code>{}</code>\n{}",
+            escape_html(&short),
+            escape_html(&explain_failure(reason))
+        ),
+        BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
+            "🧪 <b>Alpha rehearsed</b> · <code>{}</code>\n{sol_in} SOL · {}\n\
+             <i>Dry run — nothing was signed.</i>",
+            escape_html(&short),
+            if *would_succeed { "would succeed" } else { "would FAIL" }
+        ),
+        BuyOutcome::Submitted { sol_in, result, .. } => format!(
+            "⭐ <b>ALPHA BUY</b> · <code>{}</code>\n{sol_in} SOL · {}\n{}",
+            escape_html(&short),
+            escape_html(wallet_label),
+            escape_html(&describe_submission(result))
+        ),
+    })
+}
+
 /// Announce an exit to the group.
 #[cfg(feature = "sniper")]
 pub fn render_auto_sell(

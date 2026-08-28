@@ -76,6 +76,18 @@ pub struct Detector {
     /// Mints already auto-bought, so one signal opens one position.
     #[cfg(feature = "sniper")]
     smart_bought: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Mints ALPHA has already entered. Separate from `smart_bought` on
+    /// purpose: the two triggers are independent, and sharing one set would
+    /// mean whichever fired first silently suppressed the other.
+    #[cfg(feature = "sniper")]
+    alpha_bought: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Qualifying Alpha wallets, with the time they were computed.
+    ///
+    /// Cached because the scoring pass walks the whole signal history and this
+    /// is consulted on EVERY tracked buy — roughly 861 a minute. Recomputing it
+    /// per buy would put a full history scan in the hot path of the stream.
+    #[cfg(feature = "sniper")]
+    alpha_wallets: std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>,
 }
 
 impl Detector {
@@ -159,6 +171,10 @@ impl Detector {
             sniper,
             #[cfg(feature = "sniper")]
             smart_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "sniper")]
+            alpha_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(feature = "sniper")]
+            alpha_wallets: std::sync::Mutex::new(None),
         })
     }
 
@@ -981,6 +997,29 @@ impl Detector {
                 }
             }
 
+            // --- ALPHA SMART MONEY MODE. A SECOND, INDEPENDENT TRIGGER.
+            //
+            // Evaluated on its own terms: not nested inside the volume trigger
+            // above, not gated on `auto_buy`, and not suppressed by it having
+            // already fired. Alpha asks "did a wallet with a track record buy
+            // this?" and nothing else, so a token no volume threshold would
+            // ever admit still gets bought when the right wallet steps in — and
+            // a token both agree on is entered by both, which is the point.
+            #[cfg(feature = "sniper")]
+            {
+                if self.sniper.live().alpha_enabled
+                    // Same cohort filter the volume trigger uses. Performance
+                    // is not the only question: the excluded cohorts are full
+                    // of launch bundlers whose entries sit inside creation
+                    // bundles and cannot be followed at any price, however good
+                    // their measured record looks.
+                    && self.wallets.in_groups(&buy.wallet, &self.cfg.tracked.auto_buy_groups)
+                    && self.alpha_qualified(&buy.wallet)
+                {
+                    self.spawn_alpha_buy(&buy.mint, &buy.wallet).await;
+                }
+            }
+
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
                 // The triggering buy becomes the reference trade for every
@@ -988,6 +1027,74 @@ impl Detector {
                 // because it cannot be reconstructed afterwards.
                 self.spawn_conviction_alert(signal, buy);
             }
+        }
+    }
+
+    /// Is this wallet currently trusted with Alpha money?
+    ///
+    /// The qualifying set is recomputed at most every five minutes. Scores move
+    /// as calls resolve, not tick by tick, so a fresher answer would cost a full
+    /// history scan per buy to tell us the same thing.
+    #[cfg(feature = "sniper")]
+    fn alpha_qualified(&self, wallet: &str) -> bool {
+        const REFRESH: Duration = Duration::from_secs(300);
+        let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
+        let stale = match cache.as_ref() {
+            Some((at, _)) => at.elapsed() >= REFRESH,
+            None => true,
+        };
+        if stale {
+            let rules = self.sniper.alpha_rules();
+            let records = self.signals.all();
+            let set = crate::alpha::qualifying_set(&records, &rules, chrono::Utc::now());
+            info!(
+                qualifying = set.len(),
+                of_wallets = self.wallets.len(),
+                min_samples = rules.min_samples,
+                min_hit_rate = rules.min_hit_rate,
+                "alpha wallet set refreshed"
+            );
+            *cache = Some((Instant::now(), set));
+        }
+        cache.as_ref().map(|(_, s)| s.contains(wallet)).unwrap_or(false)
+    }
+
+    /// Fire an ALPHA buy, once per token, on its own size and exits.
+    #[cfg(feature = "sniper")]
+    async fn spawn_alpha_buy(&self, mint: &str, wallet: &str) {
+        {
+            let mut seen = self.alpha_bought.lock().unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(mint.to_string()) {
+                return;
+            }
+        }
+        let label = self
+            .wallets
+            .get(wallet)
+            .map(|w| w.name.clone())
+            .unwrap_or_else(|| crate::wallets::short_address(wallet));
+        let reason = format!("alpha wallet {label}");
+        info!(%mint, %wallet, %label, "alpha buy triggered");
+
+        let outcome = self.sniper.alpha_buy(mint, &reason).await;
+        info!(%mint, ?outcome, "alpha buy");
+
+        // Released on failure so a retry is possible. Holding the mint after a
+        // refusal would mean one transient rejection — a momentary low balance,
+        // a rate limit — permanently excluded that token from Alpha.
+        if !matches!(
+            outcome,
+            crate::sniper::BuyOutcome::Submitted {
+                result: crate::sniper::SubmitOutcome::Executed { .. },
+                ..
+            }
+        ) {
+            let mut seen = self.alpha_bought.lock().unwrap_or_else(|p| p.into_inner());
+            seen.remove(mint);
+        }
+
+        if let Some(msg) = crate::alerts::render_alpha_buy(mint, &label, &outcome) {
+            self.alerter.send_html(msg).await;
         }
     }
 
