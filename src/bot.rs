@@ -704,6 +704,18 @@ impl Bot {
             return Some(self.tiers_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:buying" {
+            return Some(self.buying_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:filters" {
+            return Some(self.filters_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:limits" {
+            return Some(self.limits_screen());
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:exits" {
             return Some(self.exits_screen());
         }
@@ -1489,40 +1501,18 @@ impl Bot {
         let text = self.render_settings();
         #[allow(unused_mut)]
         let mut rows: Vec<serde_json::Value> = Vec::new();
+        // GROUPED, not piled up.
+        //
+        // Ten settings in one flat list, three to a row, is a wall the operator
+        // has to re-read every time. These are four questions — do I buy, how
+        // much, what do I skip, and when do I sell — so the top level asks
+        // those and the detail lives one tap down.
+        //
+        // Auto-buy is alone on its row on purpose: it is the switch that
+        // decides whether any of the rest matters.
         #[cfg(feature = "sniper")]
         if let Some(sniper) = &self.sniper {
-            use crate::sniper::SnipeMode;
             let live = sniper.live();
-            // Deliberately NOT shown: the spend caps and the snipe mode.
-            //
-            // The caps still bind on every buy — they are set on the host and
-            // enforced from `config.toml`; hiding the buttons removes a way to
-            // TIGHTEN them, never the ceiling itself. Snipe mode is a new-pool
-            // strategy, and this bot is being pointed at smart money instead.
-            rows.push(serde_json::json!([
-                {"text": format!("💰 Size · {} SOL", live.trade_size_sol), "callback_data": "set:size"},
-                {"text": format!("📉 Slippage · {} bps", live.slippage_bps), "callback_data": "set:slippage"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("💧 Pool liq · {} SOL", live.min_liquidity_sol), "callback_data": "set:minliq"},
-                {"text": format!("🌱 Curve liq · {}", if live.curve_min_liquidity_sol == 0.0 {
-                    "off".to_string() } else { format!("{} SOL", live.curve_min_liquidity_sol) }),
-                 "callback_data": "set:curveliq"},
-            ]));
-            rows.push(serde_json::json!([
-                {"text": format!("🎚 TP / SL · {}", crate::exits::describe(&live.exits)), "callback_data": "set:exits"},
-                {"text": format!("🔢 Trades/day · {}", if live.max_trades_per_day == 0 {
-                    "∞".to_string() } else { live.max_trades_per_day.to_string() }),
-                 "callback_data": "set:maxtrades"},
-                {"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
-                 "callback_data": "set:volume"},
-                {"text": format!("📊 MC buy bands · {}", if live.buy_tiers.is_empty() {
-                    "off".to_string() } else { format!("{}", live.buy_tiers.len()) }),
-                 "callback_data": "set:tiers"},
-                {"text": format!("🪙 Supply cap · {}", if live.supply_cap {
-                    fmt_supply_pct(live.max_supply_pct) } else { "off".to_string() }),
-                 "callback_data": "set:supplycap"},
-            ]));
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
                 format!("on · {} buyers", live.effective_auto_buy_min(&env))
@@ -1532,9 +1522,107 @@ impl Bot {
             rows.push(serde_json::json!([
                 {"text": format!("🤖 Auto-buy · {ab}"), "callback_data": "set:autobuy"}
             ]));
+            rows.push(serde_json::json!([
+                {"text": format!("💰 Buying · {} SOL", live.trade_size_sol),
+                 "callback_data": "set:buying"},
+                {"text": format!("🎚 Selling · {}", crate::exits::describe(&live.exits)),
+                 "callback_data": "set:exits"},
+            ]));
+            rows.push(serde_json::json!([
+                {"text": format!("🔎 Filters · {}", if live.volume_mode { "on" } else { "off" }),
+                 "callback_data": "set:filters"},
+                {"text": format!("🛡 Limits · {}/day", if live.max_trades_per_day == 0 {
+                    "∞".to_string() } else { live.max_trades_per_day.to_string() }),
+                 "callback_data": "set:limits"},
+            ]));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "nav:main"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Everything about how much to spend.
+    #[cfg(feature = "sniper")]
+    fn buying_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let bands = if live.buy_tiers.is_empty() {
+            "off — every token uses the default".to_string()
+        } else {
+            format!("{} band(s)", live.buy_tiers.len())
+        };
+        let text = format!(
+            "💰 <b>Buying</b>\n\n             Default size   <b>{} SOL</b>\n             MC bands       <b>{bands}</b>\n             Slippage       <b>{} bps</b>\n\n             <i>A token inside a market-cap band buys that band's amount; \
+             everything else uses the default.</i>",
+            live.trade_size_sol, live.slippage_bps
+        );
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("💰 Default size · {} SOL", live.trade_size_sol),
+              "callback_data": "set:size"}],
+            [{"text": format!("📊 Market-cap bands · {}", if live.buy_tiers.is_empty() {
+                "off".to_string() } else { live.buy_tiers.len().to_string() }),
+              "callback_data": "set:tiers"}],
+            [{"text": format!("📉 Slippage · {} bps", live.slippage_bps),
+              "callback_data": "set:slippage"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
+    }
+
+    /// What the bot refuses to buy.
+    #[cfg(feature = "sniper")]
+    fn filters_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let curve = if live.curve_min_liquidity_sol == 0.0 {
+            "off".to_string()
+        } else {
+            format!("{} SOL", live.curve_min_liquidity_sol)
+        };
+        let text = format!(
+            "🔎 <b>Filters</b>\n\n             Volume mode    <b>{}</b>\n             Pool liquidity <b>{} SOL</b>\n             Curve floor    <b>{curve}</b>\n\n             <i>Smart money always decides WHEN. These only ever refuse a \
+             signal — none of them can create one.</i>",
+            if live.volume_mode { "on" } else { "off" },
+            live.min_liquidity_sol,
+        );
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("📊 Volume mode · {}", if live.volume_mode { "on" } else { "off" }),
+              "callback_data": "set:volume"}],
+            [{"text": format!("💧 Pool liquidity · {} SOL", live.min_liquidity_sol),
+              "callback_data": "set:minliq"},
+             {"text": format!("🌱 Curve floor · {curve}"), "callback_data": "set:curveliq"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
+    }
+
+    /// What bounds the damage.
+    #[cfg(feature = "sniper")]
+    fn limits_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let trades = if live.max_trades_per_day == 0 {
+            "unlimited".to_string()
+        } else {
+            live.max_trades_per_day.to_string()
+        };
+        let cap = if live.supply_cap { fmt_supply_pct(live.max_supply_pct) } else { "off".into() };
+        let text = format!(
+            "🛡 <b>Limits</b>\n\n             Trades per day <b>{trades}</b>\n             Supply cap     <b>{cap}</b>\n\n             <i>Trades per day is the main brake on a runaway. The supply cap \
+             trims a position back after the buy if it took too large a share \
+             of the token.</i>"
+        );
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"}],
+            [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
     }
 
     /// The wallet list, with a select button per wallet.
@@ -1613,7 +1701,7 @@ impl Bot {
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
             "addtier" => (
                 "market-cap band",
-                "three values: <b>min max size</b>\n\n                 <code>50k 100k 0.2</code> — $50K–$100K buys 0.2 SOL\n                 <code>1m 2m 0.75</code> — $1M–$2M buys 0.75 SOL\n                 <code>2m 0 1.0</code> — $2M and above buys 1 SOL",
+                "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
             ),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
@@ -1632,9 +1720,16 @@ impl Bot {
             ),
             _ => ("value", "send a number"),
         };
+        // The generic footer says "just the number", which is wrong for the
+        // fields that take several — and a prompt that misdescribes its own
+        // input is how you get a rejected value and no idea why.
+        let closing = if field == "addtier" || field.starts_with("wd_dest") {
+            "No command needed. Expires in 3 minutes."
+        } else {
+            "Just the number — no command. Expires in 3 minutes."
+        };
         let text = format!(
-            "✏️ <b>Send the {label}</b>\n\n{hint}\n\n\
-             <i>Just the number — no command. Expires in 3 minutes.</i>"
+            "✏️ <b>Send the {label}</b>\n\n{hint}\n\n<i>{closing}</i>"
         );
         let kb = serde_json::json!({"inline_keyboard": [[
             {"text": "◀️ Cancel", "callback_data": format!("set:{field}")}
@@ -3427,26 +3522,41 @@ mod tests {
         let sn2 = sniper.clone();
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
+        // The top level asks four questions; the detail lives one tap down.
+        // Walk the hierarchy rather than asserting a flat screen, so this test
+        // fails when a setting becomes UNREACHABLE — not merely when it moves.
         let (_, kb) = b.settings_screen();
-        let blob = kb.to_string();
-        for field in ["size", "slippage", "minliq", "curveliq", "exits", "autobuy"] {
-            assert!(blob.contains(&format!("set:{field}")), "no button for {field}");
+        let top = kb.to_string();
+        for section in ["set:autobuy", "set:buying", "set:exits", "set:filters", "set:limits"] {
+            assert!(top.contains(section), "{section} missing from the settings screen");
         }
+
+        let mut reachable = top.clone();
+        for (screen, blob) in [
+            ("buying", b.buying_screen().1.to_string()),
+            ("filters", b.filters_screen().1.to_string()),
+            ("limits", b.limits_screen().1.to_string()),
+        ] {
+            assert!(blob.contains("cmd:settings"), "{screen} has no way back");
+            reachable.push_str(&blob);
+        }
+
+        // Every setting still has a path to it, wherever it now lives.
+        for field in ["size", "slippage", "minliq", "curveliq", "exits", "autobuy",
+                      "maxtrades", "tiers", "supplycap", "volume"] {
+            assert!(
+                reachable.contains(&format!("set:{field}")),
+                "no route to {field} from the settings screen"
+            );
+        }
+
         // Spend caps are deliberately absent. Trade size bounds a single
         // entry, the wallet balance bounds the rest, and a screen of limits
-        // nobody uses is noise on the one screen that has to stay readable.
-        // The commands still exist and still bind if anyone sets them.
+        // nobody uses is noise. The commands still exist and still bind.
         for gone in ["set:maxsize", "set:dailycap", "set:maxmcap",
                      "set:maximpact", "set:mode"] {
-            assert!(!blob.contains(gone), "{gone} should not be on the settings screen");
+            assert!(!reachable.contains(gone), "{gone} should not be tappable");
         }
-        // Trades/day IS on the screen. It is the one limit that changes with
-        // how the bot is being run — supervised at 1, unattended at many — so
-        // it has to be reachable without a config edit and a restart.
-        assert!(
-            blob.contains("set:maxtrades"),
-            "trades per day must be tappable from the settings screen"
-        );
 
         // Auto-buy: the switch and threshold are tappable; the COHORTS are
         // not, by design — which wallets to follow is a decision from scoring

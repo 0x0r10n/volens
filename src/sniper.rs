@@ -950,16 +950,19 @@ impl Sniper {
         // an unaffordable trade; this only avoids paying to be told.
         const ATA_RENT_SOL: f64 = 0.00204;
         const FEE_HEADROOM_SOL: f64 = 0.0005;
-        if let Some(balance) = self.rpc.sol_balance(&owner).await {
+        let balance = self.rpc.sol_balance(&owner).await;
+        let affordable = |size: f64| -> Option<String> {
+            let bal = balance?;
             let needed = size + ATA_RENT_SOL + FEE_HEADROOM_SOL;
-            if balance < needed {
-                return BuyOutcome::Refused {
-                    reason: format!(
-                        "insufficient balance: {balance:.6} SOL, need {needed:.6} \
-                         ({size} trade + rent + fees)"
-                    ),
-                };
-            }
+            (bal < needed).then(|| {
+                format!(
+                    "insufficient balance: {bal:.6} SOL, need {needed:.6} \
+                     ({size} trade + rent + fees)"
+                )
+            })
+        };
+        if let Some(reason) = affordable(size) {
+            return BuyOutcome::Refused { reason };
         }
 
         // Mint safety. The pool path has always refused a token whose
@@ -1058,6 +1061,14 @@ impl Sniper {
                     to = tiered,
                     "market-cap band selected a different size"
                 );
+                // RE-CHECKED against the new size. The affordability test above
+                // ran on the DEFAULT size, and a band may select a larger one —
+                // passing at 0.2 SOL and then trying to spend 0.75 produces the
+                // exact `insufficient lamports` failure that check exists to
+                // prevent, at the cost of a fee.
+                if let Some(reason) = affordable(tiered) {
+                    return BuyOutcome::Refused { reason };
+                }
                 size = tiered;
                 // Reassigned, NOT shadowed: the curve builder below takes
                 // `lamports`, and a local binding here would have left it

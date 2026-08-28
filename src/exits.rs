@@ -151,11 +151,31 @@ impl ExitRules {
         }
     }
 
-    /// Replace the single target, keeping the stop untouched.
+    /// Replace the LOWEST target, leaving the stop and any higher rungs alone.
+    ///
+    /// The simple screen displays the lowest target, so editing there must edit
+    /// that one. Replacing every target instead would silently delete a ladder
+    /// the same screen just told the operator existed — destructive, invisible,
+    /// and discovered only when the higher rungs failed to fire.
     pub fn set_target(&mut self, pct: i32, amount: u8) {
-        self.orders.retain(|o| o.is_stop());
-        if pct > 0 && amount > 0 {
-            self.orders.push(SellOrder { at_pct: pct, amount_pct: amount.min(100) });
+        let lowest = self
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.is_armed() && !o.is_stop())
+            .min_by_key(|(_, o)| o.at_pct)
+            .map(|(i, _)| i);
+        match (lowest, pct > 0 && amount > 0) {
+            (Some(i), true) => {
+                self.orders[i] = SellOrder { at_pct: pct, amount_pct: amount.min(100) };
+            }
+            (Some(i), false) => {
+                self.orders.remove(i);
+            }
+            (None, true) => {
+                self.orders.push(SellOrder { at_pct: pct, amount_pct: amount.min(100) });
+            }
+            (None, false) => {}
         }
     }
 
@@ -846,6 +866,45 @@ mod tests {
             sells[0].reason
         );
     }
+
+
+#[test]
+fn the_simple_views_round_trip_without_losing_orders() {
+    let mut r = ExitRules { enabled: true, orders: vec![], ..Default::default() };
+    // Set a target, then a stop: neither may erase the other.
+    r.set_target(100, 50);
+    r.set_stop(-15);
+    assert_eq!(r.stop_pct(), -15, "the stop survived setting a target first");
+    assert_eq!(r.target(), (100, 50), "the target survived setting a stop");
+
+    // Changing the stop keeps the target.
+    r.set_stop(-25);
+    assert_eq!(r.target(), (100, 50));
+    assert_eq!(r.stop_pct(), -25);
+
+    // Changing the target keeps the stop.
+    r.set_target(250, 100);
+    assert_eq!(r.stop_pct(), -25);
+    assert_eq!(r.target(), (250, 100));
+
+    // Clearing one leaves the other.
+    r.set_stop(0);
+    assert_eq!(r.stop_pct(), 0);
+    assert_eq!(r.target(), (250, 100), "clearing the stop must not clear the target");
+
+    // A multi-rung ladder: the simple view shows the LOWEST target and
+    // editing it must not silently delete the higher rungs.
+    let mut r = ExitRules { enabled: true, orders: vec![
+        SellOrder { at_pct: -15, amount_pct: 100 },
+        SellOrder { at_pct: 100, amount_pct: 50 },
+        SellOrder { at_pct: 400, amount_pct: 50 },
+    ], ..Default::default() };
+    assert!(r.is_ladder(), "three orders is a ladder");
+    assert_eq!(r.target(), (100, 50), "shows the lowest target");
+    r.set_stop(-20);
+    assert_eq!(r.orders.iter().filter(|o| !o.is_stop()).count(), 2,
+        "setting the stop must not touch the targets");
+}
 
     /// Break-even, as the user describes it: it went up, it came back to what
     /// it cost, get out flat.
