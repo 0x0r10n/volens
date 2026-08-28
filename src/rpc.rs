@@ -376,7 +376,20 @@ impl RpcClient {
     /// Raw token balance the `owner` holds of a specific `mint`, as
     /// `(amount_in_base_units, decimals)`. This is what an exit needs: Jupiter
     /// quotes on integer base units, and "sell 50%" must be computed on the
-    /// exact raw amount, never a lossy UI float. None if unreadable or zero.
+    /// exact raw amount, never a lossy UI float.
+    ///
+    /// `Some((0, _))` means the query SUCCEEDED and the owner holds none —
+    /// including the case where the token account has been closed. `None` means
+    /// the query itself failed and the balance is unknown.
+    ///
+    /// That distinction is load-bearing. This used to return `None` for both,
+    /// and the auto-sell sweep reads positions through it: a sold-out mint was
+    /// dropped from the sweep instead of arriving with `raw == 0`, so
+    /// `plan_exits` never saw it close and `ExitStateStore::forget` was never
+    /// called for it. The ladder for that position survived forever, and a
+    /// later re-entry into the same mint inherited it — take-profit rungs
+    /// already marked fired, and a trailing stop measuring from the PREVIOUS
+    /// position's peak. The re-entry was effectively unprotected.
     ///
     /// # Why this derives the address instead of asking for it
     ///
@@ -439,7 +452,73 @@ impl RpcClient {
                 decimals = d as u8;
             }
         }
-        (total > 0).then_some((total, decimals))
+        // Zero is an ANSWER, not a failure: see the note above. Every early
+        // return before this point is a genuine "could not read".
+        Some((total, decimals))
+    }
+
+    /// Raw balances for many mints in one batched read — the sweep's version of
+    /// `token_balance_raw`.
+    ///
+    /// Every requested mint gets an entry, `(0, 0)` when the owner holds none,
+    /// so a caller can tell a closed position from one it simply failed to
+    /// read. `None` means the QUERY failed, and the caller must treat that as
+    /// "unknown", never as "all positions closed".
+    ///
+    /// The sweep previously issued one `token_balance_raw` per mint through a
+    /// `join_all`. The cost-basis map is built from the audit log, which never
+    /// forgets a mint, so that fan-out grew by one concurrent request per token
+    /// ever traded, on every sweep, forever — against a provider already known
+    /// to refuse expensive reads. This collapses it into one request per 50
+    /// mints.
+    #[cfg(feature = "sniper")]
+    pub async fn token_balances_raw(
+        &self,
+        owner: &str,
+        mints: &[String],
+    ) -> Option<std::collections::HashMap<String, (u64, u8)>> {
+        if self.url.is_empty() {
+            return None;
+        }
+        let mut out = std::collections::HashMap::new();
+        if mints.is_empty() {
+            return Some(out);
+        }
+        use spl_associated_token_account_interface::address::
+            get_associated_token_address_with_program_id;
+        let owner_pk = crate::tx::pk(owner).ok()?;
+
+        // 50 mints per request: each contributes two candidate addresses (one
+        // per token program) and `getMultipleAccounts` caps at 100.
+        for chunk in mints.chunks(50) {
+            let mut asked: Vec<String> = Vec::with_capacity(chunk.len());
+            let mut addrs: Vec<String> = Vec::with_capacity(chunk.len() * 2);
+            for m in chunk {
+                let Ok(mint_pk) = crate::tx::pk(m) else { continue };
+                asked.push(m.clone());
+                for program in [&crate::tx::TOKEN_PROGRAM, &crate::tx::TOKEN_2022_PROGRAM] {
+                    addrs.push(
+                        get_associated_token_address_with_program_id(
+                            &owner_pk, &mint_pk, program,
+                        )
+                        .to_string(),
+                    );
+                }
+            }
+            if addrs.is_empty() {
+                continue;
+            }
+            let body = json!({
+                "jsonrpc":"2.0","id":1,"method":"getMultipleAccounts",
+                "params":[addrs, {"encoding":"jsonParsed","commitment": self.commitment}],
+            });
+            let resp: serde_json::Value = self
+                .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
+            // A failed QUERY is not an empty wallet: propagate it.
+            let accts = resp.get("result")?.get("value")?.as_array()?;
+            out.extend(parse_balance_batch(&asked, accts)?);
+        }
+        Some(out)
     }
 
     /// Total supply of a mint, in UI units. Used to detect LP burns: a supply
@@ -875,6 +954,105 @@ fn parse_mint_info(resp: &serde_json::Value) -> Option<MintInfo> {
     }
 
     Some(MintInfo { mint_authority, freeze_authority, decimals, risky_extensions })
+}
+
+/// Correlate a `getMultipleAccounts` reply back to the mints that were asked
+/// for, summing the two token-program candidates per mint.
+///
+/// Split out from the request so the index arithmetic is testable: the reply is
+/// POSITIONAL, entries `2i` and `2i+1` belonging to `asked[i]`, and getting that
+/// off by one would report one token's balance under another token's name — a
+/// sell sized against the wrong position.
+///
+/// A missing account is a present zero. `None` is reserved for a reply that does
+/// not line up with the request, which cannot be trusted to mean "holds none".
+#[cfg(feature = "sniper")]
+fn parse_balance_batch(
+    asked: &[String],
+    accts: &[serde_json::Value],
+) -> Option<std::collections::HashMap<String, (u64, u8)>> {
+    if accts.len() < asked.len() * 2 {
+        return None;
+    }
+    let mut out = std::collections::HashMap::with_capacity(asked.len());
+    for (i, mint) in asked.iter().enumerate() {
+        let mut total: u64 = 0;
+        let mut decimals: u8 = 0;
+        for slot in 0..2 {
+            let Some(ta) = accts[i * 2 + slot].pointer("/data/parsed/info/tokenAmount") else {
+                continue;
+            };
+            if let Some(a) =
+                ta.get("amount").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok())
+            {
+                total = total.saturating_add(a);
+            }
+            if let Some(d) = ta.get("decimals").and_then(|v| v.as_u64()) {
+                decimals = d as u8;
+            }
+        }
+        out.insert(mint.clone(), (total, decimals));
+    }
+    Some(out)
+}
+
+#[cfg(all(test, feature = "sniper"))]
+mod balance_batch_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn acct(amount: &str, decimals: u64) -> serde_json::Value {
+        json!({"data":{"parsed":{"info":{"tokenAmount":{"amount":amount,"decimals":decimals}}}}})
+    }
+
+    fn mints(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("mint{i}")).collect()
+    }
+
+    /// The case that caused the bug this function exists to prevent: an owner
+    /// who has sold out and had the token account closed. `getMultipleAccounts`
+    /// answers `null`, and that must arrive as a readable zero — the auto-sell
+    /// sweep needs `raw == 0` to notice the position closed and drop its ladder.
+    #[test]
+    fn a_closed_account_reads_as_zero_not_as_missing() {
+        let asked = mints(1);
+        let accts = vec![serde_json::Value::Null, serde_json::Value::Null];
+        let got = parse_balance_batch(&asked, &accts).expect("a null account is still an answer");
+        assert_eq!(got.get("mint0"), Some(&(0, 0)));
+    }
+
+    /// Positional correlation. Each mint must get ITS OWN balance: reading these
+    /// off by one would size a sell against another token's position.
+    #[test]
+    fn each_mint_gets_its_own_balance() {
+        let asked = mints(3);
+        let accts = vec![
+            acct("100", 6),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            acct("7", 9),
+        ];
+        let got = parse_balance_batch(&asked, &accts).unwrap();
+        assert_eq!(got.get("mint0"), Some(&(100, 6)));
+        assert_eq!(got.get("mint1"), Some(&(0, 0)), "the middle mint holds none");
+        // Held under Token-2022, which is the SECOND candidate address.
+        assert_eq!(got.get("mint2"), Some(&(7, 9)));
+    }
+
+    /// A reply shorter than the request is not evidence of an empty wallet.
+    /// Returning zeros here would tell the sweep every position had closed.
+    #[test]
+    fn a_short_reply_is_unknown_not_empty() {
+        let asked = mints(2);
+        assert!(parse_balance_batch(&asked, &[acct("1", 6)]).is_none());
+    }
+
+    #[test]
+    fn no_mints_is_an_empty_answer() {
+        assert!(parse_balance_batch(&[], &[]).unwrap().is_empty());
+    }
 }
 
 #[cfg(test)]

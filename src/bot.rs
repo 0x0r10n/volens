@@ -1471,6 +1471,9 @@ impl Bot {
         let Some((raw, decimals)) = rpc.token_balance_raw(&owner, mint).await else {
             return ("📭 <b>No balance of this token</b>".to_string(), back);
         };
+        if raw == 0 {
+            return ("📭 <b>No balance of this token</b>".to_string(), back);
+        }
         let held = raw as f64 / 10f64.powi(decimals as i32);
 
         let sym = match rpc.token_metadata(mint).await {

@@ -1480,8 +1480,6 @@ impl Sniper {
 
         // Cost basis counts only buys that truly moved funds, so a dry-run
         // rehearsal never produces a position the ladder would act on.
-        // Cost basis counts only buys that truly moved funds, so a dry-run
-        // rehearsal never produces a position the ladder would act on.
         let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.unwrap_or_default();
         let basis = crate::positions::cost_basis_from_audit(&audit);
 
@@ -1489,27 +1487,39 @@ impl Sniper {
         // JOIN — audit record to position to ladder — can be tested; that join
         // silently produced an empty list for smart-money buys, and no amount
         // of testing the rules alone would have found it.
-        // Balances read concurrently. They are independent RPC round trips at
-        // ~150ms of network RTT each, and doing them one at a time put the
-        // whole position list behind the slowest link before the ladder had
-        // even been consulted.
-        let owner_ref = owner.as_str();
-        let reads = basis.into_iter().map(|(mint, cost)| async move {
-            let (raw, decimals) = self.rpc.token_balance_raw(owner_ref, &mint).await?;
-            Some((mint, cost, raw, decimals))
-        });
-        let read = futures::future::join_all(reads).await;
+        //
+        // One batched read rather than a request per mint. The audit log never
+        // forgets a token, so the per-mint fan-out grew without bound and put
+        // the whole ladder behind an ever-larger burst of concurrent requests.
+        let mints: Vec<String> = basis.keys().cloned().collect();
+        let Some(balances) = self.rpc.token_balances_raw(&owner, &mints).await else {
+            // Fail CLOSED. An unreadable batch is "positions unknown", and the
+            // one thing that must never follow from it is treating every
+            // position as closed: that would call `forget` on each ladder and
+            // erase the peaks and fired rungs protecting live money.
+            warn!("could not read position balances — skipping this sweep");
+            return (0, 0);
+        };
 
         let mut holdings = Vec::new();
-        for (mint, cost, raw, decimals) in read.into_iter().flatten() {
+        for (mint, cost) in basis {
+            let (raw, decimals) = balances.get(&mint).copied().unwrap_or((0, 0));
             // The price we would REALIZE, not the market's median. See
             // `realizable_sol`. Expressed per whole token so the ladder's
             // arithmetic is unchanged: multiple = price * tokens / sol_spent
             // reduces exactly to realizable / sol_spent.
+            //
+            // Skipped entirely at zero: a closed position needs no price, and
+            // pricing every token ever traded would put a quote round trip per
+            // dead mint in front of every live stop-loss.
             let tokens = raw as f64 / 10f64.powi(decimals as i32);
-            let price_sol = match self.realizable_sol(&mint, raw, decimals as u32).await {
-                Some(sol) if tokens > 0.0 => Some(sol / tokens),
-                _ => None,
+            let price_sol = if raw == 0 {
+                None
+            } else {
+                match self.realizable_sol(&mint, raw, decimals as u32).await {
+                    Some(sol) if tokens > 0.0 => Some(sol / tokens),
+                    _ => None,
+                }
             };
             holdings.push(crate::exits::Holding {
                 mint,
@@ -2371,6 +2381,11 @@ impl Sniper {
         let Some((balance, _decimals)) = self.rpc.token_balance_raw(&owner, mint).await else {
             return SellOutcome::NoPosition { mint: mint.to_string() };
         };
+        // A readable zero is also no position — `token_balance_raw` now
+        // distinguishes that from an unreadable balance, and both land here.
+        if balance == 0 {
+            return SellOutcome::NoPosition { mint: mint.to_string() };
+        }
         let amount = fraction_of(balance, pct);
         if amount == 0 {
             return SellOutcome::Refused { reason: "computed sell amount is zero".into() };
