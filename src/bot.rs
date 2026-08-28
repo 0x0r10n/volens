@@ -704,6 +704,35 @@ impl Bot {
             return Some(self.tiers_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:addtier" {
+            return Some(self.add_tier_range_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("tiersz:") {
+            if let Some((lo, hi)) = rest.split_once(':')
+                && let (Ok(lo), Ok(hi)) = (lo.parse::<f64>(), hi.parse::<f64>())
+            {
+                return Some(self.add_tier_size_screen(lo, hi));
+            }
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(rest) = data.strip_prefix("tieradd:") {
+            let parts: Vec<&str> = rest.split(':').collect();
+            if let [lo, hi, sol] = parts[..]
+                && let (Ok(lo), Ok(hi), Ok(sol)) =
+                    (lo.parse::<f64>(), hi.parse::<f64>(), sol.parse::<f64>())
+            {
+                let res = self.sniper.as_ref().map(|sn| sn.add_buy_tier(lo, hi, sol));
+                let (t, k) = self.tiers_screen();
+                let banner = match res {
+                    Some(Ok(m)) => format!("✅ {}\n\n", escape_html(&m)),
+                    Some(Err(e)) => format!("⚠️ {}\n\n", escape_html(&e)),
+                    None => String::new(),
+                };
+                return Some((format!("{banner}{t}"), k));
+            }
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:buying" {
             return Some(self.buying_screen());
         }
@@ -1558,15 +1587,20 @@ impl Bot {
              Default size · <b>{} SOL</b>\n\
              MC bands · <b>{bands}</b>\n\
              Slippage · <b>{} bps</b>\n\
+             Max market cap · <b>{}</b>\n\
              Supply cap · <b>{cap}</b>\n\n\
-             <i>A token inside a market-cap band buys that band's amount; \
-             everything else uses the default. The supply cap trims a position \
-             back after the buy if it took too large a share of the token.</i>",
-            live.trade_size_sol, live.slippage_bps
+             <i>Max market cap refuses a token outright. Bands only choose the \
+             SIZE for tokens that pass it — a token inside a band buys that \
+             band's amount, everything else uses the default.</i>",
+            live.trade_size_sol,
+            live.slippage_bps,
+            fmt_usd_cap(live.max_market_cap_usd)
         );
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("💰 Default size · {} SOL", live.trade_size_sol),
               "callback_data": "set:size"}],
+            [{"text": format!("🏦 Max market cap · {}", fmt_usd_cap(live.max_market_cap_usd)),
+              "callback_data": "set:maxmcap"}],
             [{"text": format!("📊 Market-cap bands · {}", if live.buy_tiers.is_empty() {
                 "off".to_string() } else { live.buy_tiers.len().to_string() }),
               "callback_data": "set:tiers"}],
@@ -1623,7 +1657,6 @@ impl Bot {
         } else {
             live.max_trades_per_day.to_string()
         };
-        let cap = if live.supply_cap { fmt_supply_pct(live.max_supply_pct) } else { "off".into() };
         let text = format!(
             "🛡 <b>Limits</b>\n\n\
              Trades per day · <b>{trades}</b>\n\n\
@@ -1632,7 +1665,6 @@ impl Bot {
         );
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"}],
-            [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"}],
             [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
@@ -1709,7 +1741,7 @@ impl Bot {
             "stoploss" => ("stop loss", "e.g. <code>-15</code> (percent), 0 = none"),
             "takeprofit" => ("take profit", "e.g. <code>100</code> (percent), 0 = none"),
             "tpamount" => ("take-profit amount", "e.g. <code>50</code> (percent of the position)"),
-            "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
+            "smartsol" => ("smart-money volume", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
             "addtier" => (
@@ -1772,7 +1804,7 @@ impl Bot {
         let text = format!(
             "🤖 <b>Auto-buy</b>\n\n\
              Status · <b>{}</b>\n\
-             Smart SOL in · <b>{sol_s}</b>\n\n\
+             Smart volume · <b>{sol_s}</b>\n\n\
              <i>Buys once the tracked cohort has put this much SOL into a token \
              inside the {win}-minute window. Size is the signal — five wallets \
              at 0.05 SOL each is not the same conviction as two at 5 SOL, and a \
@@ -1786,7 +1818,7 @@ impl Bot {
              "callback_data": "setv:autobuy_on:toggle"}
         ])];
         rows.push(serde_json::json!([
-            {"text": format!("💸 Smart SOL in · {sol_s}"), "callback_data": "set:smartsol"},
+            {"text": format!("💸 Smart volume · {sol_s}"), "callback_data": "set:smartsol"},
         ]));
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
@@ -1825,12 +1857,84 @@ impl Bot {
             ]));
         }
         rows.push(serde_json::json!([
-            {"text": "➕ Add band", "callback_data": "ask:addtier"},
+            {"text": "➕ Add band", "callback_data": "set:addtier"},
             {"text": "♻️ Reset", "callback_data": "setv:cleartiers:1"},
         ]));
         rows.push(serde_json::json!([
             {"text": "💰 Default buy", "callback_data": "set:size"},
             {"text": "◀️ Back", "callback_data": "cmd:settings"},
+        ]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Step 1 of adding a band: pick the market-cap range.
+    ///
+    /// Two taps and no typing. The earlier version asked for "min max size" as
+    /// a typed line, which is three decisions crammed into one field with no
+    /// feedback until it is rejected — and a mistyped zero on a market cap is
+    /// an expensive mistake to discover afterwards.
+    #[cfg(feature = "sniper")]
+    fn add_tier_range_screen(&self) -> (String, serde_json::Value) {
+        // Contiguous by construction, so ranges built here never overlap.
+        const RANGES: &[(f64, f64)] = &[
+            (0.0, 50e3),
+            (50e3, 100e3),
+            (100e3, 250e3),
+            (250e3, 500e3),
+            (500e3, 1e6),
+            (1e6, 2e6),
+            (2e6, 5e6),
+            (5e6, 0.0),
+        ];
+        let text = "📊 <b>Add a band</b>\n\nPick the market-cap range.\n\n                    <i>Bands cannot overlap, so a range that clashes with one \
+                    you already have will be refused.</i>"
+            .to_string();
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let btns: Vec<serde_json::Value> = RANGES
+            .iter()
+            .map(|(lo, hi)| {
+                let t = crate::settings::BuyTier { min_usd: *lo, max_usd: *hi, sol: 1.0 };
+                serde_json::json!({
+                    "text": crate::settings::describe_tier(&t),
+                    "callback_data": format!("tiersz:{lo}:{hi}"),
+                })
+            })
+            .collect();
+        for chunk in btns.chunks(2) {
+            rows.push(serde_json::Value::Array(chunk.to_vec()));
+        }
+        rows.push(serde_json::json!([
+            {"text": "✏️ Custom range", "callback_data": "ask:addtier"},
+            {"text": "◀️ Back", "callback_data": "set:tiers"},
+        ]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Step 2: pick the buy size for the chosen range.
+    #[cfg(feature = "sniper")]
+    fn add_tier_size_screen(&self, lo: f64, hi: f64) -> (String, serde_json::Value) {
+        let t = crate::settings::BuyTier { min_usd: lo, max_usd: hi, sol: 1.0 };
+        let label = crate::settings::describe_tier(&t);
+        let text = format!(
+            "📊 <b>{}</b>\n\nHow much should a token in this range buy?",
+            escape_html(&label)
+        );
+        let sizes = [0.05f64, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 2.0];
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        let btns: Vec<serde_json::Value> = sizes
+            .iter()
+            .map(|sol| {
+                serde_json::json!({
+                    "text": format!("{sol} SOL"),
+                    "callback_data": format!("tieradd:{lo}:{hi}:{sol}"),
+                })
+            })
+            .collect();
+        for chunk in btns.chunks(4) {
+            rows.push(serde_json::Value::Array(chunk.to_vec()));
+        }
+        rows.push(serde_json::json!([
+            {"text": "◀️ Back", "callback_data": "set:addtier"},
         ]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
@@ -2211,7 +2315,7 @@ impl Bot {
                      large buy can take a share nobody will take back off you.",
                     fmt_supply_pct(live.max_supply_pct),
                     vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], "%", false),
-                "smartsol" => ("💸 Smart-money inflow",
+                "smartsol" => ("💸 Smart-money volume",
                     "SOL the tracked cohort must have put in, over the signal window. 0 = not required.",
                     if live.min_smart_sol_in <= 0.0 { "off".to_string() }
                     else { format!("{} SOL", live.min_smart_sol_in) },
@@ -3141,6 +3245,17 @@ fn parse_tier_args(raw: &str) -> Result<(f64, f64, f64), String> {
     Ok((lo, hi, sol))
 }
 
+/// A USD ceiling for a button: $75K, $2.5M, or off.
+fn fmt_usd_cap(v: f64) -> String {
+    match v {
+        v if v <= 0.0 => "off".into(),
+        v if v >= 1e9 => format!("${:.1}B", v / 1e9),
+        v if v >= 1e6 => format!("${:.1}M", v / 1e6),
+        v if v >= 1e3 => format!("${:.0}K", v / 1e3),
+        v => format!("${v:.0}"),
+    }
+}
+
 /// Share-of-supply for a button.
 fn fmt_supply_pct(v: f64) -> String {
     if v <= 0.0 { "off".into() } else { format!("{v}%") }
@@ -3561,8 +3676,11 @@ mod tests {
         // Spend caps are deliberately absent. Trade size bounds a single
         // entry, the wallet balance bounds the rest, and a screen of limits
         // nobody uses is noise. The commands still exist and still bind.
-        for gone in ["set:maxsize", "set:dailycap", "set:maxmcap",
-                     "set:maximpact", "set:mode"] {
+        // Max market cap IS tappable again: it refuses a token outright, which
+        // is a decision that belongs with the other buying decisions rather
+        // than in a config file. The rest stay off the screens — trade size
+        // bounds a single entry and the wallet balance bounds the rest.
+        for gone in ["set:maxsize", "set:dailycap", "set:maximpact", "set:mode"] {
             assert!(!reachable.contains(gone), "{gone} should not be tappable");
         }
 
@@ -3620,6 +3738,25 @@ mod tests {
         // The wallet threshold is GONE, not merely defaulted off: a disabled
         // knob is a thing to misconfigure later. SOL volume is the only trigger.
         assert!(!ab.contains("autobuy_min"), "the wallet threshold was removed");
+        assert!(ab.contains("set:smartsol"), "the SOL trigger must be on auto-buy");
+
+        // Adding a band is two taps, not a typed line: pick a range, pick a
+        // size. Three decisions crammed into one text field gave no feedback
+        // until the whole thing was rejected.
+        let rk = b.add_tier_range_screen().1.to_string();
+        assert!(rk.contains("tiersz:"), "no range buttons");
+        assert!(rk.contains("ask:addtier"), "custom entry must remain available");
+        let sk = b.add_tier_size_screen(50e3, 100e3).1.to_string();
+        assert!(sk.contains("tieradd:50000:100000:"), "no size buttons for the range");
+
+        // Max market cap is a ceiling that REFUSES, separate from the bands
+        // which only choose a size. Both live under Buying.
+        let bk = b.buying_screen().1.to_string();
+        assert!(bk.contains("set:maxmcap"), "no max market cap");
+        assert!(bk.contains("set:tiers"), "no market-cap bands");
+        assert!(bk.contains("set:supplycap"), "supply cap belongs under Buying");
+        let lk = b.limits_screen().1.to_string();
+        assert!(!lk.contains("set:supplycap"), "supply cap must not be under Limits");
         assert!(!ab.contains("cohort") && !ab.contains("group"), "cohorts must not be editable here");
 
         // The whole exit policy is reachable by tapping, nothing typed. The
