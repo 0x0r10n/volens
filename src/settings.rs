@@ -530,11 +530,27 @@ fn clamp(s: &mut LiveSettings, env: &Envelope) {
         s.curve_min_liquidity_sol = 0.0;
     }
     let max_size = tightest(s.max_trade_size_sol, env.max_trade_size_sol);
+    // Validity first, for the same reason as the Alpha amount below: NaN.min(x)
+    // is x, so clamping first would promote a nonsense size to the ceiling —
+    // the largest spend allowed — instead of disabling it.
+    if !s.trade_size_sol.is_finite() || s.trade_size_sol <= 0.0 {
+        s.trade_size_sol = 0.0;
+    }
     if max_size > 0.0 {
         s.trade_size_sol = s.trade_size_sol.min(max_size);
     }
-    if !s.trade_size_sol.is_finite() || s.trade_size_sol <= 0.0 {
-        s.trade_size_sol = 0.0;
+    // Alpha's amount lives under the same ceiling. Left unclamped, lowering the
+    // host limit would not shrink it — it would make every Alpha buy fail the
+    // size check instead, and an Alpha refusal is deliberately silent, so the
+    // mode would simply stop trading with nothing said.
+    // Validity BEFORE the ceiling: `f64::min` returns the other operand when
+    // one side is NaN, so clamping first would turn a nonsense value into the
+    // maximum permitted spend rather than into nothing.
+    if !s.alpha_buy_sol.is_finite() || s.alpha_buy_sol < 0.0 {
+        s.alpha_buy_sol = 0.0;
+    }
+    if max_size > 0.0 {
+        s.alpha_buy_sol = s.alpha_buy_sol.min(max_size);
     }
 }
 
@@ -864,6 +880,28 @@ mod tests {
         migrate_alpha_levels(&mut s);
         assert_eq!(s.alpha_exits.orders.len(), 1);
         assert_eq!(s.alpha_exits.orders[0].at_pct, 900);
+    }
+
+    /// Lowering the host ceiling must SHRINK the Alpha amount, not leave it
+    /// oversized. An oversized amount fails the size check on every buy, and an
+    /// Alpha refusal is silent — the mode would stop trading with nothing said.
+    #[test]
+    fn the_host_ceiling_shrinks_the_alpha_amount() {
+        let mut env = env();
+        env.max_trade_size_sol = 0.2;
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_buy_sol = 0.75;
+        clamp(&mut s, &env);
+        assert_eq!(s.alpha_buy_sol, 0.2, "clamped to the ceiling, not refused later");
+    }
+
+    #[test]
+    fn a_nonsense_alpha_amount_is_zeroed() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_buy_sol = f64::NAN;
+        clamp(&mut s, &env);
+        assert_eq!(s.alpha_buy_sol, 0.0);
     }
 
     /// A full Alpha ladder is carried through intact — this is the whole point

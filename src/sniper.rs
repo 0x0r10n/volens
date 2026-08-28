@@ -483,6 +483,18 @@ pub struct Sniper {
     /// channel in identical failures, which is how a real alert gets missed.
     /// The retry is right; announcing it every time is not.
     last_exit_failure: Mutex<std::collections::HashMap<String, String>>,
+    /// Mints proven to have no usable pump.fun bonding curve.
+    ///
+    /// The curve sell is tried before the quote API, and for a Raydium or
+    /// graduated token it costs a round trip to learn what it already learned
+    /// last time. The exit sweep runs every five seconds per position, so
+    /// without this every non-curve position pays that toll forever — on the
+    /// one path where latency actually costs money.
+    ///
+    /// Only PERMANENT answers are cached: the curve account does not exist, or
+    /// the curve has graduated. Neither reverts. A transient RPC failure is not
+    /// cached, because "I could not read it" is not "it is not there".
+    no_curve: Mutex<std::collections::HashSet<String>>,
     /// Mints whose liquidity was seen being pulled.
     ///
     /// # Why this exists
@@ -627,6 +639,7 @@ impl Sniper {
             routes: Arc::new(crate::routes::RouteStore::load(&routes_path)),
             unpriceable: Mutex::new(std::collections::HashSet::new()),
             last_exit_failure: Mutex::new(std::collections::HashMap::new()),
+            no_curve: Mutex::new(std::collections::HashSet::new()),
             rugged: Mutex::new(std::collections::HashSet::new()),
             rpc,
             submitter,
@@ -1531,8 +1544,18 @@ impl Sniper {
         state: &Arc<crate::exits::ExitStateStore>,
         alerter: &crate::alerts::Alerter,
     ) -> (usize, usize) {
-        let rules = self.settings.snapshot().exits;
-        if !rules.enabled || self.kill_switch_engaged() {
+        let live0 = self.settings.snapshot();
+        let rules = live0.exits.clone();
+        // EITHER lane being on is enough to run the sweep.
+        //
+        // Gating the whole sweep on the normal switch made "auto-sell off" also
+        // mean "Alpha exits off", silently and with no screen saying so — an
+        // Alpha position with a stop configured would have sat there
+        // unprotected. The two ladders are separate strategies; the switch that
+        // turns one off must not turn the other off with it.
+        let alpha_on =
+            live0.alpha_enabled && live0.alpha_exits.orders.iter().any(|o| o.is_armed());
+        if (!rules.enabled && !alpha_on) || self.kill_switch_engaged() {
             return (0, 0);
         }
         let Some(owner) = self.owner() else { return (0, 0) };
@@ -1684,7 +1707,13 @@ impl Sniper {
         let (mut sells, mut closed) =
             crate::exits::plan_exits(&rules, state, &normal_held, breakeven_buffer);
         if !alpha_held.is_empty() {
-            let arules = live.alpha_exit_rules(&rules);
+            let mut arules = live.alpha_exit_rules(&rules);
+            // Alpha's own ladder runs on Alpha's own switch. Without this the
+            // inherited `enabled` would come from the normal rules, and
+            // `plan_exits` returns nothing at all when that is off.
+            if alpha_on {
+                arules.enabled = true;
+            }
             let (a_sells, a_closed) =
                 crate::exits::plan_exits(&arules, state, &alpha_held, breakeven_buffer);
             sells.extend(a_sells);
@@ -1889,6 +1918,27 @@ impl Sniper {
                 "alpha buy amount cleared — alpha cannot trade until it is set".to_string()
             })
         })
+    }
+
+    /// Do we already hold an ALPHA position in this mint?
+    ///
+    /// The detector's per-mint guard is in-memory, so it is empty after a
+    /// restart and a qualifying wallet buying again would open a SECOND Alpha
+    /// position in a token already held. This is the check that survives a
+    /// restart, and it is deliberately narrow: it asks whether ALPHA opened
+    /// this position, so Alpha adding to one the normal trigger opened — which
+    /// is the intended overlap — is still allowed.
+    pub async fn already_alpha_holding(&self, mint: &str) -> bool {
+        let Some(owner) = self.owner() else { return false };
+        let Ok(audit) = tokio::fs::read_to_string(&self.cfg.audit_log).await else {
+            return false;
+        };
+        if !crate::positions::alpha_mints_from_audit(&audit).contains(mint) {
+            return false;
+        }
+        // Held only if there is still a balance: a closed Alpha position may be
+        // re-entered like any other.
+        matches!(self.rpc.token_balance_raw(&owner.to_string(), mint).await, Some((raw, _)) if raw > 0)
     }
 
     /// The wallets currently trusted with Alpha money.
@@ -2591,7 +2641,11 @@ impl Sniper {
         // seller, so there is no account to fund and nothing to rent. It needs
         // only the mint, which means it works for exactly the routed positions
         // that had no other direct path.
-        if let Some((pk_mint, pk_owner)) = crate::tx::pk(mint).ok().zip(crate::tx::pk(&owner).ok())
+        let curve_known_absent =
+            self.no_curve.lock().unwrap_or_else(|p| p.into_inner()).contains(mint);
+        if !curve_known_absent
+            && let Some((pk_mint, pk_owner)) =
+                crate::tx::pk(mint).ok().zip(crate::tx::pk(&owner).ok())
         {
             match crate::execute::build_pumpfun_sell(
                 &self.rpc,
@@ -2611,11 +2665,20 @@ impl Sniper {
                 // Expected for anything not on a live pump.fun curve — a
                 // graduated token, another venue. Logged at debug so a normal
                 // Raydium exit does not read as a failure.
-                Err(e) => debug!(
-                    %mint,
-                    error = %format!("{e:#}"),
-                    "no pump.fun curve for this mint; trying the quote API"
-                ),
+                Err(e) => {
+                    let why = format!("{e:#}");
+                    // Permanent facts only. "No curve account" and "graduated"
+                    // never become false again; anything else may simply be a
+                    // provider hiccup, and caching that would permanently
+                    // disable the cheapest exit this bot has.
+                    if why.contains("no pump.fun bonding curve") || why.contains("is complete") {
+                        self.no_curve
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(mint.to_string());
+                    }
+                    debug!(%mint, error = %why, "no pump.fun curve; trying the quote API");
+                }
             }
         }
 

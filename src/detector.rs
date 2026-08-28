@@ -1068,6 +1068,11 @@ impl Detector {
                 return;
             }
         }
+        // Survives a restart, unlike the set above. See `already_alpha_holding`.
+        if self.sniper.already_alpha_holding(mint).await {
+            info!(%mint, "alpha already holds this token — not opening a second position");
+            return;
+        }
         let label = self
             .wallets
             .get(wallet)

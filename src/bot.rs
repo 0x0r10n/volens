@@ -2129,7 +2129,7 @@ impl Bot {
             "⭐ <b>Alpha</b> · {onoff}\n\n\
              Buy amount  <b>{amt_s}</b>\n\
              Orders      <b>{}</b>",
-            crate::exits::describe(&live.alpha_exits)
+            crate::exits::describe_orders(&live.alpha_exits)
         );
         if live.alpha_enabled && live.alpha_buy_sol <= 0.0 {
             text.push_str("\n\n⚠️ Set a buy amount.");

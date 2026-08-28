@@ -347,6 +347,16 @@ pub fn describe(rules: &ExitRules) -> String {
     if !rules.enabled {
         return "off".into();
     }
+    describe_orders(rules)
+}
+
+/// The same summary, WITHOUT consulting `enabled`.
+///
+/// Alpha's ladder is switched on by `alpha_enabled`, not by the `enabled` flag
+/// inside its own rules — that one is inherited from the normal lane when the
+/// exits are actually built. Summarising Alpha through `describe` therefore
+/// read "off" no matter how many orders were configured.
+pub fn describe_orders(rules: &ExitRules) -> String {
     let armed = rules.orders.iter().filter(|o| o.is_armed()).count();
     if armed == 0 && rules.trailing_pct == 0 {
         // Enabled with nothing configured does nothing, and should read as
@@ -682,6 +692,24 @@ mod tests {
         assert!(sells.is_empty());
     }
     use super::*;
+
+    /// Alpha's ladder is switched on elsewhere, so its summary must not consult
+    /// the `enabled` flag. This read "off" on a fully configured Alpha ladder.
+    #[test]
+    fn an_alpha_ladder_summary_ignores_the_inherited_switch() {
+        let rules = ExitRules {
+            enabled: false,
+            orders: vec![
+                SellOrder { at_pct: -15, amount_pct: 100 },
+                SellOrder { at_pct: 250, amount_pct: 100 },
+            ],
+            trailing_pct: 0,
+            exit_on_liquidity_pull: true,
+            breakeven: false,
+        };
+        assert_eq!(describe(&rules), "off", "the normal summary still respects it");
+        assert_eq!(describe_orders(&rules), "2 orders", "alpha's does not");
+    }
 
     fn rules() -> ExitRules {
         ExitRules { enabled: true, ..Default::default() }
