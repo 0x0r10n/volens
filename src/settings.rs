@@ -144,6 +144,17 @@ pub struct LiveSettings {
     /// buy — an independent trigger is not an independent spending limit.
     #[serde(default)]
     pub alpha_buy_sol: f64,
+    /// Alpha's single take-profit and stop, as they were BEFORE the ladder.
+    ///
+    /// Deserialize-only, and migrated into `alpha_exits` on load. A settings
+    /// file written by the previous build carries the levels the operator
+    /// actually set, and dropping them on upgrade would quietly leave Alpha
+    /// running with no exits of its own.
+    #[serde(default, skip_serializing)]
+    pub alpha_tp_pct: i32,
+    #[serde(default, skip_serializing)]
+    pub alpha_sl_pct: i32,
+
     /// Exit orders for ALPHA positions — a full ladder of its own.
     ///
     /// Not a single take-profit and stop. Alpha is the higher-conviction
@@ -154,7 +165,7 @@ pub struct LiveSettings {
     ///
     /// Completely separate from `exits`. The two triggers enter on different
     /// evidence and are meant to be managed on different terms.
-    #[serde(default)]
+    #[serde(default = "alpha_exits_default")]
     pub alpha_exits: crate::exits::ExitRules,
 
     /// Enforce the supply-share ceiling. Separate from the percentage so the
@@ -338,7 +349,9 @@ impl LiveSettings {
             buy_tiers: Vec::new(),
             alpha_enabled: false,
             alpha_buy_sol: 0.0,
-            alpha_exits: crate::exits::ExitRules::default(),
+            alpha_tp_pct: 0,
+            alpha_sl_pct: 0,
+            alpha_exits: alpha_exits_default(),
             supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
@@ -441,6 +454,7 @@ impl SettingsStore {
             },
             Err(_) => defaults,
         };
+        migrate_alpha_levels(&mut settings);
         clamp(&mut settings, &env);
         Self { path: path.to_string(), env, inner: Mutex::new(settings) }
     }
@@ -822,6 +836,36 @@ mod tests {
         assert_eq!(s.rules(Lane::Alpha).orders[0].at_pct, 300);
     }
 
+    /// Upgrading must not silently discard the Alpha levels already set. The
+    /// live bot was running +250% / -15% when the ladder replaced them.
+    #[test]
+    fn a_pre_ladder_alpha_config_is_migrated_into_orders() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_tp_pct = 250;
+        s.alpha_sl_pct = 15;
+        migrate_alpha_levels(&mut s);
+
+        let o = &s.alpha_exits.orders;
+        assert_eq!(o.len(), 2);
+        assert!(o.iter().any(|o| o.at_pct == -15 && o.amount_pct == 100), "the stop survives");
+        assert!(o.iter().any(|o| o.at_pct == 250 && o.amount_pct == 100), "and the target");
+        assert_eq!(s.alpha_tp_pct, 0, "and the legacy fields are cleared");
+    }
+
+    /// A ladder the operator has already built wins — a stale single level
+    /// must never overwrite real orders.
+    #[test]
+    fn migration_does_not_touch_an_existing_ladder() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.alpha_tp_pct = 250;
+        s.alpha_exits.orders = vec![crate::exits::SellOrder { at_pct: 900, amount_pct: 10 }];
+        migrate_alpha_levels(&mut s);
+        assert_eq!(s.alpha_exits.orders.len(), 1);
+        assert_eq!(s.alpha_exits.orders[0].at_pct, 900);
+    }
+
     /// A full Alpha ladder is carried through intact — this is the whole point
     /// of the rebuild: Alpha takes profit in rungs like the normal one.
     #[test]
@@ -840,6 +884,39 @@ mod tests {
         assert_eq!(r.trailing_pct, 35, "and alpha's own trailing stop");
         assert!(r.exit_on_liquidity_pull, "while safety behaviour is still inherited");
     }
+}
+
+/// Alpha starts with NO orders of its own.
+///
+/// `ExitRules::default()` carries the five-rung ladder the normal lane ships
+/// with, and inheriting that here would mean Alpha silently traded a strategy
+/// nobody chose for it — while the screen said it was unconfigured. Empty is
+/// honest: `alpha_exit_rules` falls back to the normal ladder and says so,
+/// until the operator builds one.
+fn alpha_exits_default() -> crate::exits::ExitRules {
+    crate::exits::ExitRules { orders: Vec::new(), ..Default::default() }
+}
+
+/// Carry a pre-ladder Alpha configuration into the order list.
+///
+/// Only when the ladder is empty: once the operator has set real orders, the
+/// old single levels are stale and must not overwrite them.
+fn migrate_alpha_levels(s: &mut LiveSettings) {
+    if s.alpha_exits.orders.iter().any(|o| o.is_armed()) {
+        return;
+    }
+    if s.alpha_sl_pct > 0 {
+        s.alpha_exits
+            .orders
+            .push(crate::exits::SellOrder { at_pct: -s.alpha_sl_pct, amount_pct: 100 });
+    }
+    if s.alpha_tp_pct > 0 {
+        s.alpha_exits
+            .orders
+            .push(crate::exits::SellOrder { at_pct: s.alpha_tp_pct, amount_pct: 100 });
+    }
+    s.alpha_tp_pct = 0;
+    s.alpha_sl_pct = 0;
 }
 
 /// A band as a reader would say it: "$50K–$100K".
