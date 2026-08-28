@@ -1515,7 +1515,7 @@ impl Bot {
             let live = sniper.live();
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
-                format!("on · {} buyers", live.effective_auto_buy_min(&env))
+                format!("on · {} SOL", live.min_smart_sol_in)
             } else {
                 "off".to_string()
             };
@@ -1767,26 +1767,16 @@ impl Bot {
         let env = sniper.envelope();
         let active = live.auto_buy_active(&env);
         let need_sol = live.min_smart_sol_in;
-        let need_wallets = live.auto_buy_min_wallets;
 
         let sol_s = if need_sol > 0.0 { format!("{need_sol} SOL") } else { "not set".into() };
-        let w_s = if need_wallets == 0 {
-            "off".to_string()
-        } else {
-            format!("{need_wallets}+")
-        };
         let text = format!(
             "🤖 <b>Auto-buy</b>\n\n\
              Status · <b>{}</b>\n\
-             Smart SOL in · <b>{sol_s}</b>\n\
-             Min wallets · <b>{w_s}</b>\n\n\
+             Smart SOL in · <b>{sol_s}</b>\n\n\
              <i>Buys once the tracked cohort has put this much SOL into a token \
              inside the {win}-minute window. Size is the signal — five wallets \
              at 0.05 SOL each is not the same conviction as two at 5 SOL, and a \
-             headcount cannot tell them apart.</i>\n\n\
-             <i>Min wallets is an optional second condition, not the trigger. \
-             Set it to off unless you want to refuse a single large buy that \
-             nobody else corroborated.</i>",
+             headcount cannot tell them apart.</i>",
             if active { "🟢 on" } else { "⚪ off" },
             win = self.track_for_secs.max(60) / 60,
         );
@@ -1798,19 +1788,6 @@ impl Bot {
         rows.push(serde_json::json!([
             {"text": format!("💸 Smart SOL in · {sol_s}"), "callback_data": "set:smartsol"},
         ]));
-        // Labelled as BUYERS, not wallets: sitting next to a wallet-management
-        // screen, "4 wallets" read as picking which wallets to trade from.
-        let opts: Vec<serde_json::Value> = [0usize, 1, 2, 3, 4, 5]
-            .iter()
-            .map(|n| serde_json::json!({
-                "text": format!("{}{}", if *n == need_wallets { "✓ " } else { "" },
-                                if *n == 0 { "off".to_string() } else { format!("{n} buyers") }),
-                "callback_data": format!("setv:autobuy_min:{n}"),
-            }))
-            .collect();
-        for chunk in opts.chunks(3) {
-            rows.push(serde_json::Value::Array(chunk.to_vec()));
-        }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
@@ -2134,7 +2111,6 @@ impl Bot {
             "cleartiers" => (sniper.clear_buy_tiers(), "tiers".into()),
             "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
             "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
-            "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "exits".into()),
             "delorder" => (sniper.remove_order(value.parse().ok()?), "exits".into()),
@@ -3550,7 +3526,7 @@ mod tests {
         sc.enabled = true;
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
         let sn2 = sniper.clone();
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
@@ -3641,7 +3617,9 @@ mod tests {
         for gone in ["set:accel", "set:smartshare", "set:volwindow"] {
             assert!(!vk.contains(gone), "{gone} was cut from the design");
         }
-        assert!(ab.contains("setv:autobuy_min:"), "no wallet threshold");
+        // The wallet threshold is GONE, not merely defaulted off: a disabled
+        // knob is a thing to misconfigure later. SOL volume is the only trigger.
+        assert!(!ab.contains("autobuy_min"), "the wallet threshold was removed");
         assert!(!ab.contains("cohort") && !ab.contains("group"), "cohorts must not be editable here");
 
         // The whole exit policy is reachable by tapping, nothing typed. The
@@ -3686,7 +3664,7 @@ mod tests {
         sc.slippage_bps = 300;
         sc.max_trade_size_sol = 0.1;
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         // Slippage is now the operator's call in both directions.
@@ -3711,7 +3689,7 @@ mod tests {
         sc.enabled = true;
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc, &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
 
         b.ask_screen(1, "size");
@@ -3774,7 +3752,7 @@ mod tests {
         sc.settings_path = String::new();
         sc.sell_routes_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
         let b = bot(&["1"], "").unwrap().with_sniper(sniper).with_rpc(rpc);
 
         let mint = "AByynfTALEVQFkE3i52oiSbJNDV61PzrXMNffX4pump";
@@ -4297,7 +4275,7 @@ mod tests {
         // Never let a test write the operator's real settings file.
         sc.settings_path = String::new();
         let rpc = Arc::new(crate::rpc::RpcClient::new(&RpcConfig::default()));
-        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new()), 4).unwrap());
+        let sniper = Arc::new(crate::sniper::Sniper::new(sc, rpc.clone(), &RpcConfig::default(), std::sync::Arc::new(crate::prices::PriceIndex::new())).unwrap());
 
         let b = bot(&["1"], "").unwrap().with_sniper(sniper);
         let (msg, kb) = b.settings_screen();

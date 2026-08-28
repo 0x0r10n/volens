@@ -82,10 +82,6 @@ pub struct LiveSettings {
     /// and is never enabled by anything but a deliberate tap.
     #[serde(default)]
     pub auto_buy: bool,
-    /// Distinct eligible buyers required before buying. 0 = use the config
-    /// default.
-    #[serde(default)]
-    pub auto_buy_min_wallets: usize,
 
     /// Buy size by market-cap band. Empty = always use `trade_size_sol`.
     ///
@@ -186,8 +182,6 @@ impl BuyTier {
 /// The config-side ceilings this process may never exceed.
 #[derive(Debug, Clone, Copy)]
 pub struct Envelope {
-    /// Starting value for the buyer threshold, used until one is set.
-    pub auto_buy_min_wallets: usize,
     pub max_trade_size_sol: f64,
     pub daily_cap_sol: f64,
     pub max_trades_per_day: u32,
@@ -259,15 +253,6 @@ impl LiveSettings {
         self.auto_buy
     }
 
-    /// Buyers required. Falls back to the config value until one is chosen.
-    pub fn effective_auto_buy_min(&self, env: &Envelope) -> usize {
-        if self.auto_buy_min_wallets > 0 {
-            self.auto_buy_min_wallets
-        } else {
-            env.auto_buy_min_wallets.max(2)
-        }
-    }
-
     /// Start from config: live values equal the envelope, capping nothing
     /// further, so behaviour before any command matches the file on disk.
     pub fn from_envelope(
@@ -288,7 +273,6 @@ impl LiveSettings {
             max_price_impact_bps: 0,
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
-            auto_buy_min_wallets: 0,
             buy_tiers: Vec::new(),
             supply_cap: false,
             max_supply_pct: 0.0,
@@ -433,7 +417,6 @@ mod tests {
 
     fn env() -> Envelope {
         Envelope {
-            auto_buy_min_wallets: 4,
             max_trade_size_sol: 1.0,
             daily_cap_sol: 5.0,
             max_trades_per_day: 10,
@@ -468,19 +451,6 @@ mod tests {
         let reloaded = SettingsStore::load(&p, env(), live());
         assert!(reloaded.snapshot().auto_buy_active(&env()), "must survive a restart");
         let _ = std::fs::remove_file(&p);
-    }
-
-    /// The threshold falls back to config until one is chosen, then the choice
-    /// stands — in either direction.
-    #[test]
-    fn the_buyer_threshold_is_the_operators_choice() {
-        let e = env();
-        let mut s = live();
-        assert_eq!(s.effective_auto_buy_min(&e), 4, "config default until set");
-        s.auto_buy_min_wallets = 8;
-        assert_eq!(s.effective_auto_buy_min(&e), 8);
-        s.auto_buy_min_wallets = 2;
-        assert_eq!(s.effective_auto_buy_min(&e), 2, "lowering is the operator's call");
     }
 
     /// 0 means "this tier sets no cap", so the other tier decides. It must

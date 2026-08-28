@@ -523,7 +523,6 @@ impl Sniper {
         // From `[tracked]`: the starting buyer threshold. Passed in rather than
         // read from `SniperConfig` because the trigger lives in the tracked
         // section.
-        auto_buy_min_wallets: usize,
     ) -> Result<Self> {
         // max_trade_size_sol == 0 means "no per-trade ceiling" (unlimited).
         // Only enforce the ceiling when one is actually configured.
@@ -580,7 +579,6 @@ impl Sniper {
             )
         })?;
         let envelope = Envelope {
-            auto_buy_min_wallets,
             max_trade_size_sol: cfg.max_trade_size_sol,
             daily_cap_sol: cfg.daily_cap_sol,
             max_trades_per_day: cfg.max_trades_per_day,
@@ -1811,7 +1809,11 @@ impl Sniper {
         self.settings.update(|s| {
             s.auto_buy = !s.auto_buy;
             Ok(if s.auto_buy {
-                format!("auto-buy ON — triggers on {} buyers", s.effective_auto_buy_min(&env))
+                if s.min_smart_sol_in > 0.0 {
+                    format!("auto-buy ON — triggers at {} SOL of tracked buying", s.min_smart_sol_in)
+                } else {
+                    "auto-buy ON — set a smart-SOL threshold for it to fire".to_string()
+                }
             } else {
                 "auto-buy OFF — signals still alert, nothing is bought".to_string()
             })
@@ -1819,17 +1821,6 @@ impl Sniper {
     }
 
     /// How many distinct tracked wallets must buy before we do.
-    pub fn set_auto_buy_min(&self, n: usize) -> Result<String, String> {
-        let env = self.settings.envelope();
-        if !(2..=20).contains(&n) {
-            return Err("between 2 and 20 buyers".into());
-        }
-        self.settings.update(|s| {
-            s.auto_buy_min_wallets = n;
-            Ok(format!("auto-buy triggers on {} buyers", s.effective_auto_buy_min(&env)))
-        })
-    }
-
     /// Turn the whole exit policy on or off.
     pub fn toggle_exits(&self) -> Result<String, String> {
         self.settings.update(|s| {
@@ -2859,7 +2850,6 @@ mod tests {
             Arc::new(RpcClient::new(&rpc_cfg)),
             &rpc_cfg,
             Arc::new(crate::prices::PriceIndex::new()),
-            4,
         )
     }
 

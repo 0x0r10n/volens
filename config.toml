@@ -283,7 +283,6 @@ auto_buy_groups = ["Main"]
 # Distinct buyers FROM THOSE COHORTS before buying. Higher than the alert
 # threshold on purpose: an alert costs a notification, a buy costs money.
 # Also settable from Telegram; this is the default until one is chosen.
-auto_buy_min_wallets = 4
 window_secs = 600
 # Minimum SOL a wallet must spend for a buy to count. Not 0: every signer pays
 # a transaction fee, so zero would count any tracked wallet that merely signed

@@ -67,11 +67,6 @@ pub struct TrackedConfig {
     /// trade this market. Both still alert and still generate scoring data.
     #[serde(default)]
     pub auto_buy_groups: Vec<String>,
-    /// Distinct wallets FROM THOSE COHORTS required before buying. Deliberately
-    /// higher than the alert threshold: an alert costs a notification, a buy
-    /// costs money.
-    #[serde(default = "default_auto_buy_min")]
-    pub auto_buy_min_wallets: usize,
     #[serde(default = "default_conviction_window")]
     pub window_secs: u64,
     /// Minimum SOL a wallet must spend for the buy to count. Every signer pays
@@ -208,7 +203,6 @@ fn default_update_multiples() -> Vec<f64> {
     ]
 }
 
-fn default_auto_buy_min() -> usize { 4 }
 fn default_conviction_threshold() -> usize {
     3
 }
@@ -230,7 +224,6 @@ impl Default for TrackedConfig {
             conviction_threshold: default_conviction_threshold(),
             auto_buy: false,
             auto_buy_groups: Vec::new(),
-            auto_buy_min_wallets: default_auto_buy_min(),
             window_secs: default_conviction_window(),
             min_buy_sol: default_min_buy_sol(),
             log_all_buys: true,

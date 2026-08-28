@@ -92,7 +92,6 @@ impl Detector {
             rpc.clone(),
             &cfg.rpc,
             prices.clone(),
-            cfg.tracked.auto_buy_min_wallets,
         )?);
 
         // Load the tracked-wallet list up front so a bad path is a startup
@@ -110,7 +109,6 @@ impl Detector {
                 wallets = book.len(),
                 auto_buy = cfg.tracked.auto_buy,
                 auto_buy_eligible = eligible,
-                auto_buy_min = cfg.tracked.auto_buy_min_wallets,
                 cohorts = ?groups,
                 path = %path,
                 "tracked wallets loaded"
@@ -912,12 +910,11 @@ impl Detector {
                     // 5 SOL. Conviction is expressed in size, not in headcount,
                     // and the count cannot tell those apart.
                     //
-                    // The wallet floor survives as an optional SECONDARY
-                    // condition — useful for refusing a single large buy that
-                    // nobody else corroborated — but it is no longer what
-                    // decides an entry. 0 disables it.
+                    // There is no wallet condition at all. It was removed
+                    // rather than defaulted off: a threshold that exists but is
+                    // disabled is a thing to misconfigure later, and the count
+                    // is still logged, so nothing observable is lost.
                     let need_sol = live.min_smart_sol_in;
-                    let need_wallets = live.auto_buy_min_wallets;
                     let (eligible, smart_sol) = {
                         let tracker = match self.conviction.lock() {
                             Ok(t) => t,
@@ -934,8 +931,10 @@ impl Detector {
                         (wallets, tracker.sol_in_window(&buy.mint, now))
                     };
 
-                    let sol_ok = need_sol <= 0.0 || smart_sol >= need_sol;
-                    let wallets_ok = need_wallets == 0 || eligible.len() >= need_wallets;
+                    // A threshold of 0 means "not configured", NOT "buy
+                    // everything": auto-buy with no trigger set must do nothing
+                    // rather than fire on the first tracked buy of any token.
+                    let sol_ok = need_sol > 0.0 && smart_sol >= need_sol;
 
                     // Logged for anything at least halfway to the threshold.
                     // "No trades" and "nothing strong enough" look identical
@@ -947,14 +946,11 @@ impl Detector {
                             smart_sol,
                             need_sol,
                             wallets = eligible.len(),
-                            need_wallets,
-                            sol_ok,
-                            wallets_ok,
                             "auto-buy progress"
                         );
                     }
 
-                    if sol_ok && wallets_ok {
+                    if sol_ok {
                         // Token-volume confirmation, unchanged in spirit: it
                         // can only ever BLOCK a signal the trigger admitted.
                         let passed = if live.volume_mode && live.min_token_volume_sol > 0.0 {
