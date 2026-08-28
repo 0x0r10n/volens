@@ -87,25 +87,34 @@ pub struct LiveSettings {
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
 
+    /// Enforce the supply-share ceiling. Separate from the percentage so the
+    /// rule can be switched off without losing the number you tuned.
+    #[serde(default)]
+    pub supply_cap: bool,
     /// Most of a token's total supply one position may hold, as a percent.
-    /// 0 = no limit.
     ///
-    /// # Why this matters more as the trade size grows
     ///
-    /// On an early token the supply is small and the curve is thin, so a fixed
-    /// SOL size buys a wildly varying SHARE of it. At 0.01 SOL that share is
-    /// negligible; at 0.5 SOL the same trade can take a double-digit percentage
-    /// of everything that exists.
+    /// # A ceiling on the POSITION, not on the buy
     ///
-    /// A position that large cannot be exited: selling it moves the price
-    /// against itself the whole way down, and there is nobody on the other side
-    /// for a fifth of the supply. Price impact catches some of this and misses
-    /// the rest, because impact measures the pool while this measures the
-    /// token.
+    /// The buy always executes at its configured size — nothing here resizes
+    /// it. Afterwards, the wallet's actual holding is measured against the
+    /// token's supply, and any excess is sold back off.
     ///
-    /// The trade is SIZED DOWN to fit rather than refused — a smaller position
-    /// in a token the cohort is buying beats no position, and the point is to
-    /// bound the holding, not to skip the trade.
+    /// Enforced after the fill rather than before it because a quote is a
+    /// prediction and a fill is a fact. Sizing the buy down from a quote leaves
+    /// the position wherever the fill landed; measuring what was actually
+    /// received is the only version that holds the line.
+    ///
+    /// # Why it matters as the trade size grows
+    ///
+    /// On an early token a fixed SOL size buys a wildly varying SHARE of the
+    /// supply. At 0.01 SOL that share is negligible; at 0.5 SOL the same trade
+    /// can take a double-digit percentage of everything that exists — a
+    /// position that cannot be exited, because selling it moves the price the
+    /// whole way down and nobody is bidding for a fifth of the token.
+    ///
+    /// Price impact does not catch this: impact measures the POOL, this
+    /// measures the TOKEN.
     #[serde(default)]
     pub max_supply_pct: f64,
 
@@ -200,6 +209,7 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             auto_buy_min_wallets: 0,
+            supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
             min_smart_sol_in: 0.0,

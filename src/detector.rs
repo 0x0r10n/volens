@@ -1071,6 +1071,14 @@ impl Detector {
         if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome, entry_mcap) {
             self.alerter.send_html(msg).await;
         }
+
+        // PRIMARY supply-ceiling enforcement: right after the fill, on the
+        // real balance. The sweep repeats this as a fallback, but doing it here
+        // means an oversized position is trimmed in seconds rather than
+        // whenever the next reconciliation happens to come round.
+        if opened {
+            self.sniper.enforce_supply_cap(mint, &self.alerter).await;
+        }
     }
 
     /// Where the trade record lives, for marking leaderboard rows.

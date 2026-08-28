@@ -671,6 +671,10 @@ impl Bot {
             return Some(self.volume_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:supplycap" {
+            return Some(self.supply_cap_screen());
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:exits" {
             return Some(self.exits_screen());
         }
@@ -1483,8 +1487,9 @@ impl Bot {
                  "callback_data": "set:maxtrades"},
                 {"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
                  "callback_data": "set:volume"},
-                {"text": format!("🪙 Max supply · {}", fmt_supply_pct(live.max_supply_pct)),
-                 "callback_data": "set:maxsupply"},
+                {"text": format!("🪙 Supply cap · {}", if live.supply_cap {
+                    fmt_supply_pct(live.max_supply_pct) } else { "off".to_string() }),
+                 "callback_data": "set:supplycap"},
             ]));
             let env = sniper.envelope();
             let ab = if live.auto_buy_active(&env) {
@@ -1647,6 +1652,35 @@ impl Bot {
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// The supply-share ceiling: a toggle and a percentage.
+    #[cfg(feature = "sniper")]
+    fn supply_cap_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let on = live.supply_cap;
+        let pct = live.max_supply_pct;
+
+        let text = format!(
+            "🪙 <b>Supply cap</b>\n\nStatus: <b>{}</b>\nCeiling: <b>{}</b>\n\n             <i>Buys always execute at their configured size. Afterwards the \
+             position is measured against the token's total supply, and only \
+             the EXCESS is sold — a position at or under the ceiling is left \
+             alone. Checked right after each buy, and again on every \
+             reconciliation sweep as a fallback.</i>",
+            if on { "🟢 on" } else { "⚪ off" },
+            if pct > 0.0 { format!("{pct}% of supply") } else { "not set".into() },
+        );
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": if on { "🟢 On — tap to disable" } else { "⚪ Off — tap to enable" },
+              "callback_data": "setv:supplycap_on:toggle"}],
+            [{"text": format!("📐 Ceiling · {}", fmt_supply_pct(pct)),
+              "callback_data": "set:maxsupply"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
     }
 
     /// Volume confirmation: smart money must be corroborated by real flow.
@@ -1890,6 +1924,7 @@ impl Bot {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
             "autobuy_on" => (sniper.toggle_auto_buy(), "autobuy".into()),
             "volume_on" => (sniper.toggle_volume_mode(), "volume".into()),
+            "supplycap_on" => (sniper.toggle_supply_cap(), "supplycap".into()),
             "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
             "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
@@ -1914,6 +1949,8 @@ impl Bot {
             self.autobuy_screen()
         } else if screen == "volume" {
             self.volume_screen()
+        } else if screen == "supplycap" {
+            self.supply_cap_screen()
         } else {
             self.exits_screen()
         };
@@ -1981,11 +2018,11 @@ impl Bot {
                     "How much of the position the take-profit sells.",
                     format!("{}%", live.exits.target().1),
                     vec![25.0, 50.0, 75.0, 100.0], "%", false),
-                "maxsupply" => ("🪙 Max share of supply",
-                    "Most of a token's supply one position may hold. The trade is \
-                     SIZED DOWN to fit rather than skipped. Matters as the trade \
-                     size grows: on an early token a large buy can take a share \
-                     nobody will take back off you. 0 = no limit.",
+                "maxsupply" => ("📐 Supply ceiling",
+                    "Most of a token's supply one position may hold. Enforced AFTER \
+                     the buy: only the excess is sold, and the buy itself is never \
+                     resized. Matters as the trade size grows — on an early token a \
+                     large buy can take a share nobody will take back off you.",
                     fmt_supply_pct(live.max_supply_pct),
                     vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], "%", false),
                 "smartsol" => ("💸 Smart-money inflow",

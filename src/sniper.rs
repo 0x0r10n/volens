@@ -983,13 +983,12 @@ impl Sniper {
         let lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let max_mcap = live.effective_max_market_cap(&env);
-        let max_supply_pct = live.max_supply_pct;
         let (mint_info, quote, supply) = tokio::join!(
             self.rpc.mint_info(mint),
             jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps),
             // Fetched when EITHER guard needs it, and not otherwise.
             async {
-                if max_mcap > 0.0 || max_supply_pct > 0.0 {
+                if max_mcap > 0.0 {
                     self.rpc.token_supply(mint).await
                 } else {
                     None
@@ -1019,49 +1018,6 @@ impl Sniper {
                 return BuyOutcome::Refused { reason: "could not verify the mint".into() };
             }
         };
-
-        // SUPPLY SHARE. Bound how much of the token this position may hold.
-        //
-        // Sized down rather than refused: the aim is to bound the holding, not
-        // to skip a token the cohort is buying. Only ever shrinks the trade.
-        //
-        // Fails CLOSED when the limit is on and the supply cannot be read — the
-        // whole point is that we do not know how large a share we are taking,
-        // and that is precisely the state this guard exists to prevent.
-        let mut size = size;
-        if max_supply_pct > 0.0 {
-            let Some(total_supply) = supply else {
-                return BuyOutcome::Refused {
-                    reason: "token supply unreadable — cannot bound the supply share".into(),
-                };
-            };
-            let cap_tokens = total_supply * max_supply_pct / 100.0;
-            let would_get = match &quote {
-                Ok(q) => q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32),
-                Err(_) => 0.0,
-            };
-            if would_get > cap_tokens && would_get > 0.0 {
-                // Tokens scale close to linearly with SOL at these sizes, so
-                // one proportional step lands well inside the cap. The 2%
-                // margin absorbs the curve's convexity rather than re-quoting
-                // in a loop for a bound that does not need to be exact.
-                let scaled = size * (cap_tokens / would_get) * 0.98;
-                let share = 100.0 * would_get / total_supply;
-                if scaled < MIN_TRADE_SOL {
-                    return BuyOutcome::Refused {
-                        reason: format!(
-                            "{size} SOL would take {share:.2}% of supply; \
-                             staying under {max_supply_pct}% needs less than {MIN_TRADE_SOL} SOL"
-                        ),
-                    };
-                }
-                warn!(
-                    %mint, from = size, to = scaled, share_pct = share, max_supply_pct,
-                    "sizing down: the trade would take too much of the supply"
-                );
-                size = scaled;
-            }
-        }
 
         // Hoisted: both the curve path and the Jupiter path apply this, and
         // the curve path now runs FIRST. `max_mcap` is already bound above,
@@ -1374,6 +1330,74 @@ impl Sniper {
         }
     }
 
+    /// Bring a position back under the supply-share ceiling, if it is over.
+    ///
+    /// # Why this runs after the fill and not before it
+    ///
+    /// A quote is a prediction; a fill is a fact. Sizing the buy down from a
+    /// quote leaves the position wherever the fill actually landed, which is
+    /// the number that matters. So the buy executes at its configured size,
+    /// untouched, and this measures what was really received.
+    ///
+    /// Sells ONLY the excess. A position at or under the ceiling is left alone,
+    /// and one over it is trimmed to the ceiling rather than closed — the
+    /// position is not the problem, its size is.
+    ///
+    /// Called twice by design: once right after a buy confirms, and again on
+    /// every reconciliation sweep. The second is a fallback, because a missed
+    /// post-trade check would otherwise leave an unexitable position sitting
+    /// there with nothing to notice it.
+    ///
+    /// Returns `Some(pct_sold)` if it acted.
+    pub async fn enforce_supply_cap(
+        &self,
+        mint: &str,
+        alerter: &crate::alerts::Alerter,
+    ) -> Option<u8> {
+        let live = self.settings.snapshot();
+        if !live.supply_cap || live.max_supply_pct <= 0.0 {
+            return None;
+        }
+        let owner = self.owner()?.to_string();
+        let (raw, decimals) = self.rpc.token_balance_raw(&owner, mint).await?;
+        if raw == 0 {
+            return None;
+        }
+        let supply_ui = self.rpc.token_supply(mint).await?;
+        if supply_ui <= 0.0 {
+            return None;
+        }
+        let held_ui = raw as f64 / 10f64.powi(decimals as i32);
+        let cap_ui = supply_ui * live.max_supply_pct / 100.0;
+        if held_ui <= cap_ui {
+            return None;
+        }
+        // Percent OF THE CURRENT HOLDING to shed, which is what `sell` takes.
+        // Rounded UP so a rounding error cannot leave the position
+        // fractionally over the ceiling on every future sweep.
+        let excess =
+            ((held_ui - cap_ui) / held_ui * 100.0).ceil().clamp(1.0, 100.0) as u8;
+        let share = 100.0 * held_ui / supply_ui;
+        warn!(
+            %mint, share_pct = share, max = live.max_supply_pct, sell_pct = excess,
+            "position over the supply ceiling — trimming the excess"
+        );
+        let outcome = self.sell(mint, excess).await;
+        info!(%mint, ?outcome, "supply-ceiling trim");
+        if let Some(msg) = crate::alerts::render_auto_sell(
+            mint,
+            excess,
+            &format!(
+                "supply ceiling: holding {share:.2}% of supply, max {}%",
+                live.max_supply_pct
+            ),
+            &outcome,
+        ) {
+            alerter.send_html(msg).await;
+        }
+        Some(excess)
+    }
+
     /// One pass of the exit policy over every position the bot opened.
     ///
     /// Returns (considered, sold). Deliberately sequential and one action per
@@ -1457,12 +1481,70 @@ impl Sniper {
         }
 
         let considered = holdings.iter().filter(|h| h.raw > 0).count();
+
+        // SUPPLY-SHARE CEILING, enforced on the POSITION rather than the buy.
+        //
+        // Sizing the buy down is a best effort: it works off a quote, and the
+        // fill can differ. This is the part that actually holds the line —
+        // whatever the position ended up being, and however it got there, a
+        // holding over the ceiling is trimmed back to it.
+        //
+        // It runs BEFORE the ladder and returns immediately, because a position
+        // that is too large to exit is a more urgent problem than any target,
+        // and selling the excess makes the remainder exitable.
+        let max_supply_pct = self.settings.snapshot().max_supply_pct;
+        if max_supply_pct > 0.0 {
+            for h in holdings.iter().filter(|h| h.raw > 0) {
+                let Some(supply_ui) = self.rpc.token_supply(&h.mint).await else { continue };
+                if supply_ui <= 0.0 {
+                    continue;
+                }
+                let held_ui = h.raw as f64 / 10f64.powi(h.decimals as i32);
+                let cap_ui = supply_ui * max_supply_pct / 100.0;
+                if held_ui <= cap_ui {
+                    continue;
+                }
+                // Percent OF THE CURRENT HOLDING to shed, which is what `sell`
+                // takes. Rounded up so a rounding error cannot leave the
+                // position fractionally over the ceiling forever.
+                let excess = ((held_ui - cap_ui) / held_ui * 100.0).ceil().clamp(1.0, 100.0) as u8;
+                let share = 100.0 * held_ui / supply_ui;
+                warn!(
+                    mint = %h.mint, share_pct = share, max_supply_pct, sell_pct = excess,
+                    "position exceeds the supply ceiling — trimming"
+                );
+                let outcome = self.sell(&h.mint, excess).await;
+                info!(mint = %h.mint, ?outcome, "supply-ceiling trim result");
+                if let Some(msg) = crate::alerts::render_auto_sell(
+                    &h.mint,
+                    excess,
+                    &format!("supply ceiling: {share:.2}% of supply, max {max_supply_pct}%"),
+                    &outcome,
+                ) {
+                    alerter.send_html(msg).await;
+                }
+                return (considered, 1);
+            }
+        }
+
         let (sells, closed) = crate::exits::plan_exits(&rules, state, &holdings);
         for mint in closed {
             state.forget(&mint);
         }
 
-        let mut sold = 0usize;
+        // Reconciliation fallback for the supply ceiling. Runs AFTER the ladder
+        // so a stop-loss is never delayed by a trim; the post-buy check is the
+        // primary enforcement and this only catches what it missed.
+        let mut trimmed = 0usize;
+        if self.settings.snapshot().supply_cap {
+            for h in holdings.iter().filter(|h| h.raw > 0) {
+                if self.enforce_supply_cap(&h.mint, alerter).await.is_some() {
+                    trimmed += 1;
+                }
+            }
+        }
+
+        let mut sold = trimmed;
         for s in sells {
             warn!(mint = %s.mint, pct = s.pct_of_current, reason = %s.reason, "auto-sell firing");
             let outcome = self.sell(&s.mint, s.pct_of_current).await;
@@ -1536,6 +1618,22 @@ impl Sniper {
             }
             s.exits.set_target(pct, amount);
             Ok(format!("take profit sells {amount}% at +{pct}%"))
+        })
+    }
+
+    /// Turn the supply-share ceiling on or off, keeping the tuned percentage.
+    pub fn toggle_supply_cap(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            s.supply_cap = !s.supply_cap;
+            Ok(if s.supply_cap {
+                if s.max_supply_pct > 0.0 {
+                    format!("supply ceiling ON — positions trimmed to {}% of supply", s.max_supply_pct)
+                } else {
+                    "supply ceiling ON — set a percentage for it to act on".to_string()
+                }
+            } else {
+                "supply ceiling off".to_string()
+            })
         })
     }
 
@@ -3176,38 +3274,35 @@ mod tests {
     }
 
     /// A dry-run bot holds no key, so withdraw must be refused before any
-    /// The supply-share cap SIZES DOWN rather than refusing, and refuses only
-    /// when even the smallest worthwhile trade would still take too much.
+    /// The supply ceiling trims the EXCESS and nothing more. It is a ceiling
+    /// on the position, not a reason to close it.
     #[test]
-    fn a_supply_share_cap_sizes_the_trade_down() {
-        // Mirrors the arithmetic in `buy_mint`.
-        fn plan(size: f64, tokens: f64, supply: f64, max_pct: f64) -> Result<f64, &'static str> {
-            if max_pct <= 0.0 {
-                return Ok(size);
-            }
+    fn the_supply_ceiling_sells_only_the_excess() {
+        // Mirrors `enforce_supply_cap`.
+        fn trim(held: f64, supply: f64, max_pct: f64) -> Option<u8> {
             let cap = supply * max_pct / 100.0;
-            if tokens <= cap {
-                return Ok(size);
+            if held <= cap {
+                return None;
             }
-            let scaled = size * (cap / tokens) * 0.98;
-            if scaled < MIN_TRADE_SOL { Err("too small") } else { Ok(scaled) }
+            Some(((held - cap) / held * 100.0).ceil().clamp(1.0, 100.0) as u8)
         }
 
-        // Under the cap: untouched.
-        assert_eq!(plan(0.5, 1_000_000.0, 1e9, 2.0), Ok(0.5));
+        // At the ceiling exactly: untouched.
+        assert_eq!(trim(20_000_000.0, 1e9, 2.0), None);
+        // Under it: untouched.
+        assert_eq!(trim(5_000_000.0, 1e9, 2.0), None);
 
-        // 10% of supply against a 2% cap: scaled to roughly a fifth.
-        let got = plan(0.5, 100_000_000.0, 1e9, 2.0).unwrap();
-        assert!((got - 0.098).abs() < 1e-9, "expected ~0.098 SOL, got {got}");
-        // And the resulting holding is inside the cap, which is the point.
-        let held = 100_000_000.0 * (got / 0.5);
-        assert!(held <= 1e9 * 2.0 / 100.0, "still over the cap: {held}");
+        // 10% of supply against a 2% ceiling: sheds 80%, keeping 2%.
+        let pct = trim(100_000_000.0, 1e9, 2.0).unwrap();
+        assert_eq!(pct, 80);
+        let left = 100_000_000.0 * (1.0 - pct as f64 / 100.0);
+        assert!(left <= 1e9 * 2.0 / 100.0, "must land at or under the ceiling, left {left}");
 
-        // A token so thin that staying inside the cap is not a trade at all.
-        assert_eq!(plan(0.5, 1e9, 1e9, 0.1), Err("too small"));
-
-        // Disabled changes nothing.
-        assert_eq!(plan(0.5, 1e9, 1e9, 0.0), Ok(0.5));
+        // Rounds UP, so a position can never sit fractionally over the ceiling
+        // and be re-trimmed on every sweep forever.
+        let pct = trim(2_000_001.0, 1e9, 0.2).unwrap();
+        let left = 2_000_001.0 * (1.0 - pct as f64 / 100.0);
+        assert!(left <= 1e9 * 0.2 / 100.0, "rounding must not leave it over");
     }
 
     /// network call — the armed-only gate that stops a leaked token on a
