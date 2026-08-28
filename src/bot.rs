@@ -396,7 +396,7 @@ impl Bot {
                         self.reply_with(
                             chat_id,
                             format!(
-                                "📤 <b>Withdrawing {sol} SOL</b>\n\n                                 Now send the <b>destination address</b>.\n\n                                 <i>Nothing is sent until you confirm on the next screen.</i>"
+                                "📤 <b>Withdrawing {sol} SOL</b>\n\nNow send the <b>destination address</b>.\n\n<i>Nothing is sent until you confirm on the next screen.</i>"
                             ),
                             kb,
                         )
@@ -1552,9 +1552,16 @@ impl Bot {
         } else {
             format!("{} band(s)", live.buy_tiers.len())
         };
+        let cap = if live.supply_cap { fmt_supply_pct(live.max_supply_pct) } else { "off".into() };
         let text = format!(
-            "💰 <b>Buying</b>\n\n             Default size   <b>{} SOL</b>\n             MC bands       <b>{bands}</b>\n             Slippage       <b>{} bps</b>\n\n             <i>A token inside a market-cap band buys that band's amount; \
-             everything else uses the default.</i>",
+            "💰 <b>Buying</b>\n\n\
+             Default size · <b>{} SOL</b>\n\
+             MC bands · <b>{bands}</b>\n\
+             Slippage · <b>{} bps</b>\n\
+             Supply cap · <b>{cap}</b>\n\n\
+             <i>A token inside a market-cap band buys that band's amount; \
+             everything else uses the default. The supply cap trims a position \
+             back after the buy if it took too large a share of the token.</i>",
             live.trade_size_sol, live.slippage_bps
         );
         let rows = serde_json::json!({ "inline_keyboard": [
@@ -1565,6 +1572,7 @@ impl Bot {
               "callback_data": "set:tiers"}],
             [{"text": format!("📉 Slippage · {} bps", live.slippage_bps),
               "callback_data": "set:slippage"}],
+            [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"}],
             [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
@@ -1583,7 +1591,11 @@ impl Bot {
             format!("{} SOL", live.curve_min_liquidity_sol)
         };
         let text = format!(
-            "🔎 <b>Filters</b>\n\n             Volume mode    <b>{}</b>\n             Pool liquidity <b>{} SOL</b>\n             Curve floor    <b>{curve}</b>\n\n             <i>Smart money always decides WHEN. These only ever refuse a \
+            "🔎 <b>Filters</b>\n\n\
+             Volume mode · <b>{}</b>\n\
+             Pool liquidity · <b>{} SOL</b>\n\
+             Curve floor · <b>{curve}</b>\n\n\
+             <i>Smart money always decides WHEN. These only ever refuse a \
              signal — none of them can create one.</i>",
             if live.volume_mode { "on" } else { "off" },
             live.min_liquidity_sol,
@@ -1613,9 +1625,10 @@ impl Bot {
         };
         let cap = if live.supply_cap { fmt_supply_pct(live.max_supply_pct) } else { "off".into() };
         let text = format!(
-            "🛡 <b>Limits</b>\n\n             Trades per day <b>{trades}</b>\n             Supply cap     <b>{cap}</b>\n\n             <i>Trades per day is the main brake on a runaway. The supply cap \
-             trims a position back after the buy if it took too large a share \
-             of the token.</i>"
+            "🛡 <b>Limits</b>\n\n\
+             Trades per day · <b>{trades}</b>\n\n\
+             <i>The main brake on a runaway: how many entries may happen in a \
+             day, however many signals arrive.</i>"
         );
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"}],
@@ -1753,13 +1766,27 @@ impl Bot {
         let live = sniper.live();
         let env = sniper.envelope();
         let active = live.auto_buy_active(&env);
-        let need = live.effective_auto_buy_min(&env);
+        let need_sol = live.min_smart_sol_in;
+        let need_wallets = live.auto_buy_min_wallets;
 
+        let sol_s = if need_sol > 0.0 { format!("{need_sol} SOL") } else { "not set".into() };
+        let w_s = if need_wallets == 0 {
+            "off".to_string()
+        } else {
+            format!("{need_wallets}+")
+        };
         let text = format!(
-            "🤖 <b>Auto-buy</b>\n\nStatus: <b>{}</b>\nTriggers on: <b>{need} smart buyers</b>\n\n\
-             <i>Buys once {need} different tracked wallets buy the same token \
-             inside the {win}-minute window. Alerts are unaffected — they still \
-             fire on every cohort at the alert threshold.</i>",
+            "🤖 <b>Auto-buy</b>\n\n\
+             Status · <b>{}</b>\n\
+             Smart SOL in · <b>{sol_s}</b>\n\
+             Min wallets · <b>{w_s}</b>\n\n\
+             <i>Buys once the tracked cohort has put this much SOL into a token \
+             inside the {win}-minute window. Size is the signal — five wallets \
+             at 0.05 SOL each is not the same conviction as two at 5 SOL, and a \
+             headcount cannot tell them apart.</i>\n\n\
+             <i>Min wallets is an optional second condition, not the trigger. \
+             Set it to off unless you want to refuse a single large buy that \
+             nobody else corroborated.</i>",
             if active { "🟢 on" } else { "⚪ off" },
             win = self.track_for_secs.max(60) / 60,
         );
@@ -1768,13 +1795,16 @@ impl Bot {
             {"text": if active { "🟢 On — tap to disable" } else { "⚪ Off — tap to enable" },
              "callback_data": "setv:autobuy_on:toggle"}
         ])];
-        // Labelled as BUYERS, not wallets. Sitting next to a wallet-management
-        // screen, "4 wallets" read as picking which wallets to trade from —
-        // it is how many must converge before we act.
-        let opts: Vec<serde_json::Value> = [2usize, 3, 4, 5, 6, 8]
+        rows.push(serde_json::json!([
+            {"text": format!("💸 Smart SOL in · {sol_s}"), "callback_data": "set:smartsol"},
+        ]));
+        // Labelled as BUYERS, not wallets: sitting next to a wallet-management
+        // screen, "4 wallets" read as picking which wallets to trade from.
+        let opts: Vec<serde_json::Value> = [0usize, 1, 2, 3, 4, 5]
             .iter()
             .map(|n| serde_json::json!({
-                "text": format!("{}{n} buyers", if *n == need { "✓ " } else { "" }),
+                "text": format!("{}{}", if *n == need_wallets { "✓ " } else { "" },
+                                if *n == 0 { "off".to_string() } else { format!("{n} buyers") }),
                 "callback_data": format!("setv:autobuy_min:{n}"),
             }))
             .collect();
@@ -1804,7 +1834,7 @@ impl Bot {
             body.push_str("<i>none — every token uses the default</i>\n");
         }
         let text = format!(
-            "📊 <b>Buy by market cap</b>\n\n             Default buy: <b>{} SOL</b>\n\n{body}\n             <i>A token that falls in a band buys that amount; anything else \
+            "📊 <b>Buy by market cap</b>\n\nDefault buy: <b>{} SOL</b>\n\n{body}\n<i>A token that falls in a band buys that amount; anything else \
              uses the default. Bands cannot overlap, so every token matches at \
              most one.</i>",
             live.trade_size_sol
@@ -1839,7 +1869,7 @@ impl Bot {
         let pct = live.max_supply_pct;
 
         let text = format!(
-            "🪙 <b>Supply cap</b>\n\nStatus: <b>{}</b>\nCeiling: <b>{}</b>\n\n             <i>Buys always execute at their configured size. Afterwards the \
+            "🪙 <b>Supply cap</b>\n\nStatus: <b>{}</b>\nCeiling: <b>{}</b>\n\n<i>Buys always execute at their configured size. Afterwards the \
              position is measured against the token's total supply, and only \
              the EXCESS is sold — a position at or under the ceiling is left \
              alone. Checked right after each buy, and again on every \
@@ -1852,7 +1882,7 @@ impl Bot {
               "callback_data": "setv:supplycap_on:toggle"}],
             [{"text": format!("📐 Ceiling · {}", fmt_supply_pct(pct)),
               "callback_data": "set:maxsupply"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": "◀️ Back", "callback_data": "set:buying"}],
         ]});
         (text, rows)
     }
@@ -1868,9 +1898,13 @@ impl Bot {
         let fmt = |v: f64| if v <= 0.0 { "off".to_string() } else { format!("{v} SOL") };
 
         let text = format!(
-            "📊 <b>Volume mode</b>\n\nStatus: <b>{}</b>\n\n             💸 Smart SOL in · <b>{}</b>\n📈 Token volume · <b>{}</b>\n\n             <i>Smart money still decides WHEN. This only decides whether the              flow behind it is real, measured over the same {win}-minute window              as the signal. It can block an entry, never create one — with this              off, behaviour is exactly as before.</i>",
+            "📊 <b>Volume mode</b>\n\n\
+             Status · <b>{}</b>\n\
+             Token volume · <b>{}</b>\n\n\
+             <i>Corroboration only: it can block a signal the trigger admitted, \
+             never create one. Measured over the same {win}-minute window as \
+             the signal itself.</i>",
             if on { "🟢 on" } else { "⚪ off" },
-            fmt(live.min_smart_sol_in),
             fmt(live.min_token_volume_sol),
             win = self.track_for_secs.max(60) / 60,
         );
@@ -1880,8 +1914,6 @@ impl Bot {
              "callback_data": "setv:volume_on:toggle"}
         ])];
         rows.push(serde_json::json!([
-            {"text": format!("💸 Smart SOL in · {}", fmt(live.min_smart_sol_in)),
-             "callback_data": "set:smartsol"},
             {"text": format!("📈 Token volume · {}", fmt(live.min_token_volume_sol)),
              "callback_data": "set:tokenvol"},
         ]));
@@ -1919,7 +1951,7 @@ impl Bot {
         let tr_s = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
 
         let mut text = format!(
-            "🎚 <b>Auto-sell</b> · {onoff}\n\n             🛑 Stop loss   <b>{stop_s}</b>\n             🎯 Take profit <b>{tp_s}</b>\n             🔒 Break-even  <b>{be_s}</b>\n             📉 Trailing    <b>{tr_s}</b>\n\n             <i>Break-even arms once the position has been up that much, then \
+            "🎚 <b>Auto-sell</b> · {onoff}\n\n🛑 Stop loss   <b>{stop_s}</b>\n🎯 Take profit <b>{tp_s}</b>\n🔒 Break-even  <b>{be_s}</b>\n📉 Trailing    <b>{tr_s}</b>\n\n<i>Break-even arms once the position has been up that much, then \
              exits at cost rather than at a loss. Protective rules are always \
              checked before targets.</i>"
         );
@@ -1966,7 +1998,7 @@ impl Bot {
             body.push_str("   <i>none</i>\n");
         }
         let text = format!(
-            "⚙️ <b>Targets</b>\n\n{body}\n             <i>Amounts are shares of the ORIGINAL position, so they add up. \
+            "⚙️ <b>Targets</b>\n\n{body}\n<i>Amounts are shares of the ORIGINAL position, so they add up. \
              Anything past 100% can never fire.</i>"
         );
         let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -2070,7 +2102,7 @@ impl Bot {
         };
         let cur = sniper.live().exits.trailing_pct;
         let text = format!(
-            "📉 <b>Trailing stop</b>\n\nCurrent: <b>{}</b>\n\n             <i>Sells everything once the position falls this far from its PEAK. \
+            "📉 <b>Trailing stop</b>\n\nCurrent: <b>{}</b>\n\n<i>Sells everything once the position falls this far from its PEAK. \
              Only acts after the position has been in profit, so it cannot close \
              a fresh entry on ordinary slippage.</i>",
             if cur > 0 { format!("−{cur}%") } else { "off".into() }
@@ -3600,8 +3632,12 @@ mod tests {
             "a target that closes the position must say what remains:\n{lt}"
         );
 
-        assert!(vk.contains("set:smartsol"), "no smart-money inflow button");
         assert!(vk.contains("set:tokenvol"), "no token volume button");
+        // Smart-money SOL is the auto-buy TRIGGER now, not a volume filter, so
+        // it lives on the auto-buy screen. Having it in both places would be
+        // two controls for one number.
+        assert!(!vk.contains("set:smartsol"), "the SOL trigger moved to auto-buy");
+        assert!(ab.contains("set:smartsol"), "the SOL trigger must be on auto-buy");
         for gone in ["set:accel", "set:smartshare", "set:volwindow"] {
             assert!(!vk.contains(gone), "{gone} was cut from the design");
         }

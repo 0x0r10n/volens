@@ -905,77 +905,80 @@ impl Detector {
                 let live = self.sniper.live();
                 let env = self.sniper.envelope();
                 if live.auto_buy_active(&env) {
-                    let need = live.effective_auto_buy_min(&env);
-                        let eligible: Vec<String> = {
-                    let tracker = match self.conviction.lock() {
-                        Ok(t) => t,
-                        Err(p) => p.into_inner(),
-                    };
-                        tracker
-                            .buyers_in_window(&buy.mint, Instant::now())
+                    // SOL VOLUME IS THE TRIGGER, not the wallet count.
+                    //
+                    // Counting wallets treats every buy as one vote, so five
+                    // wallets putting in 0.05 SOL each outranks two putting in
+                    // 5 SOL. Conviction is expressed in size, not in headcount,
+                    // and the count cannot tell those apart.
+                    //
+                    // The wallet floor survives as an optional SECONDARY
+                    // condition — useful for refusing a single large buy that
+                    // nobody else corroborated — but it is no longer what
+                    // decides an entry. 0 disables it.
+                    let need_sol = live.min_smart_sol_in;
+                    let need_wallets = live.auto_buy_min_wallets;
+                    let (eligible, smart_sol) = {
+                        let tracker = match self.conviction.lock() {
+                            Ok(t) => t,
+                            Err(p) => p.into_inner(),
+                        };
+                        let now = Instant::now();
+                        let wallets: Vec<String> = tracker
+                            .buyers_in_window(&buy.mint, now)
                             .into_iter()
                             .filter(|w| {
                                 self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
                             })
-                            .collect()
+                            .collect();
+                        (wallets, tracker.sol_in_window(&buy.mint, now))
                     };
-                    // Logged whenever a token is at least halfway to the
-                    // threshold. "No trades" and "no signals strong enough"
-                    // look identical from outside, and telling them apart
-                    // should not require reading the source.
-                    if eligible.len() * 2 >= need {
+
+                    let sol_ok = need_sol <= 0.0 || smart_sol >= need_sol;
+                    let wallets_ok = need_wallets == 0 || eligible.len() >= need_wallets;
+
+                    // Logged for anything at least halfway to the threshold.
+                    // "No trades" and "nothing strong enough" look identical
+                    // from outside, and telling them apart should not require
+                    // reading the source.
+                    if need_sol > 0.0 && smart_sol * 2.0 >= need_sol {
                         info!(
                             mint = %buy.mint,
-                            eligible = eligible.len(),
-                            need,
+                            smart_sol,
+                            need_sol,
+                            wallets = eligible.len(),
+                            need_wallets,
+                            sol_ok,
+                            wallets_ok,
                             "auto-buy progress"
                         );
                     }
-                    if eligible.len() >= need {
-                        // VOLUME CONFIRMATION.
-                        //
-                        // Evaluated only AFTER the wallet count passes, and
-                        // able only to BLOCK. Smart money is the trigger;
-                        // volume corroborates it. A confirmation that could
-                        // also admit signals would really be a second, weaker
-                        // trigger — so this is structured so a misconfigured
-                        // volume rule makes the bot trade less, never more.
-                        //
-                        // The toggle is a real bypass rather than "thresholds
-                        // at zero": turning volume mode off cannot leave a
-                        // stray threshold still filtering, and costs nothing
-                        // to evaluate.
-                        let passed = if live.volume_mode {
+
+                    if sol_ok && wallets_ok {
+                        // Token-volume confirmation, unchanged in spirit: it
+                        // can only ever BLOCK a signal the trigger admitted.
+                        let passed = if live.volume_mode && live.min_token_volume_sol > 0.0 {
                             let window = Duration::from_secs(self.cfg.tracked.window_secs);
-                            let smart_sol = {
-                                let tracker = match self.conviction.lock() {
-                                    Ok(t) => t,
-                                    Err(p) => p.into_inner(),
-                                };
-                                tracker.sol_in_window(&buy.mint, Instant::now())
-                            };
                             let token_vol = self.prices.volume_sol_in(&buy.mint, window);
-                            let smart_ok = live.min_smart_sol_in <= 0.0
-                                || smart_sol >= live.min_smart_sol_in;
-                            let vol_ok = live.min_token_volume_sol <= 0.0
-                                || token_vol >= live.min_token_volume_sol;
-                            // Logged either way, with both numbers. A filter
-                            // you cannot see working is one you cannot tune,
-                            // and this one decides what NOT to buy.
+                            let ok = token_vol >= live.min_token_volume_sol;
                             info!(
                                 mint = %buy.mint,
-                                smart_sol_in = smart_sol,
-                                need_smart_sol = live.min_smart_sol_in,
                                 token_volume = token_vol,
                                 need_volume = live.min_token_volume_sol,
-                                passed = smart_ok && vol_ok,
+                                passed = ok,
                                 "volume confirmation"
                             );
-                            smart_ok && vol_ok
+                            ok
                         } else {
                             true
                         };
                         if passed {
+                            info!(
+                                mint = %buy.mint,
+                                smart_sol,
+                                wallets = eligible.len(),
+                                "auto-buy triggered on smart-money SOL volume"
+                            );
                             self.spawn_smart_buy(&buy.mint, eligible.len()).await;
                         }
                     }
