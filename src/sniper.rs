@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Smallest trade worth making. Below this, fees and rent dominate the position
 /// so completely that the trade cannot express an opinion about the token.
@@ -475,6 +475,14 @@ pub struct Sniper {
     /// Held positions we have already warned about being unpriceable, so the
     /// warning fires on the transition rather than every fifteen seconds.
     unpriceable: Mutex<std::collections::HashSet<String>>,
+    /// The last exit-failure reason announced per mint.
+    ///
+    /// A failed sell re-arms its trigger, so a position that cannot be exited
+    /// retries every sweep — once every five seconds — and each attempt used to
+    /// send its own Telegram message. One unsellable token buried the alert
+    /// channel in identical failures, which is how a real alert gets missed.
+    /// The retry is right; announcing it every time is not.
+    last_exit_failure: Mutex<std::collections::HashMap<String, String>>,
     /// Mints whose liquidity was seen being pulled.
     ///
     /// # Why this exists
@@ -618,6 +626,7 @@ impl Sniper {
             settings,
             routes: Arc::new(crate::routes::RouteStore::load(&routes_path)),
             unpriceable: Mutex::new(std::collections::HashSet::new()),
+            last_exit_failure: Mutex::new(std::collections::HashMap::new()),
             rugged: Mutex::new(std::collections::HashSet::new()),
             rpc,
             submitter,
@@ -1708,8 +1717,24 @@ impl Sniper {
             }
             // Announced whether it worked or not: an operator must be able to
             // tell "the ladder never fired" from "it fired and failed".
-            if let Some(msg) =
-                crate::alerts::render_auto_sell(&s.mint, s.pct_of_current, &s.reason, &outcome)
+            //
+            // A REPEAT of the same failure is not announced again. The retry
+            // continues either way — only the message is suppressed, and a
+            // change in the reason, or the sell finally landing, speaks again.
+            let repeat = {
+                let mut seen =
+                    self.last_exit_failure.lock().unwrap_or_else(|p| p.into_inner());
+                if landed {
+                    seen.remove(&s.mint);
+                    false
+                } else {
+                    let key = failure_key(&outcome);
+                    seen.insert(s.mint.clone(), key.clone()) == Some(key)
+                }
+            };
+            if !repeat
+                && let Some(msg) =
+                    crate::alerts::render_auto_sell(&s.mint, s.pct_of_current, &s.reason, &outcome)
             {
                 alerter.send_html(msg).await;
             }
@@ -2562,6 +2587,52 @@ impl Sniper {
             }
         }
 
+        // THE BONDING CURVE, derived from the mint alone.
+        //
+        // A smart-money entry is routed, not built from a pool we decoded, so
+        // `self.routes` has nothing for it and the branch above never fires.
+        // That sent every such exit to Jupiter — and a Jupiter sell opens a
+        // WSOL account to receive the proceeds, which costs rent UP FRONT:
+        //
+        //   Transfer: insufficient lamports 1530516, need 1844400
+        //
+        // A position worth 0.0023 SOL could not be sold by a wallet holding
+        // 0.0015, so the stop-loss re-fired every five seconds and was rejected
+        // every time. Being too poor to exit is the worst state this bot can be
+        // in, and it is reachable from an ordinary run of small losses.
+        //
+        // The curve sell has no such floor: pump.fun pays SOL straight to the
+        // seller, so there is no account to fund and nothing to rent. It needs
+        // only the mint, which means it works for exactly the routed positions
+        // that had no other direct path.
+        if let Some((pk_mint, pk_owner)) = crate::tx::pk(mint).ok().zip(crate::tx::pk(&owner).ok())
+        {
+            match crate::execute::build_pumpfun_sell(
+                &self.rpc,
+                &pk_mint,
+                &pk_owner,
+                amount,
+                self.cfg.sell_slippage_bps,
+                600_000,
+                self.cfg.priority_fee_micro_lamports,
+            )
+            .await
+            {
+                Ok(plan) => {
+                    info!(%mint, pct, "selling on the pump.fun curve (no WSOL rent needed)");
+                    return self.execute_curve_sell(mint, &owner, pct, plan).await;
+                }
+                // Expected for anything not on a live pump.fun curve — a
+                // graduated token, another venue. Logged at debug so a normal
+                // Raydium exit does not read as a failure.
+                Err(e) => debug!(
+                    %mint,
+                    error = %format!("{e:#}"),
+                    "no pump.fun curve for this mint; trying the quote API"
+                ),
+            }
+        }
+
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let quote = match jup.quote(mint, WSOL_MINT, amount, self.cfg.sell_slippage_bps).await {
             Ok(q) => q,
@@ -2668,6 +2739,45 @@ impl Sniper {
                 SellOutcome::Submitted { mint: mint.to_string(), pct, sol_out, result }
             }
         })
+    }
+
+    /// Submit a bonding-curve sell, audited exactly like every other exit.
+    ///
+    /// Tagged `:curve` in the audit so an exit that took this path can be told
+    /// apart from a routed one when reconciling a session.
+    #[cfg(feature = "sniper")]
+    async fn execute_curve_sell(
+        &self,
+        mint: &str,
+        owner: &str,
+        pct: u8,
+        plan: crate::execute::ExecutionPlan,
+    ) -> SellOutcome {
+        // What the curve quote says we receive, in SOL.
+        let sol_out = plan.quote.minimum_out as f64 / 1e9;
+        match &self.mode {
+            Mode::DryRun { .. } => {
+                info!(%mint, pct, sol_out, "sniper: DRY RUN CURVE SELL (nothing signed)");
+                self.audit_sell(owner, mint, pct, sol_out, "would-succeed:curve").await;
+                SellOutcome::Rehearsed {
+                    mint: mint.to_string(),
+                    pct,
+                    sol_out,
+                    impact_pct: 0.0,
+                    would_succeed: true,
+                }
+            }
+            Mode::Armed(cap) => {
+                warn!(%mint, pct, sol_out, "sniper: SUBMITTING REAL CURVE SELL");
+                let res = self
+                    .submitter
+                    .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
+                    .await;
+                let (outcome, result) = classify_submission(res);
+                self.audit_sell(owner, mint, pct, sol_out, &format!("{outcome}:curve")).await;
+                SellOutcome::Submitted { mint: mint.to_string(), pct, sol_out, result }
+            }
+        }
     }
 
     /// SOL price in USD, from the stream-derived index.
@@ -2960,6 +3070,30 @@ fn classify_submission(res: Result<Submission>) -> (String, SubmitOutcome) {
             )
         }
     }
+}
+
+/// A stable key for "this exit failed the same way as last time".
+///
+/// Deliberately the CLASS of failure, not the whole message. A preflight
+/// rejection carries the wallet's exact lamport balance, which ticks with every
+/// block — comparing full text would make every repeat look new and defeat the
+/// suppression entirely.
+#[cfg(feature = "sniper")]
+fn failure_key(outcome: &SellOutcome) -> String {
+    let raw = match outcome {
+        SellOutcome::Refused { reason } => reason.clone(),
+        SellOutcome::Failed { reason, .. } => reason.clone(),
+        SellOutcome::NoPosition { .. } => "no-position".to_string(),
+        SellOutcome::Rehearsed { .. } => "rehearsed".to_string(),
+        SellOutcome::Submitted { result, .. } => match result {
+            SubmitOutcome::Executed { .. } => "executed".to_string(),
+            SubmitOutcome::NotExecuted { reason } => reason.clone(),
+            SubmitOutcome::Indeterminate { reason, .. } => reason.clone(),
+        },
+    };
+    // Digits vary run to run (balances, compute units, slots); the shape of the
+    // failure does not.
+    raw.chars().filter(|c| !c.is_ascii_digit()).take(160).collect()
 }
 
 async fn append_line(path: &str, value: &serde_json::Value) -> Result<()> {
@@ -3703,5 +3837,56 @@ mod tests {
 
         let tomorrow = today + chrono::Duration::days(1);
         assert!(s.consider(&event(), tomorrow).is_ok(), "budget must reset next day");
+    }
+
+    /// The suppression must survive a changing lamport balance. Preflight text
+    /// carries the wallet's exact balance, which moves every block — comparing
+    /// raw text would make every retry look new and re-announce every 5s.
+    #[test]
+    fn the_same_failure_keys_the_same_across_changing_balances() {
+        let a = SellOutcome::Submitted {
+            mint: "M".into(),
+            pct: 100,
+            sol_out: 0.002,
+            result: SubmitOutcome::NotExecuted {
+                reason: "preflight rejected: Transfer: insufficient lamports 1530516, need 1844400"
+                    .into(),
+            },
+        };
+        let b = SellOutcome::Submitted {
+            mint: "M".into(),
+            pct: 100,
+            sol_out: 0.002,
+            result: SubmitOutcome::NotExecuted {
+                reason: "preflight rejected: Transfer: insufficient lamports 1612050, need 1844400"
+                    .into(),
+            },
+        };
+        assert_eq!(failure_key(&a), failure_key(&b), "same failure, different balance");
+    }
+
+    #[test]
+    fn a_different_failure_is_announced_again() {
+        let poor = SellOutcome::Submitted {
+            mint: "M".into(),
+            pct: 100,
+            sol_out: 0.002,
+            result: SubmitOutcome::NotExecuted { reason: "insufficient lamports 1".into() },
+        };
+        let slippage = SellOutcome::Submitted {
+            mint: "M".into(),
+            pct: 100,
+            sol_out: 0.002,
+            result: SubmitOutcome::NotExecuted { reason: "slippage tolerance exceeded".into() },
+        };
+        assert_ne!(failure_key(&poor), failure_key(&slippage));
+    }
+
+    /// A landing sell clears the memory, so the NEXT failure speaks again.
+    #[test]
+    fn a_refusal_and_a_failure_are_different_classes() {
+        let refused = SellOutcome::Refused { reason: "kill switch engaged".into() };
+        let failed = SellOutcome::Failed { mint: "M".into(), reason: "quote: timeout".into() };
+        assert_ne!(failure_key(&refused), failure_key(&failed));
     }
 }
