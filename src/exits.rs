@@ -383,6 +383,25 @@ pub struct PlannedSell {
     /// Share of the CURRENT balance to sell — what a sell can act on.
     pub pct_of_current: u8,
     pub reason: String,
+    /// The trigger this came from, so a FAILED sell can be un-fired.
+    ///
+    /// `None` for rules that are not one of the ladder's orders (break-even,
+    /// trailing) — those key off the peak and re-evaluate every sweep on their
+    /// own, so they need no bookkeeping to retry.
+    pub trigger: Option<i32>,
+}
+
+/// Recover the ladder trigger from a reason string, if it came from one.
+///
+/// The reason is built as `"{kind} {label}"` where the label leads with the
+/// signed percentage, so the trigger is recoverable without threading it
+/// through every layer.
+fn trigger_of(reason: &str) -> Option<i32> {
+    if !(reason.starts_with("stop ") || reason.starts_with("target ")) {
+        return None;
+    }
+    let rest = reason.split_whitespace().nth(1)?;
+    rest.trim_end_matches('%').trim_start_matches('+').parse::<i32>().ok()
 }
 
 /// Decide every exit for a set of holdings, without touching the network.
@@ -425,7 +444,13 @@ pub fn plan_exits(
         if let ExitAction::Sell { reason, .. } = action
             && pct_now > 0
         {
-            sells.push(PlannedSell { mint: h.mint.clone(), pct_of_current: pct_now, reason });
+            let trigger = trigger_of(&reason);
+            sells.push(PlannedSell {
+                mint: h.mint.clone(),
+                pct_of_current: pct_now,
+                reason,
+                trigger,
+            });
         }
     }
     (sells, closed)
@@ -482,6 +507,30 @@ impl ExitStateStore {
         // saved would fire again after a restart and sell the position twice.
         self.save();
         (action, pct_now)
+    }
+
+    /// Un-record a trigger whose sell did not go through.
+    ///
+    /// # Why firing is recorded before the sell succeeds
+    ///
+    /// It has to be: sweeps run every few seconds and a sell takes longer than
+    /// that, so without recording the decision immediately the next sweep would
+    /// fire the same order again while the first is still in flight, and sell
+    /// the position twice.
+    ///
+    /// But a sell that FAILS never happened, and leaving the trigger recorded
+    /// disarms it permanently — a stop-loss that is preflight-rejected once
+    /// would never protect that position again. That is the worst failure this
+    /// module can have, so a failure rolls the record back and the next sweep
+    /// tries again.
+    pub fn unfire(&self, mint: &str, at_pct: i32) {
+        {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(st) = g.get_mut(mint) {
+                st.fired_at.retain(|t| *t != at_pct);
+            }
+        }
+        self.save();
     }
 
     /// Forget a position, e.g. once fully sold.
@@ -938,6 +987,58 @@ fn the_simple_views_round_trip_without_losing_orders() {
     assert_eq!(r.orders.iter().filter(|o| !o.is_stop()).count(), 2,
         "setting the stop must not touch the targets");
 }
+
+    /// The most expensive failure this module can have: a stop-loss that is
+    /// rejected once and then never protects the position again.
+    ///
+    /// Observed live — a position was bought, its stop fired three seconds
+    /// later, the sell was preflight-rejected for low SOL, and the position was
+    /// still held afterwards with the trigger marked as fired.
+    #[test]
+    fn a_failed_sell_re_arms_its_trigger() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![SellOrder { at_pct: -25, amount_pct: 100 }],
+            ..Default::default()
+        };
+        let store = ExitStateStore::ephemeral();
+        let h = || holding("M", 0.01, 1_000_000, Some(0.007)); // -30%, stop hit
+
+        let (sells, _) = plan_exits(&rules, &store, &[h()], TEST_BUFFER);
+        assert_eq!(sells.len(), 1, "the stop fires");
+        let trigger = sells[0].trigger.expect("a ladder sell carries its trigger");
+        assert_eq!(trigger, -25);
+
+        // Immediately after firing it must NOT fire again — that is what stops
+        // a second sweep selling the position twice while the first is in
+        // flight.
+        let (again, _) = plan_exits(&rules, &store, &[h()], TEST_BUFFER);
+        assert!(again.is_empty(), "must not double-fire while in flight");
+
+        // The sell failed, so the trigger is rolled back and the next sweep
+        // tries again. Without this the position is unprotected forever.
+        store.unfire("M", trigger);
+        let (retry, _) = plan_exits(&rules, &store, &[h()], TEST_BUFFER);
+        assert_eq!(retry.len(), 1, "a failed stop must be retried");
+    }
+
+    /// Break-even and trailing key off the peak and re-evaluate every sweep, so
+    /// they carry no trigger to roll back.
+    #[test]
+    fn peak_based_rules_need_no_rollback() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![],
+            breakeven: true,
+            ..Default::default()
+        };
+        let store = ExitStateStore::ephemeral();
+        plan_exits(&rules, &store, &[holding("M", 0.01, 1_000_000, Some(0.0105))], TEST_BUFFER);
+        let (sells, _) =
+            plan_exits(&rules, &store, &[holding("M", 0.01, 1_000_000, Some(0.0101))], TEST_BUFFER);
+        assert_eq!(sells.len(), 1, "break-even fires");
+        assert!(sells[0].trigger.is_none(), "not a ladder order — nothing to roll back");
+    }
 
     /// Break-even, as the user describes it: it went up, it came back to what
     /// it cost, get out flat.

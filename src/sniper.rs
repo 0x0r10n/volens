@@ -643,7 +643,12 @@ impl Sniper {
     /// down a pool whose build later failed — permanently locking out a pool we
     /// never traded — and recording nowhere would let a re-detection buy twice.
     fn reserve(&self, pool: &str, size: f64, now: DateTime<Utc>) {
-        let mut st = self.state.lock().unwrap();
+        // Recovered rather than unwrapped, like every other lock here. A panic
+        // anywhere while holding this poisons it, and `.unwrap()` would then
+        // panic on every subsequent lock — taking the AUTO-SELL down with the
+        // buy path, because both go through this state. Losing the ability to
+        // exit is a far worse failure than continuing with the daily counters.
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
         st.roll(now);
         st.spent += size;
         st.trades += 1;
@@ -914,7 +919,7 @@ impl Sniper {
         // entries cannot each spend a full day's budget.
         let now = Utc::now();
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.roll(now);
             let max_trades = live.effective_max_trades(&env);
             if max_trades > 0 && st.trades >= max_trades {
@@ -1597,23 +1602,27 @@ impl Sniper {
             state.forget(&mint);
         }
 
-        // Reconciliation fallback for the supply ceiling. Runs AFTER the ladder
-        // so a stop-loss is never delayed by a trim; the post-buy check is the
-        // primary enforcement and this only catches what it missed.
-        let mut trimmed = 0usize;
-        if self.settings.snapshot().supply_cap {
-            for h in holdings.iter().filter(|h| h.raw > 0) {
-                if self.enforce_supply_cap(&h.mint, alerter).await.is_some() {
-                    trimmed += 1;
-                }
-            }
-        }
-
-        let mut sold = trimmed;
+        let mut sold = 0usize;
         for s in sells {
             warn!(mint = %s.mint, pct = s.pct_of_current, reason = %s.reason, "auto-sell firing");
             let outcome = self.sell(&s.mint, s.pct_of_current).await;
             info!(mint = %s.mint, ?outcome, "auto-sell result");
+
+            // A sell that did not happen must not leave its trigger disarmed.
+            // See `ExitStateStore::unfire`: without this a stop-loss rejected
+            // once — for slippage, for a moment of low SOL — never protects
+            // that position again.
+            let landed = matches!(
+                &outcome,
+                SellOutcome::Submitted { result: SubmitOutcome::Executed { .. }, .. }
+            );
+            if !landed && let Some(t) = s.trigger {
+                warn!(
+                    mint = %s.mint, trigger = t,
+                    "sell did not land — re-arming the trigger for the next sweep"
+                );
+                state.unfire(&s.mint, t);
+            }
             // Announced whether it worked or not: an operator must be able to
             // tell "the ladder never fired" from "it fired and failed".
             if let Some(msg) =
@@ -1622,6 +1631,26 @@ impl Sniper {
                 alerter.send_html(msg).await;
             }
             sold += 1;
+        }
+
+        // Reconciliation fallback for the supply ceiling. Runs AFTER the ladder,
+        // and this ordering is load-bearing rather than cosmetic.
+        //
+        // `plan_exits` sizes each sell against the balance it SAW. Trimming
+        // first changes that balance underneath the plan, so a partial rung
+        // computed as "20% of the original position" would then be applied to
+        // what survived the trim — selling far more of the position than the
+        // ladder intended. The two must not interleave.
+        //
+        // It is also the right precedence: a stop-loss is more urgent than a
+        // size ceiling, and the post-buy check is the primary enforcement
+        // anyway. This only catches what that missed.
+        if self.settings.snapshot().supply_cap {
+            for h in holdings.iter().filter(|h| h.raw > 0) {
+                if self.enforce_supply_cap(&h.mint, alerter).await.is_some() {
+                    sold += 1;
+                }
+            }
         }
         (considered, sold)
     }
@@ -2004,7 +2033,7 @@ impl Sniper {
         // Daily limits and per-pool cooldown share one lock: they are checked
         // against the same state that `reserve` mutates.
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.roll(now);
             if let Some(seconds_remaining) =
                 st.cooling_down(&ev.pool, now, self.cfg.pool_cooldown_secs)
