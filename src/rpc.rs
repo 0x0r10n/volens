@@ -326,19 +326,52 @@ impl RpcClient {
     /// Raw token balance the `owner` holds of a specific `mint`, as
     /// `(amount_in_base_units, decimals)`. This is what an exit needs: Jupiter
     /// quotes on integer base units, and "sell 50%" must be computed on the
-    /// exact raw amount, never a lossy UI float. Sums across all token accounts
-    /// for the mint (usually one, but be safe). None if unreadable or zero.
+    /// exact raw amount, never a lossy UI float. None if unreadable or zero.
+    ///
+    /// # Why this derives the address instead of asking for it
+    ///
+    /// The obvious call is `getTokenAccountsByOwner`, and it is what this used
+    /// to do. That is a SCAN, and providers reject scans under load:
+    ///
+    /// ```text
+    ///   scan aborted: scan rejected: memory pressure threshold exceeded
+    /// ```
+    ///
+    /// Measured against one provider, that failure was total and permanent —
+    /// every attempt, mint-filtered or not. Since this call is what the
+    /// auto-sell sweep uses to see its own positions, a provider that refuses
+    /// scans does not degrade the bot, it blinds it: no holdings visible means
+    /// no stop-loss, silently.
+    ///
+    /// The bot creates its token accounts idempotently as ATAs on every buy, so
+    /// the address is derivable and does not need looking up. Both token
+    /// programs are checked in one `getMultipleAccounts`, which is a targeted
+    /// read rather than a scan: it is cheaper, faster, and works on providers
+    /// that refuse the scan entirely.
     #[cfg(feature = "sniper")]
     pub async fn token_balance_raw(&self, owner: &str, mint: &str) -> Option<(u64, u8)> {
         if self.url.is_empty() {
             return None;
         }
-        // The `mint` filter finds the account regardless of which token program
-        // owns it (SPL or Token-2022), so one query suffices.
+        use spl_associated_token_account_interface::address::
+            get_associated_token_address_with_program_id;
+        let owner_pk = crate::tx::pk(owner).ok()?;
+        let mint_pk = crate::tx::pk(mint).ok()?;
+        // Both token programs: a mint is owned by one of them, and deriving
+        // both costs nothing next to a round trip.
+        let candidates = [
+            get_associated_token_address_with_program_id(
+                &owner_pk, &mint_pk, &crate::tx::TOKEN_PROGRAM,
+            )
+            .to_string(),
+            get_associated_token_address_with_program_id(
+                &owner_pk, &mint_pk, &crate::tx::TOKEN_2022_PROGRAM,
+            )
+            .to_string(),
+        ];
         let body = json!({
-            "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-            "params":[owner, {"mint": mint},
-                      {"encoding":"jsonParsed","commitment": self.commitment}],
+            "jsonrpc":"2.0","id":1,"method":"getMultipleAccounts",
+            "params":[candidates, {"encoding":"jsonParsed","commitment": self.commitment}],
         });
         let resp: serde_json::Value = self
             .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
@@ -346,10 +379,10 @@ impl RpcClient {
         let mut total: u64 = 0;
         let mut decimals: u8 = 0;
         for acct in accts {
-            let Some(ta) = acct.pointer("/account/data/parsed/info/tokenAmount") else {
-                continue;
-            };
-            if let Some(a) = ta.get("amount").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()) {
+            let Some(ta) = acct.pointer("/data/parsed/info/tokenAmount") else { continue };
+            if let Some(a) =
+                ta.get("amount").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok())
+            {
                 total = total.saturating_add(a);
             }
             if let Some(d) = ta.get("decimals").and_then(|v| v.as_u64()) {
