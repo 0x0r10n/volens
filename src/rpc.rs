@@ -285,38 +285,88 @@ impl RpcClient {
         Some(total)
     }
 
-    /// Token holdings of an address: `(mint, ui_amount)` for every account with a
-    /// non-zero balance, across classic SPL Token and Token-2022. Backs
-    /// `/positions`. `None` means a query failed — never render that as "empty
-    /// wallet", which is a different (and misleading) claim.
+    /// Token holdings of an address: `(mint, ui_amount)` for every account with
+    /// a non-zero balance. Backs `/positions`. `None` means a query failed —
+    /// never render that as "empty wallet", which is a different (and
+    /// misleading) claim.
     ///
     /// Zero-balance accounts are dropped: a memecoin fully sold still leaves an
     /// empty token account behind, which is not a position.
-    pub async fn token_holdings(&self, owner: &str) -> Option<Vec<(String, f64)>> {
+    ///
+    /// # Why this takes a mint list
+    ///
+    /// Enumerating an owner's accounts means `getTokenAccountsByOwner`, which
+    /// is a SCAN — and providers reject scans under load, permanently in at
+    /// least one case:
+    ///
+    /// ```text
+    ///   scan aborted: scan rejected: memory pressure threshold exceeded
+    /// ```
+    ///
+    /// So the caller supplies the mints it cares about, which it already knows
+    /// from the audit log, and the addresses are DERIVED rather than searched
+    /// for. One targeted batch read instead of a scan.
+    ///
+    /// The trade: a token the bot did not buy through its own audit trail is
+    /// invisible here. That is the correct bias for a positions screen whose
+    /// job is showing what the bot is holding, and far better than the screen
+    /// showing nothing at all because the provider refused the query.
+    #[cfg(feature = "sniper")]
+    pub async fn token_holdings(
+        &self,
+        owner: &str,
+        mints: &[String],
+    ) -> Option<Vec<(String, f64)>> {
         if self.url.is_empty() {
             return None;
         }
+        if mints.is_empty() {
+            return Some(Vec::new());
+        }
+        use spl_associated_token_account_interface::address::
+            get_associated_token_address_with_program_id;
+        let owner_pk = crate::tx::pk(owner).ok()?;
+
         let mut out = Vec::new();
-        for program in [
-            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
-            "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
-        ] {
+        // Batched: `getMultipleAccounts` caps at 100 addresses, and each mint
+        // contributes two candidates (one per token program).
+        for chunk in mints.chunks(50) {
+            let mut addrs = Vec::with_capacity(chunk.len() * 2);
+            for m in chunk {
+                let Ok(mint_pk) = crate::tx::pk(m) else { continue };
+                addrs.push(
+                    get_associated_token_address_with_program_id(
+                        &owner_pk, &mint_pk, &crate::tx::TOKEN_PROGRAM,
+                    )
+                    .to_string(),
+                );
+                addrs.push(
+                    get_associated_token_address_with_program_id(
+                        &owner_pk, &mint_pk, &crate::tx::TOKEN_2022_PROGRAM,
+                    )
+                    .to_string(),
+                );
+            }
+            if addrs.is_empty() {
+                continue;
+            }
             let body = json!({
-                "jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
-                "params":[owner, {"programId": program},
-                          {"encoding":"jsonParsed","commitment": self.commitment}],
+                "jsonrpc":"2.0","id":1,"method":"getMultipleAccounts",
+                "params":[addrs, {"encoding":"jsonParsed","commitment": self.commitment}],
             });
             let resp: serde_json::Value = self
                 .client.post(&self.url).json(&body).send().await.ok()?.json().await.ok()?;
-            for acct in resp.get("result")?.get("value")?.as_array()? {
-                let info = acct.pointer("/account/data/parsed/info")?;
-                let mint = info.get("mint")?.as_str()?.to_string();
-                let amount = info
+            // A failed QUERY is not an empty wallet: propagate it.
+            let accts = resp.get("result")?.get("value")?.as_array()?;
+            for acct in accts {
+                let Some(info) = acct.pointer("/data/parsed/info") else { continue };
+                let Some(mint) = info.get("mint").and_then(|m| m.as_str()) else { continue };
+                let ui = info
                     .pointer("/tokenAmount/uiAmount")
                     .and_then(|v| v.as_f64())
                     .unwrap_or(0.0);
-                if amount > 0.0 {
-                    out.push((mint, amount));
+                if ui > 0.0 {
+                    out.push((mint.to_string(), ui));
                 }
             }
         }

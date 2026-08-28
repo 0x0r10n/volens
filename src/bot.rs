@@ -1291,21 +1291,24 @@ impl Bot {
                 return "⚠️ <b>No RPC configured</b>\nCannot read holdings.".to_string();
             };
 
-            let holdings = match rpc.token_holdings(&address).await {
-                Some(h) => h,
-                None => {
-                    return "⚠️ <b>Could not read holdings</b> (RPC error — not \"empty\")."
-                        .to_string();
-                }
-            };
-
-            // Cost basis from the bot's own executed buys.
+            // Cost basis from the bot's own executed buys. Read FIRST: its
+            // mints are also the candidate list for the holdings read, which
+            // derives addresses rather than scanning for them.
             let basis = if self.audit_log.is_empty() {
                 Default::default()
             } else {
                 match tokio::fs::read_to_string(&self.audit_log).await {
                     Ok(s) => cost_basis_from_audit(&s),
                     Err(_) => Default::default(),
+                }
+            };
+            let candidates: Vec<String> = basis.keys().cloned().collect();
+
+            let holdings = match rpc.token_holdings(&address, &candidates).await {
+                Some(h) => h,
+                None => {
+                    return "⚠️ <b>Could not read holdings</b> (RPC error — not \"empty\")."
+                        .to_string();
                 }
             };
 
@@ -1424,7 +1427,12 @@ impl Bot {
         #[cfg(feature = "sniper")]
         if let (Some(sniper), Some(rpc)) = (&self.sniper, &self.rpc) {
             if let Some((address, _)) = sniper.trading_identity() {
-                if let Some(holdings) = rpc.token_holdings(&address).await {
+                let candidates: Vec<String> = match tokio::fs::read_to_string(&self.audit_log).await
+                {
+                    Ok(s) => crate::positions::cost_basis_from_audit(&s).keys().cloned().collect(),
+                    Err(_) => Vec::new(),
+                };
+                if let Some(holdings) = rpc.token_holdings(&address, &candidates).await {
                     for (mint, _amt) in holdings.iter().take(10) {
                         // The ticker, not the mint — "DOGEK" is actionable,
                         // "Gw12…pump" is something you have to decode first.
