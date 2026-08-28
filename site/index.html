@@ -399,7 +399,7 @@
 
 <section class="col">
   <h2><span class="num">03</span>Reading the settings screen</h2>
-  <p class="lede">Four questions. The detail lives one tap down.</p>
+  <p class="lede">A handful of questions. The detail lives one tap down.</p>
 
   <div class="screen">
     <div class="title">⚙️ Settings</div>
@@ -408,6 +408,7 @@
       <span class="btn">💰 Buying · 0.08 SOL</span>
       <span class="btn">🎚 Selling · −25% / +100%</span>
     </div>
+    <div class="btnrow"><span class="btn acc">⭐ Alpha · on · 0.05 SOL</span></div>
     <div class="btnrow">
       <span class="btn">🔎 Filters · off</span>
       <span class="btn">🛡 Limits · 10/day</span>
@@ -420,14 +421,15 @@
       <tbody>
         <tr><td><strong>🤖 Auto-buy</strong></td><td>The master switch, and the SOL threshold that triggers an entry.</td></tr>
         <tr><td><strong>💰 Buying</strong></td><td>Trade size, slippage, max market cap, market-cap bands, supply cap.</td></tr>
-        <tr><td><strong>🎚 Selling</strong></td><td>Stop loss, take profit, break-even, trailing stop.</td></tr>
+        <tr><td><strong>🎚 Selling</strong></td><td>The exit order table, break-even, trailing stop.</td></tr>
+        <tr><td><strong>⭐ Alpha</strong></td><td>The second buy trigger, its buy amount, and its own order table.</td></tr>
         <tr><td><strong>🔎 Filters</strong></td><td>Volume confirmation, pool liquidity, curve floor.</td></tr>
         <tr><td><strong>🛡 Limits</strong></td><td>Trades per day.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>Auto-buy sits alone because it is the switch that decides whether any of the rest matters.</p>
+  <p>Auto-buy and Alpha each sit alone because they are the two switches that decide whether any of the rest matters. They are independent — either, both, or neither.</p>
 </section>
 
 <hr class="div">
@@ -478,35 +480,51 @@
 
 <section class="col">
   <h2><span class="num">05</span>Selling</h2>
-  <p class="lede">Four decisions, not a spreadsheet.</p>
+  <p class="lede">One table. The orders fire in the order you read them.</p>
 
   <div class="screen">
     <div class="title">🎚 Auto-sell · 🟢 On</div>
     <div class="console" style="margin:0 0 12px">
-🛑 Stop loss   <span class="c-stop">−25%</span>
-🎯 Take profit <span class="c-go">+100% · sell 100%</span>
-🔒 Break-even  <span class="c-acc">on</span>
-📉 Trailing    <span class="c-dim">off</span>
+<span class="c-stop">-25%</span>   →  sell 100%
+<span class="c-go">+100%</span>  →  sell 50%
+<span class="c-go">+250%</span>  →  sell 20%
+<span class="c-go">+900%</span>  →  sell 10%
+
+Trailing <span class="c-dim">off</span>   Break-even <span class="c-acc">on</span>
+Targets total <span class="c-acc">80%</span>
     </div>
+    <div class="btnrow"><span class="btn on">Auto-sell · 🟢 On</span></div>
+    <div class="btnrow"><span class="btn">📋 Orders</span></div>
     <div class="btnrow">
-      <span class="btn">🛑 Stop loss · −25%</span>
-      <span class="btn">🎯 Take profit · +100%</span>
-    </div>
-    <div class="btnrow">
-      <span class="btn">🔒 Break-even · on</span>
       <span class="btn">📉 Trailing · off</span>
+      <span class="btn">🔒 Break-even · on</span>
     </div>
-    <div class="btnrow">
-      <span class="btn">⚙️ More targets</span>
-      <span class="btn">◀️ Back</span>
-    </div>
+  </div>
+
+  <p>Behind <strong>Orders</strong> is the list itself — each row taps through to its own editor, <code>✕</code> removes it, <strong>Add order</strong> appends a new one.</p>
+
+  <h3>How an order works</h3>
+  <p>Every order is two numbers: <em class="term">a trigger</em> and <em class="term">how much to sell</em>.</p>
+  <ul class="plain">
+    <li><strong>Negative trigger = a stop.</strong> <code>-25%</code> sells when the position is 25% below cost. Set its amount to <code>100%</code> unless you have a reason not to.</li>
+    <li><strong>Positive trigger = a target.</strong> <code>+100%</code> sells when the position has doubled.</li>
+    <li><strong>Amounts are shares of the original position</strong>, so they add up. Targets totalling more than 100% means the later ones find less than they asked for — the screen shows the running total and flags it.</li>
+  </ul>
+
+  <p>A worked ladder: take your stake back at the first double, then let the rest run.</p>
+  <div class="console">
+-25%   →  sell 100%   <span class="c-dim">the stop</span>
++100%  →  sell 50%    <span class="c-dim">initial stake back</span>
++250%  →  sell 20%
++400%  →  sell 20%
++900%  →  sell 10%    <span class="c-dim">the runner</span>
   </div>
 
   <ul class="plain">
     <li><strong>Stops are checked before targets.</strong> A position that gaps from +300% to −60% exits rather than taking a target on the way past.</li>
-    <li><strong>Break-even</strong> is a toggle. Once a position has been up, if it comes back it exits at cost — no profit, no loss.</li>
+    <li><strong>Targets fire lowest-first, once each.</strong></li>
+    <li><strong>Break-even</strong> is a toggle, not a level. Once a position has been up, if it comes back it exits at cost — no profit, no loss.</li>
     <li><strong>Trailing</strong> sells everything once the position falls a set percentage from its peak, and only after it has been in profit.</li>
-    <li><strong>More targets</strong> holds the full ladder if you want several rungs, with a running total of what is left.</li>
   </ul>
 
   <div class="note danger">
@@ -518,7 +536,65 @@
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">06</span>Sizing by market cap</h2>
+  <h2><span class="num">06</span>Alpha smart money</h2>
+  <p class="lede">A second buy trigger that asks a different question: not <em class="term">how much</em> smart money bought, but <em class="term">whose</em>.</p>
+
+  <p>Normal auto-buy fires on aggregate volume — enough tracked SOL went into one token. It does not care which wallets moved it. Alpha scores the tracked wallets on how their past calls actually performed, promotes the ones that clear a bar, and buys when one of <strong>those</strong> wallets buys, whatever the volume did.</p>
+
+  <div class="screen">
+    <div class="title">⭐ Alpha · 🟢 On</div>
+    <div class="console" style="margin:0 0 12px">
+Buy amount  <span class="c-acc">0.05 SOL</span>
+Orders      <span class="c-go">-15% / +250%</span>
+    </div>
+    <div class="btnrow"><span class="btn on">Alpha · 🟢 On</span></div>
+    <div class="btnrow">
+      <span class="btn">💰 Buy · 0.05 SOL</span>
+      <span class="btn">📋 Orders</span>
+    </div>
+  </div>
+
+  <h3>It is genuinely separate</h3>
+  <ul class="plain">
+    <li><strong>Its own buy amount.</strong> Not the normal trade size, and the market-cap bands never resize it — the amount you set is the amount it spends.</li>
+    <li><strong>Its own order table.</strong> Same controls as the normal one, entirely separate storage. Changing one never touches the other.</li>
+    <li><strong>Independent of auto-buy.</strong> Run either, both, or neither. Both can fire on the same token — that is the strongest case, not a bug.</li>
+    <li><strong>Same safety vetoes.</strong> Every guard that runs before a normal buy runs before an Alpha buy, on the same code path.</li>
+  </ul>
+
+  <h3>Which wallets qualify</h3>
+  <p>Scored from the call history you can already see — which tracked wallets bought each announced token, and the peak that token reached. Nothing new is recorded, so a wallet's score can always be reconciled against the leaderboard.</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Rule</th><th>Default</th></tr></thead>
+      <tbody>
+        <tr><td>Resolved calls needed</td><td>8</td></tr>
+        <tr><td>Share of them reaching 2×</td><td>35%</td></tr>
+        <tr><td>Must have bought within</td><td>72 hours</td></tr>
+        <tr><td>Looking back over</td><td>7 days</td></tr>
+        <tr><td>A call counts as resolved after</td><td>1 hour</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>That last row matters more than it looks. A token called ten minutes ago has not had time to go anywhere, and counting it as a miss would penalise the busiest wallets hardest — exactly backwards. Fresh calls prove a wallet is <em class="term">active</em>; only matured ones count toward its <em class="term">record</em>.</p>
+
+  <p>These live in the host config, not Telegram. Which wallets get trusted with money is a decision to make deliberately, not a slider to nudge between trades. On the current book, <strong>68 of 1,117 tracked wallets qualify</strong>.</p>
+
+  <div class="note">
+    <span class="h">Set a buy amount, or nothing happens</span>
+    <p>Alpha switched on with the amount left at zero looks armed and does nothing. If its order table is also empty, Alpha positions fall back to the normal auto-sell ladder — the screen says so rather than leaving a position with no exits at all.</p>
+  </div>
+
+  <h3>When both trigger on one token</h3>
+  <p>There is still one position on chain, with one balance. Both buys count toward its cost basis, and <strong>Alpha's orders govern the exit</strong> — it is the more specific thesis, and letting the general rules take over would mean the Alpha settings did nothing on precisely the signals the mode exists to catch.</p>
+</section>
+
+<hr class="div">
+
+<section class="col">
+  <h2><span class="num">07</span>Sizing by market cap</h2>
   <p class="lede">One SOL amount for every token treats a $20K launch like a $2M one.</p>
 
   <div class="screen">
@@ -549,7 +625,7 @@ $500K–$1M    →  0.50 SOL
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">07</span>What runs before every buy</h2>
+  <h2><span class="num">08</span>What runs before every buy</h2>
   <p class="lede">Seven checks. Any one refuses the trade.</p>
 
   <div class="tablewrap">
@@ -574,7 +650,7 @@ $500K–$1M    →  0.50 SOL
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">08</span>Reading the alerts</h2>
+  <h2><span class="num">09</span>Reading the alerts</h2>
   <p class="lede">What lands in the group, and what it means.</p>
 
   <h3>A buy</h3>
@@ -584,6 +660,14 @@ $500K–$1M    →  0.50 SOL
 confirmed 4fPt56PL…
   </div>
   <p>Short mint, size, entry market cap, and where the transaction landed. Tap <strong>Positions</strong> for live P&amp;L and per-position sell buttons.</p>
+
+  <h3>An Alpha buy</h3>
+  <div class="console">
+<span class="c-acc">⭐ ALPHA BUY</span> · <span class="c-dim">Grizzl…8ppump</span>
+0.05 SOL  ·  cupseyy
+confirmed 4fPt56PL…
+  </div>
+  <p>Named after the wallet that triggered it. If the volume trigger also fires on the same token you get both messages — two decisions, two sizes, and the position is now the sum of them.</p>
 
   <h3>A sell</h3>
   <div class="console">
@@ -616,7 +700,7 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">09</span>What the signal is actually worth</h2>
+  <h2><span class="num">10</span>What the signal is actually worth</h2>
   <p class="lede">Measured over 2,018 priced tokens. Read both columns together.</p>
 
   <div class="tablewrap">
@@ -646,8 +730,8 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">10</span>A safe first session</h2>
-  <p class="lede">In order. The whole point is that step 6 is boring.</p>
+  <h2><span class="num">11</span>A safe first session</h2>
+  <p class="lede">In order. The whole point is that the last step is boring.</p>
 
   <ol class="steps">
     <li>
@@ -668,7 +752,11 @@ No fills observed, so it cannot be priced — or sold — right now.
     </li>
     <li>
       <h3>Set a stop you'd actually accept</h3>
-      <p>Wide enough to sit outside the spread. <code>−25%</code> is a reasonable start; <code>−5%</code> will stop you out on entry.</p>
+      <p>Add one order under <strong>Selling → Orders</strong>: trigger <code>−25%</code>, amount <code>100%</code>. Wide enough to sit outside the spread — <code>−5%</code> will stop you out on entry. Add targets later, once you have watched a few trades.</p>
+    </li>
+    <li>
+      <h3>Leave Alpha off for the first session</h3>
+      <p>One trigger at a time. You cannot tell which one produced a result if both are running, and Alpha spends its own amount on top of everything auto-buy does.</p>
     </li>
     <li>
       <h3>Resume, and watch the first trade land</h3>
@@ -684,7 +772,7 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">11</span>Honest limits</h2>
+  <h2><span class="num">12</span>Honest limits</h2>
   <p class="lede">Things worth knowing before trusting it with size.</p>
 
   <ul class="plain">
@@ -694,6 +782,9 @@ No fills observed, so it cannot be priced — or sold — right now.
     <li><strong>Some tokens can't be sold at any price.</strong> If liquidity is pulled, no exit strategy helps. The stop can only fire while someone is still buying.</li>
     <li><strong>Speed is location.</strong> Running near the data source is worth more than any code change — the same bot is about 830ms faster per entry on a well-placed server than on home internet.</li>
     <li><strong>Only ever run one copy.</strong> Two instances sharing a wallet will double-trade every signal.</li>
+    <li><strong>Don't share the trading wallet with another app.</strong> The bot reconstructs cost basis from its own trade log, so a manual buy or sell made elsewhere from the same wallet is invisible to it — positions and P&amp;L drift until the next reconciliation.</li>
+    <li><strong>Alpha scores from the call, not from each wallet's own entry.</strong> Per-wallet fill prices aren't recorded, so a wallet that bought late is credited with a little more than it earned. The sample minimum is set high enough that this can't promote a wallet on its own.</li>
+    <li><strong>Keep enough SOL for fees.</strong> Exits cost a fee, and a routed exit can need rent up front. A wallet too empty to pay it cannot sell — the stop fires and is rejected.</li>
   </ul>
 </section>
 
