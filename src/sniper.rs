@@ -980,7 +980,7 @@ impl Sniper {
         // did. The only difference is that a mint which fails safety has now
         // also spent a quote — wasted work on a token we were never going to
         // buy, which is the correct trade for the time saved on ones we do.
-        let lamports = (size * 1e9) as u64;
+        let mut lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let max_mcap = live.effective_max_market_cap(&env);
         let (mint_info, quote, supply) = tokio::join!(
@@ -1018,6 +1018,54 @@ impl Sniper {
                 return BuyOutcome::Refused { reason: "could not verify the mint".into() };
             }
         };
+
+        // MARKET-CAP BUY BANDS.
+        //
+        // The size is chosen from the token's valuation rather than being one
+        // number for everything: the same SOL buys a very different share of a
+        // $20k launch and a $2M token, and carries a very different risk.
+        //
+        // The first quote is priced at the DEFAULT size purely to learn the
+        // market cap — the per-token price barely moves at these sizes, so it
+        // is a sound estimate of the valuation whatever size we end up using.
+        // If a band selects something different, the quote is redone at that
+        // size, because a quote for the wrong amount is not a quote for this
+        // trade. One extra round trip, and only when a band actually applies.
+        let mut size = size;
+        let mut quote = quote;
+        if !live.buy_tiers.is_empty()
+            && let Ok(q) = &quote
+        {
+            let tokens_ui = q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
+            let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
+            let mcap = match (tokens_ui > 0.0).then_some(()).and(sol_usd).zip(supply) {
+                Some((sol_usd, sup)) => Some((size / tokens_ui) * sup * sol_usd),
+                None => None,
+            };
+            let tiered = live.size_for_mcap(mcap);
+            if (tiered - size).abs() > f64::EPSILON {
+                if max_size > 0.0 && tiered > max_size {
+                    return BuyOutcome::Refused {
+                        reason: format!(
+                            "band size {tiered} SOL exceeds the {max_size} SOL ceiling"
+                        ),
+                    };
+                }
+                info!(
+                    %mint,
+                    mcap_usd = mcap.unwrap_or(0.0),
+                    from = size,
+                    to = tiered,
+                    "market-cap band selected a different size"
+                );
+                size = tiered;
+                // Reassigned, NOT shadowed: the curve builder below takes
+                // `lamports`, and a local binding here would have left it
+                // building at the default size while `size` said otherwise.
+                lamports = (size * 1e9) as u64;
+                quote = jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await;
+            }
+        }
 
         // Hoisted: both the curve path and the Jupiter path apply this, and
         // the curve path now runs FIRST. `max_mcap` is already bound above,
@@ -1618,6 +1666,36 @@ impl Sniper {
             }
             s.exits.set_target(pct, amount);
             Ok(format!("take profit sells {amount}% at +{pct}%"))
+        })
+    }
+
+    /// Add a market-cap band. Refuses one that overlaps an existing band.
+    pub fn add_buy_tier(&self, min_usd: f64, max_usd: f64, sol: f64) -> Result<String, String> {
+        let tier = crate::settings::BuyTier { min_usd, max_usd, sol };
+        let label = crate::settings::describe_tier(&tier);
+        self.settings.update(|s| {
+            s.add_tier(tier)?;
+            Ok(format!("{label} → {sol} SOL"))
+        })
+    }
+
+    /// Remove the band at `idx` in the sorted list.
+    pub fn remove_buy_tier(&self, idx: usize) -> Result<String, String> {
+        self.settings.update(|s| {
+            if idx >= s.buy_tiers.len() {
+                return Err("no such band".to_string());
+            }
+            let t = s.buy_tiers.remove(idx);
+            Ok(format!("removed {}", crate::settings::describe_tier(&t)))
+        })
+    }
+
+    /// Clear every band; the default size applies to everything again.
+    pub fn clear_buy_tiers(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            let n = s.buy_tiers.len();
+            s.buy_tiers.clear();
+            Ok(format!("cleared {n} band(s) — the default size applies to every token"))
         })
     }
 

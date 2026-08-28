@@ -409,6 +409,31 @@ impl Bot {
                 }
                 return;
             }
+            if field == "addtier" {
+                let (reply, kb) = match parse_tier_args(value) {
+                    Ok((lo, hi, sol)) => match self
+                        .sniper
+                        .as_ref()
+                        .map(|sn| sn.add_buy_tier(lo, hi, sol))
+                    {
+                        Some(Ok(m)) => {
+                            let (t, k) = self.tiers_screen();
+                            (format!("✅ {}\n\n{t}", escape_html(&m)), k)
+                        }
+                        Some(Err(e)) => {
+                            let (t, k) = self.tiers_screen();
+                            (format!("⚠️ {}\n\n{t}", escape_html(&e)), k)
+                        }
+                        None => ("⚪ Sniper not configured".to_string(), back_to_settings()),
+                    },
+                    Err(e) => {
+                        let (t, k) = self.tiers_screen();
+                        (format!("⚠️ {}\n\n{t}", escape_html(&e)), k)
+                    }
+                };
+                self.reply_with(chat_id, reply, kb).await;
+                return;
+            }
             if let Some(sol) = field.strip_prefix("wd_dest|") {
                 let (reply, kb) = self.withdraw_prompt_screen(Some(&format!("{sol} {value}")));
                 self.reply_with(chat_id, reply, kb).await;
@@ -673,6 +698,10 @@ impl Bot {
         #[cfg(feature = "sniper")]
         if data == "set:supplycap" {
             return Some(self.supply_cap_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:tiers" {
+            return Some(self.tiers_screen());
         }
         #[cfg(feature = "sniper")]
         if data == "set:exits" {
@@ -1487,6 +1516,9 @@ impl Bot {
                  "callback_data": "set:maxtrades"},
                 {"text": format!("📊 Volume · {}", if live.volume_mode { "on" } else { "off" }),
                  "callback_data": "set:volume"},
+                {"text": format!("📊 MC buy bands · {}", if live.buy_tiers.is_empty() {
+                    "off".to_string() } else { format!("{}", live.buy_tiers.len()) }),
+                 "callback_data": "set:tiers"},
                 {"text": format!("🪙 Supply cap · {}", if live.supply_cap {
                     fmt_supply_pct(live.max_supply_pct) } else { "off".to_string() }),
                  "callback_data": "set:supplycap"},
@@ -1579,6 +1611,10 @@ impl Bot {
             "smartsol" => ("smart-money inflow", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
+            "addtier" => (
+                "market-cap band",
+                "three values: <b>min max size</b>\n\n                 <code>50k 100k 0.2</code> — $50K–$100K buys 0.2 SOL\n                 <code>1m 2m 0.75</code> — $1M–$2M buys 0.75 SOL\n                 <code>2m 0 1.0</code> — $2M and above buys 1 SOL",
+            ),
             "maxsize" => ("max trade size", "e.g. <code>0.08</code> (SOL)"),
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
@@ -1651,6 +1687,49 @@ impl Bot {
             rows.push(serde_json::Value::Array(chunk.to_vec()));
         }
         rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "cmd:settings"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// Buy size by market-cap band.
+    #[cfg(feature = "sniper")]
+    fn tiers_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let mut body = String::new();
+        for t in &live.buy_tiers {
+            body.push_str(&format!(
+                "{}  →  <b>{} SOL</b>\n",
+                escape_html(&crate::settings::describe_tier(t)),
+                t.sol
+            ));
+        }
+        if live.buy_tiers.is_empty() {
+            body.push_str("<i>none — every token uses the default</i>\n");
+        }
+        let text = format!(
+            "📊 <b>Buy by market cap</b>\n\n             Default buy: <b>{} SOL</b>\n\n{body}\n             <i>A token that falls in a band buys that amount; anything else \
+             uses the default. Bands cannot overlap, so every token matches at \
+             most one.</i>",
+            live.trade_size_sol
+        );
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for (i, t) in live.buy_tiers.iter().enumerate() {
+            rows.push(serde_json::json!([
+                {"text": format!("{} → {} SOL", crate::settings::describe_tier(t), t.sol),
+                 "callback_data": "set:tiers"},
+                {"text": "✕", "callback_data": format!("setv:deltier:{i}")},
+            ]));
+        }
+        rows.push(serde_json::json!([
+            {"text": "➕ Add band", "callback_data": "ask:addtier"},
+            {"text": "♻️ Reset", "callback_data": "setv:cleartiers:1"},
+        ]));
+        rows.push(serde_json::json!([
+            {"text": "💰 Default buy", "callback_data": "set:size"},
+            {"text": "◀️ Back", "callback_data": "cmd:settings"},
+        ]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
@@ -1925,6 +2004,8 @@ impl Bot {
             "autobuy_on" => (sniper.toggle_auto_buy(), "autobuy".into()),
             "volume_on" => (sniper.toggle_volume_mode(), "volume".into()),
             "supplycap_on" => (sniper.toggle_supply_cap(), "supplycap".into()),
+            "cleartiers" => (sniper.clear_buy_tiers(), "tiers".into()),
+            "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
             "breakeven_on" => (sniper.toggle_breakeven(), "exits".into()),
             "autobuy_min" => (sniper.set_auto_buy_min(value.parse().ok()?), "autobuy".into()),
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
@@ -1951,6 +2032,8 @@ impl Bot {
             self.volume_screen()
         } else if screen == "supplycap" {
             self.supply_cap_screen()
+        } else if screen == "tiers" {
+            self.tiers_screen()
         } else {
             self.exits_screen()
         };
@@ -2919,6 +3002,40 @@ fn parse_withdraw_args(args: Option<&str>) -> Result<(f64, String, Option<String
         return Err("that doesn't look like a Solana address".into());
     }
     Ok((sol, address.to_string(), wallet))
+}
+
+/// Parse "50k 100k 0.2" into a band.
+///
+/// Suffixes are accepted because nobody wants to type 100000000 on a phone,
+/// and a mistyped zero on a market cap is a very expensive typo.
+#[cfg(feature = "sniper")]
+fn parse_tier_args(raw: &str) -> Result<(f64, f64, f64), String> {
+    const USAGE: &str = "three values: min max size — e.g. 50k 100k 0.2";
+    let mut it = raw.split_whitespace();
+    let (a, b, c) = match (it.next(), it.next(), it.next()) {
+        (Some(a), Some(b), Some(c)) => (a, b, c),
+        _ => return Err(USAGE.into()),
+    };
+    let money = |s: &str| -> Result<f64, String> {
+        let s = s.trim_start_matches('$').to_ascii_lowercase();
+        let (num, mult) = match s.chars().last() {
+            Some('k') => (&s[..s.len() - 1], 1e3),
+            Some('m') => (&s[..s.len() - 1], 1e6),
+            Some('b') => (&s[..s.len() - 1], 1e9),
+            _ => (s.as_str(), 1.0),
+        };
+        num.parse::<f64>().map(|v| v * mult).map_err(|_| format!("'{s}' is not a number"))
+    };
+    let lo = money(a)?;
+    let hi = money(b)?;
+    let sol: f64 = c.parse().map_err(|_| format!("'{c}' is not a SOL amount"))?;
+    if sol <= 0.0 {
+        return Err("the buy size must be greater than 0".into());
+    }
+    if hi > 0.0 && hi <= lo {
+        return Err("the upper bound must be above the lower one".into());
+    }
+    Ok((lo, hi, sol))
 }
 
 /// Share-of-supply for a button.

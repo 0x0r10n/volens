@@ -87,6 +87,18 @@ pub struct LiveSettings {
     #[serde(default)]
     pub auto_buy_min_wallets: usize,
 
+    /// Buy size by market-cap band. Empty = always use `trade_size_sol`.
+    ///
+    /// A fixed size treats a $20k launch and a $2M token as the same bet, which
+    /// they are not — the same SOL buys a very different share of each, and
+    /// carries a very different risk. These override `trade_size_sol` for a
+    /// token that falls inside one.
+    ///
+    /// A token matching NO band uses `trade_size_sol`, so the bands are an
+    /// override rather than a table you must complete before the bot works.
+    #[serde(default)]
+    pub buy_tiers: Vec<BuyTier>,
+
     /// Enforce the supply-share ceiling. Separate from the percentage so the
     /// rule can be switched off without losing the number you tuned.
     #[serde(default)]
@@ -135,6 +147,42 @@ pub struct LiveSettings {
     pub min_token_volume_sol: f64,
 }
 
+/// One market-cap band and the size to buy inside it.
+///
+/// Bands are half-open — `[min, max)` — so a token at exactly the boundary
+/// falls in the upper band and nowhere else. Ambiguity here is not a cosmetic
+/// problem: a token matching two rules would buy a different amount depending
+/// on iteration order, which is the kind of bug that only shows up in the
+/// audit log weeks later.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BuyTier {
+    /// Inclusive lower bound, USD.
+    pub min_usd: f64,
+    /// Exclusive upper bound, USD. 0 = unbounded above.
+    pub max_usd: f64,
+    pub sol: f64,
+}
+
+impl BuyTier {
+    pub fn contains(&self, mcap_usd: f64) -> bool {
+        mcap_usd >= self.min_usd && (self.max_usd <= 0.0 || mcap_usd < self.max_usd)
+    }
+
+    /// Do two bands share any market cap at all?
+    pub fn overlaps(&self, other: &BuyTier) -> bool {
+        let a_hi = if self.max_usd <= 0.0 { f64::INFINITY } else { self.max_usd };
+        let b_hi = if other.max_usd <= 0.0 { f64::INFINITY } else { other.max_usd };
+        self.min_usd < b_hi && other.min_usd < a_hi
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.min_usd >= 0.0
+            && self.sol > 0.0
+            && self.sol.is_finite()
+            && (self.max_usd <= 0.0 || self.max_usd > self.min_usd)
+    }
+}
+
 /// The config-side ceilings this process may never exceed.
 #[derive(Debug, Clone, Copy)]
 pub struct Envelope {
@@ -175,6 +223,38 @@ pub fn tightest_u32(live: u32, hard: u32) -> u32 {
 }
 
 impl LiveSettings {
+    /// The size to buy a token at this market cap, in SOL.
+    ///
+    /// Falls back to `trade_size_sol` when no band matches — including when the
+    /// market cap could not be computed at all, which must not silently stop
+    /// the bot trading.
+    pub fn size_for_mcap(&self, mcap_usd: Option<f64>) -> f64 {
+        let Some(mc) = mcap_usd.filter(|m| *m > 0.0) else {
+            return self.trade_size_sol;
+        };
+        self.buy_tiers
+            .iter()
+            .find(|t| t.is_valid() && t.contains(mc))
+            .map(|t| t.sol)
+            .unwrap_or(self.trade_size_sol)
+    }
+
+    /// Add a band, refusing one that overlaps an existing one.
+    pub fn add_tier(&mut self, tier: BuyTier) -> Result<(), String> {
+        if !tier.is_valid() {
+            return Err("a band needs a positive size and max above min".into());
+        }
+        if let Some(clash) = self.buy_tiers.iter().find(|t| t.overlaps(&tier)) {
+            return Err(format!(
+                "overlaps the existing {} band — bands must not share any market cap",
+                describe_tier(clash)
+            ));
+        }
+        self.buy_tiers.push(tier);
+        self.buy_tiers.sort_by(|a, b| a.min_usd.total_cmp(&b.min_usd));
+        Ok(())
+    }
+
     pub fn auto_buy_active(&self, _env: &Envelope) -> bool {
         self.auto_buy
     }
@@ -209,6 +289,7 @@ impl LiveSettings {
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
             auto_buy_min_wallets: 0,
+            buy_tiers: Vec::new(),
             supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
@@ -497,5 +578,82 @@ mod tests {
         });
         assert_eq!(err, Err("nope".into()));
         assert_eq!(store.snapshot(), before, "a refused update must not leak a partial write");
+    }
+
+    /// Bands must never be ambiguous: a token matching two would buy a
+    /// different amount depending on iteration order.
+    #[test]
+    fn bands_may_not_overlap() {
+        let mut s = live();
+        s.buy_tiers.clear();
+        s.add_tier(BuyTier { min_usd: 50e3, max_usd: 100e3, sol: 0.2 }).unwrap();
+        // Straddles the existing band.
+        let err = s
+            .add_tier(BuyTier { min_usd: 75e3, max_usd: 200e3, sol: 0.3 })
+            .unwrap_err();
+        assert!(err.contains("overlaps"), "got: {err}");
+        // Touching at the boundary is fine — bands are [min, max).
+        s.add_tier(BuyTier { min_usd: 100e3, max_usd: 500e3, sol: 0.35 }).unwrap();
+        assert_eq!(s.buy_tiers.len(), 2);
+    }
+
+    /// The boundary belongs to exactly one band.
+    #[test]
+    fn a_market_cap_matches_at_most_one_band() {
+        let mut s = live();
+        s.buy_tiers.clear();
+        s.trade_size_sol = 0.2;
+        s.add_tier(BuyTier { min_usd: 10e3, max_usd: 50e3, sol: 0.1 }).unwrap();
+        s.add_tier(BuyTier { min_usd: 50e3, max_usd: 100e3, sol: 0.25 }).unwrap();
+
+        assert_eq!(s.size_for_mcap(Some(20e3)), 0.1);
+        assert_eq!(s.size_for_mcap(Some(50e3)), 0.25, "the boundary goes to the upper band");
+        assert_eq!(s.size_for_mcap(Some(73e3)), 0.25, "the worked example");
+    }
+
+    /// No matching band, and no market cap at all, both fall back to the
+    /// default. An unknown valuation must not stop the bot trading.
+    #[test]
+    fn an_unmatched_or_unknown_market_cap_uses_the_default() {
+        let mut s = live();
+        s.buy_tiers.clear();
+        s.trade_size_sol = 0.2;
+        s.add_tier(BuyTier { min_usd: 10e3, max_usd: 50e3, sol: 0.1 }).unwrap();
+
+        assert_eq!(s.size_for_mcap(Some(75e3)), 0.2, "gap between bands");
+        assert_eq!(s.size_for_mcap(None), 0.2, "market cap unknown");
+        assert_eq!(s.size_for_mcap(Some(0.0)), 0.2, "market cap unusable");
+    }
+
+    /// An open-ended top band.
+    #[test]
+    fn a_band_with_no_upper_bound_catches_everything_above() {
+        let mut s = live();
+        s.buy_tiers.clear();
+        s.add_tier(BuyTier { min_usd: 2e6, max_usd: 0.0, sol: 1.0 }).unwrap();
+        assert_eq!(s.size_for_mcap(Some(50e6)), 1.0);
+        assert_eq!(s.size_for_mcap(Some(1e6)), s.trade_size_sol, "below it, default");
+        // And nothing may overlap it.
+        assert!(s.add_tier(BuyTier { min_usd: 3e6, max_usd: 4e6, sol: 0.5 }).is_err());
+    }
+}
+
+/// A band as a reader would say it: "$50K–$100K".
+pub fn describe_tier(t: &BuyTier) -> String {
+    let f = |v: f64| {
+        if v >= 1e9 {
+            format!("${:.1}B", v / 1e9)
+        } else if v >= 1e6 {
+            format!("${:.1}M", v / 1e6)
+        } else if v >= 1e3 {
+            format!("${:.0}K", v / 1e3)
+        } else {
+            format!("${v:.0}")
+        }
+    };
+    if t.max_usd <= 0.0 {
+        format!("{}+", f(t.min_usd))
+    } else {
+        format!("{}–{}", f(t.min_usd), f(t.max_usd))
     }
 }
