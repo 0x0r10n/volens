@@ -147,9 +147,20 @@ def main():
     ap.add_argument("--top", type=int, default=25)
     ap.add_argument("--no-quotes", action="store_true",
                     help="skip live quotes; use sampled outcomes only")
+    ap.add_argument("--sort", choices=["peak", "final"], default="peak",
+                    help="rank by best price reached (peak) or by where the "
+                         "position actually ended (final). Peak flatters: a "
+                         "wallet that touches 30x and gives it all back "
+                         "outranks one that holds 3x")
+    ap.add_argument("--window", choices=["24h", "7d", "30d", "all"], default=None,
+                    help="convenience for --since, relative to now")
     ap.add_argument("--by-group", action="store_true",
                     help="aggregate by wallet group instead of listing wallets")
     args = ap.parse_args()
+    if args.window and args.window != "all":
+        import datetime as _dt
+        days = {"24h": 1, "7d": 7, "30d": 30}[args.window]
+        args.since = (_dt.date.today() - _dt.timedelta(days=days)).isoformat()
 
     buys = load_jsonl(args.buys)
     if args.since:
@@ -279,7 +290,11 @@ def main():
             w["wins"] += 1
 
     ranked = [v for v in W.values() if v["n"] >= args.min_buys and v["paid"] > 0]
-    ranked.sort(key=lambda v: v["peak_w"] / v["paid"], reverse=True)
+    # Peak is what a wallet touched; final is what it kept. Ranking on peak
+    # rewards a wallet that hit 30x and round-tripped it over one that held 3x,
+    # which is backwards for deciding who to follow.
+    key = "final_w" if args.sort == "final" else "peak_w"
+    ranked.sort(key=lambda v: v[key] / v["paid"], reverse=True)
 
     print(f"\n{len(ranked)} wallets with >= {args.min_buys} buys\n")
     print(f"{'wallet':<24}{'buys':>5}{'paid':>9}{'peak':>7}{'final':>7}{'2x+':>6}{'rug':>6}{'smp':>5}{'?':>5}")
