@@ -399,227 +399,248 @@
 
 <section class="col">
   <h2><span class="num">03</span>Reading the settings screen</h2>
-  <p class="lede">Everything is a button. Tap one, get options, or type a custom value.</p>
+  <p class="lede">Four questions. The detail lives one tap down.</p>
 
   <div class="screen">
     <div class="title">⚙️ Settings</div>
+    <div class="btnrow"><span class="btn acc">🤖 Auto-buy · on · 10 SOL</span></div>
     <div class="btnrow">
-      <span class="btn">💰 Size · 0.01 SOL</span>
-      <span class="btn">📉 Slippage · 300 bps</span>
+      <span class="btn">💰 Buying · 0.08 SOL</span>
+      <span class="btn">🎚 Selling · −25% / +100%</span>
     </div>
     <div class="btnrow">
-      <span class="btn">💧 Pool liq · 15 SOL</span>
-      <span class="btn">🌱 Curve liq · off</span>
-    </div>
-    <div class="btnrow">
-      <span class="btn">🎚 TP / SL</span>
-      <span class="btn">🔢 Trades/day · 10</span>
-      <span class="btn">📊 Volume · off</span>
-    </div>
-    <div class="btnrow">
-      <span class="btn acc">🤖 Auto-buy · on · 4 buyers</span>
+      <span class="btn">🔎 Filters · off</span>
+      <span class="btn">🛡 Limits · 10/day</span>
     </div>
   </div>
 
   <div class="tablewrap">
     <table>
-      <thead>
-        <tr><th>Setting</th><th>What it means</th><th class="num-col">Sane start</th></tr>
-      </thead>
+      <thead><tr><th>Section</th><th>Holds</th></tr></thead>
       <tbody>
-        <tr><td><strong>Size</strong></td><td>SOL spent per trade. The single biggest lever on both risk and cost efficiency.</td><td class="mono">0.05–0.1</td></tr>
-        <tr><td><strong>Slippage</strong></td><td>How far the price may move against you between quote and fill. 300 bps = 3%.</td><td class="mono">300</td></tr>
-        <tr><td><strong>Pool liq</strong></td><td>Minimum depth for tokens trading on a normal exchange pool. Thin pools are rug surface.</td><td class="mono">15 SOL</td></tr>
-        <tr><td><strong>Curve liq</strong></td><td>Same idea for pump.fun bonding curves — but these are <em class="term">supposed</em> to be small early, so 0 is normal.</td><td class="mono">0</td></tr>
-        <tr><td><strong>Trades/day</strong></td><td>Hard ceiling on entries per day. Your main defence against a runaway.</td><td class="mono">5–10</td></tr>
-        <tr><td><strong>Auto-buy</strong></td><td>Master switch, plus how many tracked wallets must converge before buying.</td><td class="mono">on · 4–5</td></tr>
+        <tr><td><strong>🤖 Auto-buy</strong></td><td>The master switch, and the SOL threshold that triggers an entry.</td></tr>
+        <tr><td><strong>💰 Buying</strong></td><td>Trade size, slippage, max market cap, market-cap bands, supply cap.</td></tr>
+        <tr><td><strong>🎚 Selling</strong></td><td>Stop loss, take profit, break-even, trailing stop.</td></tr>
+        <tr><td><strong>🔎 Filters</strong></td><td>Volume confirmation, pool liquidity, curve floor.</td></tr>
+        <tr><td><strong>🛡 Limits</strong></td><td>Trades per day.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <div class="note caution">
-    <span class="h">Trades per day is not cosmetic</span>
-    <p>In one two-hour session with this set to 1000, the bot opened and closed <strong>62 positions</strong>. That was intentional, and it worked — but it's the number that decides how much can happen while you're asleep. Set it to what you'd be comfortable waking up to.</p>
+  <p>Auto-buy sits alone because it is the switch that decides whether any of the rest matters.</p>
+</section>
+
+<hr class="div">
+
+<section class="col">
+  <h2><span class="num">04</span>What triggers a buy</h2>
+  <p class="lede">Smart-money SOL volume — not how many wallets bought.</p>
+
+  <p>The bot sums what the tracked cohort spent on one token inside a ten-minute window. When that total crosses your threshold, it buys.</p>
+
+  <div class="screen">
+    <div class="title">🤖 Auto-buy</div>
+    <div class="btnrow"><span class="btn on">🟢 On — tap to disable</span></div>
+    <div class="btnrow">
+      <span class="btn">💸 Smart volume · 10 SOL</span>
+      <span class="btn">◀️ Back</span>
+    </div>
+  </div>
+
+  <p><strong>Size is the signal, not headcount.</strong> Five wallets putting in 0.05 SOL each is not the same conviction as two putting in 5 SOL, and a count cannot tell them apart. There is no wallet-count setting — it was removed, not merely defaulted off.</p>
+
+  <h3>Choosing the number</h3>
+  <p>Measured across 91,672 tracked buys and 11,064 tokens:</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Threshold</th><th class="num-col">Tokens qualifying</th><th>Reads as</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">1 SOL</td><td class="num-col">89%</td><td>one wallet showing up — barely a filter</td></tr>
+        <tr><td class="mono">2 SOL</td><td class="num-col">63%</td><td>two typical buys</td></tr>
+        <tr><td class="mono">5 SOL</td><td class="num-col">39%</td><td>loose</td></tr>
+        <tr><td class="mono">10 SOL</td><td class="num-col">20%</td><td>real commitment</td></tr>
+        <tr><td class="mono">20 SOL</td><td class="num-col">8%</td><td>strong conviction</td></tr>
+        <tr><td class="mono">50 SOL</td><td class="num-col">2%</td><td>rare</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The <strong>median tracked buy is 0.95 SOL</strong>, and the median token attracts <strong>3.1 SOL</strong> in its best ten minutes. So anything under 2 SOL is close to no filter at all.</p>
+
+  <div class="note">
+    <span class="h">Threshold and cap do different jobs</span>
+    <p>The threshold controls <em class="term">quality</em>; trades-per-day controls <em class="term">quantity</em>. Even at 20% selectivity, thousands of tokens flow through daily — so you need both.</p>
   </div>
 </section>
 
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">04</span>Buyers, and why the number is delicate</h2>
-  <p class="lede">The single setting that decides how often anything happens at all.</p>
-
-  <p>"4 buyers" means four <em class="term">different</em> tracked wallets bought the same token within ten minutes. Not four purchases — four separate wallets, arriving independently.</p>
-
-  <p>Because it's four-of-780, small changes swing the fire rate hard:</p>
-
-  <div class="tablewrap">
-    <table>
-      <thead><tr><th>Threshold</th><th>Effect</th></tr></thead>
-      <tbody>
-        <tr><td class="mono">2–3</td><td>Fires often. More noise, more entries, more fees.</td></tr>
-        <tr><td class="mono">4–5</td><td>Balanced. Several signals an hour on a busy day.</td></tr>
-        <tr><td class="mono">6+</td><td>Rare. You will miss good tokens for being one wallet short.</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <p>That last row isn't hypothetical. At a threshold of 5, a token reached <strong>4 buyers</strong> and stopped — then ran to <strong>4.07×</strong>. Higher is not safer; it's just quieter.</p>
-</section>
-
-<hr class="div">
-
-<section class="col">
-  <h2><span class="num">05</span>Selling: stops and targets</h2>
-  <p class="lede">The half that protects you, and the half most people set up wrong.</p>
+  <h2><span class="num">05</span>Selling</h2>
+  <p class="lede">Four decisions, not a spreadsheet.</p>
 
   <div class="screen">
     <div class="title">🎚 Auto-sell · 🟢 On</div>
-    <div class="console" style="margin:0">
-<span class="c-stop">🛑 STOPS</span>  <span class="c-dim">— checked first</span>
-   -15% → sell 100%
-
-<span class="c-go">🎯 TARGETS</span>  <span class="c-dim">— lowest first</span>
-   +100% → sell 50%   <span class="c-dim">(50% left)</span>
-   +250% → sell 20%   <span class="c-dim">(30% left)</span>
-   +400% → sell 20%   <span class="c-dim">(10% left)</span>
-   +900% → sell 10%   <span class="c-dim">(nothing left)</span>
-
-<span class="c-acc">📉 Trailing</span>: off
+    <div class="console" style="margin:0 0 12px">
+🛑 Stop loss   <span class="c-stop">−25%</span>
+🎯 Take profit <span class="c-go">+100% · sell 100%</span>
+🔒 Break-even  <span class="c-acc">on</span>
+📉 Trailing    <span class="c-dim">off</span>
+    </div>
+    <div class="btnrow">
+      <span class="btn">🛑 Stop loss · −25%</span>
+      <span class="btn">🎯 Take profit · +100%</span>
+    </div>
+    <div class="btnrow">
+      <span class="btn">🔒 Break-even · on</span>
+      <span class="btn">📉 Trailing · off</span>
+    </div>
+    <div class="btnrow">
+      <span class="btn">⚙️ More targets</span>
+      <span class="btn">◀️ Back</span>
     </div>
   </div>
 
-  <p>Three rules govern the whole thing:</p>
-
   <ul class="plain">
-    <li><strong>Stops are checked before targets.</strong> A position that gaps from +300% to −60% exits, rather than taking a target on the way past.</li>
-    <li><strong>Amounts are shares of the original position</strong>, so they accumulate. The screen shows what's left after each rung so you don't have to do the arithmetic.</li>
-    <li><strong>Targets fire lowest-first, once each.</strong></li>
+    <li><strong>Stops are checked before targets.</strong> A position that gaps from +300% to −60% exits rather than taking a target on the way past.</li>
+    <li><strong>Break-even</strong> is a toggle. Once a position has been up, if it comes back it exits at cost — no profit, no loss.</li>
+    <li><strong>Trailing</strong> sells everything once the position falls a set percentage from its peak, and only after it has been in profit.</li>
+    <li><strong>More targets</strong> holds the full ladder if you want several rungs, with a running total of what is left.</li>
   </ul>
 
-  <div class="note">
-    <span class="h">The classic mistake</span>
-    <p>A ladder like <code>−15% → 100%</code> and <code>+25% → 100%</code> closes the entire position at +25%. Every rung above it — +250%, +400%, +900% — <strong>can never fire</strong>. The screen now says so outright when it detects this, but it's worth understanding rather than being told.</p>
+  <div class="note danger">
+    <span class="h">Do not set the stop too tight</span>
+    <p>You buy at the ask and the exit prices at the bid. On a fresh memecoin that gap alone is several percent, so a <strong>−5% stop trips before the token has moved at all.</strong> This is not theoretical: in one live session, five of seven positions stopped out within 26 seconds of entry, purely on the spread. Keep the stop outside the round-trip cost — <code>−25%</code> or wider at small trade sizes.</p>
   </div>
-
-  <p>The <strong>trailing stop</strong> sells everything once the position falls a set percentage from its peak. It only activates after the position has been in profit, so it can't close a fresh entry on ordinary slippage.</p>
 </section>
 
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">06</span>Volume mode</h2>
-  <p class="lede">Optional. Makes the bot pickier, never looser.</p>
-
-  <p>Normally the buyer count alone decides. Turn volume mode on and a signal must <em class="term">also</em> show real flow behind it:</p>
+  <h2><span class="num">06</span>Sizing by market cap</h2>
+  <p class="lede">One SOL amount for every token treats a $20K launch like a $2M one.</p>
 
   <div class="screen">
-    <div class="title">📊 Volume mode · 🟢 on</div>
-    <div class="btnrow">
-      <span class="btn on">🟢 On — tap to disable</span>
+    <div class="title">📊 Buy by market cap</div>
+    <div class="console" style="margin:0 0 12px">
+Default buy: 0.20 SOL
+
+$10K–$50K    →  0.10 SOL
+$50K–$100K   →  0.20 SOL
+$100K–$500K  →  0.35 SOL
+$500K–$1M    →  0.50 SOL
     </div>
     <div class="btnrow">
-      <span class="btn">💸 Smart SOL in · 2 SOL</span>
-      <span class="btn">📈 Token volume · 30 SOL</span>
+      <span class="btn">➕ Add band</span>
+      <span class="btn">♻️ Reset</span>
     </div>
   </div>
 
-  <ul class="plain">
-    <li><strong>Smart SOL in</strong> — how much the tracked wallets themselves put in. Five wallets at 0.05 SOL each is a different signal from five at 5 SOL each, and a plain count can't tell them apart.</li>
-    <li><strong>Token volume</strong> — total trading in that token over the same ten-minute window.</li>
-  </ul>
+  <p>Adding a band is two taps — pick a range, pick a size. Bands <strong>cannot overlap</strong>, so every token matches at most one, and a token in no band uses the default. You never have to fill in the whole table.</p>
 
-  <p>Either can be set to <code>0</code> to switch that half off. Smart money remains <strong>required</strong> — volume can only ever block a signal, never create one.</p>
+  <p>Separately, <strong>Max market cap</strong> refuses a token outright. The two are different jobs: the ceiling decides <em class="term">whether</em>, bands decide <em class="term">how much</em>.</p>
 
-  <div class="note">
-    <span class="h">Use it as a measuring tool first</span>
-    <p>Turn volume mode on with <strong>both thresholds at 0</strong>. It then blocks nothing but logs the real numbers on every signal. After a day you'll know where to set them, instead of guessing.</p>
-  </div>
+  <h3>Supply cap</h3>
+  <p>A ceiling on how much of a token's supply one position may hold, as a percentage. The buy always executes at its configured size; afterwards the real holding is measured and <strong>only the excess is sold</strong>.</p>
+  <p>It matters as trade size grows: on an early token a fixed SOL amount can buy a double-digit share of everything that exists — a position nobody will take back off you. Price impact does not catch this, because impact measures the pool and this measures the token.</p>
 </section>
 
 <hr class="div">
 
 <section class="col">
   <h2><span class="num">07</span>What runs before every buy</h2>
-  <p class="lede">Seven checks. Any one of them refuses the trade.</p>
+  <p class="lede">Seven checks. Any one refuses the trade.</p>
 
   <div class="tablewrap">
     <table>
       <thead><tr><th>Check</th><th>Refuses when</th></tr></thead>
       <tbody>
         <tr><td class="mono">HALT</td><td>You've stopped the bot.</td></tr>
-        <tr><td class="mono">Rug blacklist</td><td>This token's liquidity was seen being pulled — ever, this session.</td></tr>
+        <tr><td class="mono">Rug blacklist</td><td>This token's liquidity was seen being pulled, ever, this session.</td></tr>
+        <tr><td class="mono">Balance</td><td>The wallet can't cover the trade plus rent and fees.</td></tr>
         <tr><td class="mono">Mint authority</td><td>The creator can still print more supply.</td></tr>
         <tr><td class="mono">Freeze authority</td><td>The creator can still freeze your account, trapping the position.</td></tr>
-        <tr><td class="mono">Token-2022</td><td>The token has extensions that can change the rules under you.</td></tr>
-        <tr><td class="mono">Price impact</td><td>Your own order would move the price more than the limit — the pool is too thin to exit.</td></tr>
+        <tr><td class="mono">Token-2022</td><td>Extensions that can change the rules under you.</td></tr>
+        <tr><td class="mono">Price impact</td><td>Your own order would move the price more than the limit.</td></tr>
         <tr><td class="mono">Trades/day</td><td>You've hit today's ceiling.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>All of them <strong>fail closed</strong>. If a check can't be read — the network is down, a price is missing — it refuses rather than assuming the best. A skipped trade costs nothing; a wrong one costs money.</p>
+  <p>All of them <strong>fail closed</strong>. If a check can't be read — network down, price missing — it refuses rather than assuming the best. A skipped trade costs nothing; a wrong one costs money.</p>
 </section>
 
 <hr class="div">
 
 <section class="col">
   <h2><span class="num">08</span>Reading the alerts</h2>
-  <p class="lede">What lands in the group, and what each one means.</p>
+  <p class="lede">What lands in the group, and what it means.</p>
 
   <h3>A buy</h3>
   <div class="console">
 <span class="c-go">🟢 SMART BUY</span> · <span class="c-dim">Grizzl…8ppump</span>
-0.01 SOL
+0.08 SOL  ·  entry $41.2K
 confirmed 4fPt56PL…
   </div>
-  <p>The token is identified by a shortened mint address, not a name. Amount, then where the transaction ended up. Tap <strong>Positions</strong> for entry market cap, current market cap and live P&amp;L — those live on the position screen, not in the alert.</p>
+  <p>Short mint, size, entry market cap, and where the transaction landed. Tap <strong>Positions</strong> for live P&amp;L and per-position sell buttons.</p>
 
   <h3>A sell</h3>
   <div class="console">
 <span class="c-stop">🔴 AUTO-SELL</span> · <span class="c-dim">Grizzl…8ppump</span>
-100% · est 0.0198 SOL
+100% · est 0.1598 SOL
 target +100% → sell 100%
 confirmed 2yh6iS2E…
   </div>
-  <p>The third line is the rung that fired, in the same words as the ladder screen. If it says <code>stop -15%</code>, the stop caught it.</p>
+  <p>The third line names the rung that fired, in the same words as the settings screen.</p>
 
   <h3>Skipped, with a reason</h3>
   <div class="console">
 <span class="c-dim">⚪ Smart buy skipped</span> · <span class="c-dim">297uf7…ivpump</span>
 price impact 2720 bps exceeds 1000
   </div>
-  <p>This is the bot working, not failing. It's telling you the pool was too thin to get back out of.</p>
+  <p>This is the bot working, not failing.</p>
 
   <h3>The one worth watching for</h3>
   <div class="console">
 <span class="c-warn">🟠 Position stopped trading</span> · <span class="c-dim">E6Vhd3…ZZpump</span>
 No fills observed, so it cannot be priced — or sold — right now.
-<span class="c-dim">Auto-sell is holding rather than acting on a price it does not have.</span>
   </div>
-  <p>Nothing is trading that token, so there is no honest price. The bot holds rather than acting on a number it does not have. This usually clears within seconds — one observed case lasted 33 seconds and then sold normally. If it persists, look at the token yourself and consider selling by hand from the position screen.</p>
+  <p>Nothing is trading that token, so there is no honest price. The bot holds rather than acting on a number it does not have. Usually clears in seconds.</p>
+
+  <h3>The leaderboard</h3>
+  <p>Every five hours the group gets the best-performing calls, ranked by the peak each reached. It arrives collapsed — tap to expand — with the mint under each ticker so you can copy it, and a <code>●</code> marking the ones the bot actually traded.</p>
+  <p>Type <code>/alerts</code> for the same list on demand.</p>
 </section>
 
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">09</span>What it costs to trade</h2>
-  <p class="lede">Real numbers from a real session, because this surprises people.</p>
+  <h2><span class="num">09</span>What the signal is actually worth</h2>
+  <p class="lede">Measured over 2,018 priced tokens. Read both columns together.</p>
 
-  <p>Over 62 round trips in two hours, roughly 0.75 SOL of volume passed through a 0.03 SOL wallet — the money recycles each time you buy and sell.</p>
-
-  <div class="glance">
-    <div><dt>Round trips</dt><dd>62</dd></div>
-    <div><dt>Cost each</dt><dd>−0.00032</dd></div>
-    <div><dt>Of trade size</dt><dd>3.2%</dd></div>
-    <div><dt>Fees share</dt><dd>43%</dd></div>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Peak reached</th><th class="num-col">Share</th><th>Where it ended</th><th class="num-col">Share</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">≥ 1.5×</td><td class="num-col">23.9%</td><td class="mono">≥ 2×</td><td class="num-col">9.0%</td></tr>
+        <tr><td class="mono">≥ 2×</td><td class="num-col">12.9%</td><td class="mono">≥ 1×</td><td class="num-col">52.9%</td></tr>
+        <tr><td class="mono">≥ 3×</td><td class="num-col">6.8%</td><td class="mono">&lt; 0.5×</td><td class="num-col">29.8%</td></tr>
+        <tr><td class="mono">≥ 10×</td><td class="num-col">0.7%</td><td class="mono">~zero</td><td class="num-col">3.1%</td></tr>
+      </tbody>
+    </table>
   </div>
 
-  <p style="margin-top:22px">Two things follow from this, and they're the most practically useful facts on this page.</p>
+  <div class="glance">
+    <div><dt>Median peak</dt><dd>1.08×</dd></div>
+    <div><dt>Cohort final</dt><dd>0.53×</dd></div>
+    <div><dt>Rug rate</dt><dd>70%</dd></div>
+    <div><dt>Wallets scored</dt><dd>309</dd></div>
+  </div>
 
-  <p><strong>Roughly half the cost is fixed.</strong> Network fees are the same whether you trade 0.01 SOL or 1 SOL. At 0.01 they're 1.4% of the trade; at 0.1 they're 0.14%; at 1 SOL, 0.014%.</p>
+  <p style="margin-top:22px"><strong>12.9% of signals touch 2× at some point, but only 9% are still there at the end.</strong> The median signal peaks at 1.08× — essentially flat — and 70% of what the cohort buys eventually rugs.</p>
 
-  <p><strong>So small trades are inefficient, not safe.</strong> At 0.01 SOL you're paying about 3.2% per round trip in friction. The signal has to beat that before anything else. Trading bigger doesn't reduce risk — but it does stop the costs from drowning the result.</p>
+  <p>That says the edge lives in <em class="term">exits</em>, not entries. A signal that touches 2× and gives it back is a win you had and lost, which is exactly what the stop, break-even and trailing settings exist to keep.</p>
 </section>
 
 <hr class="div">
@@ -638,12 +659,16 @@ No fills observed, so it cannot be priced — or sold — right now.
       <p>If the machine dies or the host suspends the box, an unexported key is simply gone.</p>
     </li>
     <li>
+      <h3>Set the trigger</h3>
+      <p>Smart volume decides everything. <code>10 SOL</code> admits about the top 20% of tokens; below <code>2 SOL</code> is barely a filter.</p>
+    </li>
+    <li>
       <h3>Set the limits before arming</h3>
-      <p>Size, trades/day, and the stop. Decide what a bad day looks like while you're calm.</p>
+      <p>Trade size and trades/day. Decide what a bad day looks like while you're calm.</p>
     </li>
     <li>
       <h3>Set a stop you'd actually accept</h3>
-      <p>A ladder with no stop has no floor. <code>−15% → 100%</code> is a reasonable starting point.</p>
+      <p>Wide enough to sit outside the spread. <code>−25%</code> is a reasonable start; <code>−5%</code> will stop you out on entry.</p>
     </li>
     <li>
       <h3>Resume, and watch the first trade land</h3>
@@ -664,7 +689,8 @@ No fills observed, so it cannot be priced — or sold — right now.
 
   <ul class="plain">
     <li><strong>It follows, it doesn't predict.</strong> If the tracked wallets have a bad week, so does the bot.</li>
-    <li><strong>Volume has no direction.</strong> A token collapsing prints enormous volume too. The wallet signal supplies the direction; volume only confirms.</li>
+    <li><strong>Volume has no direction.</strong> A token collapsing prints enormous volume too. Smart-money buying supplies the direction; the token-volume filter only confirms.</li>
+    <li><strong>70% of what the cohort buys rugs</strong>, and the average position ends around half. Following it broadly loses money — the edge is in the exits and in the handful of wallets whose results hold up.</li>
     <li><strong>Some tokens can't be sold at any price.</strong> If liquidity is pulled, no exit strategy helps. The stop can only fire while someone is still buying.</li>
     <li><strong>Speed is location.</strong> Running near the data source is worth more than any code change — the same bot is about 830ms faster per entry on a well-placed server than on home internet.</li>
     <li><strong>Only ever run one copy.</strong> Two instances sharing a wallet will double-trade every signal.</li>

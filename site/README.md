@@ -28,11 +28,13 @@ same commit. The sections most likely to go stale:
 
 | Section | Tracks |
 |---|---|
-| Reading the settings screen | `bot.rs` — `settings_screen` |
-| Selling: stops and targets  | `bot.rs` — `exits_screen`, `order_screen` |
-| Volume mode                 | `bot.rs` — `volume_screen` |
+| Reading the settings screen | `bot.rs` — `settings_screen` and its four sub-screens |
+| What triggers a buy         | `detector.rs` — the smart-SOL gate; `bot.rs` — `autobuy_screen` |
+| Selling                     | `exits.rs` — `evaluate`; `bot.rs` — `exits_screen` |
+| Sizing by market cap        | `settings.rs` — `BuyTier`; `bot.rs` — `tiers_screen` |
 | What runs before every buy  | `sniper.rs` — `buy_mint` guards |
-| Reading the alerts          | `alerts.rs` — `render_smart_buy`, `render_auto_sell` |
+| Reading the alerts          | `alerts.rs` — `render_smart_buy`, `render_auto_sell`, `render_leaderboard` |
+| What the signal is worth    | `tools/score_wallets.py` — re-run to refresh the figures |
 
 ## Contents
 
