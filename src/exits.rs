@@ -231,7 +231,12 @@ pub enum ExitAction {
 }
 
 /// Decide, and record what was decided.
-pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> ExitAction {
+pub fn evaluate(
+    rules: &ExitRules,
+    state: &mut PositionState,
+    multiple: f64,
+    breakeven_buffer: f64,
+) -> ExitAction {
     if !multiple.is_finite() || multiple <= 0.0 {
         // No usable price is not a reason to sell. An unpriced token looks
         // exactly like a worthless one, and acting on that confusion is how a
@@ -272,10 +277,28 @@ pub fn evaluate(rules: &ExitRules, state: &mut PositionState, multiple: f64) -> 
     // `peak_multiple > 1.0` is the arming condition and the only one — the
     // position was, at some point, worth more than it cost. `multiple <= 1.0`
     // is the trigger: it is back at cost. Nothing to configure.
-    if rules.breakeven && state.peak_multiple > 1.0 && multiple <= 1.0 {
+    // The exit level sits ABOVE cost by the buffer, not at it.
+    //
+    // Firing at exactly 1.0 could not break even, and the trades proved it:
+    // two positions exited on this rule at -2.9% and -4.7%. The decision is
+    // made on a quote and the fill lands afterwards, so exiting at the moment
+    // the quote reads "cost" guarantees receiving less than cost.
+    //
+    // The buffer is the room the fill needs, derived from the configured sell
+    // slippage rather than being another number to tune — this is a toggle,
+    // and a toggle that quietly needs a companion setting is two settings.
+    //
+    // Arming uses the same level: a position that never rose past the buffer
+    // was never far enough ahead for this rule to return the capital.
+    let be_exit = 1.0 + breakeven_buffer;
+    if rules.breakeven && state.peak_multiple > be_exit && multiple <= be_exit {
         return ExitAction::Sell {
             amount_pct_of_original: 100,
-            reason: format!("break-even (peaked {:.2}x, back to cost)", state.peak_multiple),
+            reason: format!(
+                "break-even (peaked {:.2}x, back to cost +{:.1}%)",
+                state.peak_multiple,
+                breakeven_buffer * 100.0
+            ),
         };
     }
 
@@ -377,6 +400,7 @@ pub fn plan_exits(
     rules: &ExitRules,
     state: &ExitStateStore,
     holdings: &[Holding],
+    breakeven_buffer: f64,
 ) -> (Vec<PlannedSell>, Vec<String>) {
     let mut sells = Vec::new();
     let mut closed = Vec::new();
@@ -397,7 +421,7 @@ pub fn plan_exits(
         let tokens = h.raw as f64 / 10f64.powi(h.decimals as i32);
         let multiple = (price * tokens) / h.sol_spent;
 
-        let (action, pct_now) = state.decide(rules, &h.mint, multiple, h.raw);
+        let (action, pct_now) = state.decide(rules, &h.mint, multiple, h.raw, breakeven_buffer);
         if let ExitAction::Sell { reason, .. } = action
             && pct_now > 0
         {
@@ -437,6 +461,7 @@ impl ExitStateStore {
         mint: &str,
         multiple: f64,
         current_raw: u64,
+        breakeven_buffer: f64,
     ) -> (ExitAction, u8) {
         let (action, pct_now) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -444,7 +469,7 @@ impl ExitStateStore {
             if current_raw > st.original_raw {
                 st.original_raw = current_raw;
             }
-            let action = evaluate(rules, st, multiple);
+            let action = evaluate(rules, st, multiple, breakeven_buffer);
             let pct_now = match &action {
                 ExitAction::Sell { amount_pct_of_original, .. } => {
                     share_of_current(*amount_pct_of_original, st.original_raw, current_raw)
@@ -495,6 +520,10 @@ impl ExitStateStore {
 
 #[cfg(test)]
 mod tests {
+    /// Fill headroom used by the tests; production derives it from the
+    /// configured sell slippage.
+    const TEST_BUFFER: f64 = 0.02;
+
 
     // --- The join: audit record -> position -> ladder.
     //
@@ -524,6 +553,7 @@ mod tests {
             &ExitRules { enabled: true, ..Default::default() },
             &store,
             &[holding("MINT_A", cost, raw, Some(now_price))],
+            TEST_BUFFER,
         );
         assert_eq!(sells.len(), 1, "the +100% target should have fired");
         assert_eq!(sells[0].pct_of_current, 50);
@@ -540,13 +570,13 @@ mod tests {
         let entry = cost / 1_000_000.0;
 
         // +150%: the +100% target takes half.
-        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, raw, Some(entry * 2.5))]);
+        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, raw, Some(entry * 2.5))], TEST_BUFFER);
         assert_eq!(sells.len(), 1, "take-profit must fire on the way up");
         assert!(sells[0].reason.contains("target"), "{}", sells[0].reason);
 
         // Then it collapses. Half is already sold, so the stop closes the rest.
         let left = raw / 2;
-        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, left, Some(entry * 0.3))]);
+        let (sells, _) = plan_exits(&rules, &store, &[holding("M", cost, left, Some(entry * 0.3))], TEST_BUFFER);
         assert_eq!(sells.len(), 1, "the stop must fire on the way down");
         assert_eq!(sells[0].pct_of_current, 100);
         assert!(sells[0].reason.contains("stop"), "{}", sells[0].reason);
@@ -569,6 +599,7 @@ mod tests {
             &ExitRules { enabled: true, ..Default::default() },
             &store,
             &[holding("M", 0.05, 1_000_000_000_000, None)],
+            TEST_BUFFER,
         );
         assert!(sells.is_empty());
         assert!(closed.is_empty(), "and it is still a position");
@@ -583,6 +614,7 @@ mod tests {
             &ExitRules { enabled: true, ..Default::default() },
             &store,
             &[holding("M", 0.05, 0, Some(1.0))],
+            TEST_BUFFER,
         );
         assert!(sells.is_empty());
         assert_eq!(closed, vec!["M".to_string()]);
@@ -596,6 +628,7 @@ mod tests {
             &ExitRules::default(),
             &store,
             &[holding("M", 0.05, 1_000_000_000_000, Some(1.0))],
+            TEST_BUFFER,
         );
         assert!(sells.is_empty());
     }
@@ -609,8 +642,8 @@ mod tests {
     fn nothing_happens_while_disabled() {
         let mut s = PositionState::default();
         let off = ExitRules::default();
-        assert_eq!(evaluate(&off, &mut s, 10.0), ExitAction::Hold);
-        assert_eq!(evaluate(&off, &mut s, 0.01), ExitAction::Hold);
+        assert_eq!(evaluate(&off, &mut s, 10.0, TEST_BUFFER), ExitAction::Hold);
+        assert_eq!(evaluate(&off, &mut s, 0.01, TEST_BUFFER), ExitAction::Hold);
         assert_eq!(s.peak_multiple, 10.0, "the peak is still tracked");
     }
 
@@ -620,7 +653,7 @@ mod tests {
     fn an_unusable_price_never_sells() {
         let mut s = PositionState::default();
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(evaluate(&rules(), &mut s, bad), ExitAction::Hold, "{bad}");
+            assert_eq!(evaluate(&rules(), &mut s, bad, TEST_BUFFER), ExitAction::Hold, "{bad}");
         }
         assert_eq!(s.peak_multiple, 0.0, "a bad print must not move the peak");
     }
@@ -637,22 +670,22 @@ mod tests {
         let mut s = PositionState::default();
         let r = rules();
         for expected in [50u8, 20, 20, 10] {
-            match evaluate(&r, &mut s, 11.0) {
+            match evaluate(&r, &mut s, 11.0, TEST_BUFFER) {
                 ExitAction::Sell { amount_pct_of_original, .. } => {
                     assert_eq!(amount_pct_of_original, expected)
                 }
                 a => panic!("expected a target, got {a:?}"),
             }
         }
-        assert_eq!(evaluate(&r, &mut s, 11.0), ExitAction::Hold, "ladder exhausted");
+        assert_eq!(evaluate(&r, &mut s, 11.0, TEST_BUFFER), ExitAction::Hold, "ladder exhausted");
     }
 
     #[test]
     fn a_stop_closes_the_position() {
         let mut s = PositionState::default();
         let r = rules(); // −25% stop
-        assert_eq!(evaluate(&r, &mut s, 0.80), ExitAction::Hold, "above the stop");
-        match evaluate(&r, &mut s, 0.75) {
+        assert_eq!(evaluate(&r, &mut s, 0.80, TEST_BUFFER), ExitAction::Hold, "above the stop");
+        match evaluate(&r, &mut s, 0.75, TEST_BUFFER) {
             ExitAction::Sell { amount_pct_of_original, reason } => {
                 assert_eq!(amount_pct_of_original, 100);
                 assert!(reason.contains("stop"), "{reason}");
@@ -667,8 +700,8 @@ mod tests {
     fn a_collapse_exits_rather_than_taking_a_target() {
         let mut s = PositionState::default();
         let r = rules();
-        evaluate(&r, &mut s, 4.0);
-        match evaluate(&r, &mut s, 0.3) {
+        evaluate(&r, &mut s, 4.0, TEST_BUFFER);
+        match evaluate(&r, &mut s, 0.3, TEST_BUFFER) {
             ExitAction::Sell { amount_pct_of_original, reason } => {
                 assert_eq!(amount_pct_of_original, 100);
                 assert!(reason.contains("stop"), "expected protection first: {reason}");
@@ -681,9 +714,9 @@ mod tests {
     fn the_trailing_stop_measures_from_the_peak() {
         let mut s = PositionState::default();
         let r = ExitRules { enabled: true, orders: vec![], trailing_pct: 30, ..Default::default() };
-        evaluate(&r, &mut s, 4.0);
-        assert_eq!(evaluate(&r, &mut s, 3.0), ExitAction::Hold, "25% off the peak");
-        match evaluate(&r, &mut s, 2.8) {
+        evaluate(&r, &mut s, 4.0, TEST_BUFFER);
+        assert_eq!(evaluate(&r, &mut s, 3.0, TEST_BUFFER), ExitAction::Hold, "25% off the peak");
+        match evaluate(&r, &mut s, 2.8, TEST_BUFFER) {
             ExitAction::Sell { amount_pct_of_original, reason } => {
                 assert_eq!(amount_pct_of_original, 100);
                 assert!(reason.contains("trailing"), "{reason}");
@@ -696,8 +729,8 @@ mod tests {
     fn the_trailing_stop_waits_for_profit() {
         let mut s = PositionState::default();
         let r = ExitRules { enabled: true, orders: vec![], trailing_pct: 10, ..Default::default() };
-        assert_eq!(evaluate(&r, &mut s, 0.95), ExitAction::Hold);
-        assert_eq!(evaluate(&r, &mut s, 0.85), ExitAction::Hold, "never been in profit");
+        assert_eq!(evaluate(&r, &mut s, 0.95, TEST_BUFFER), ExitAction::Hold);
+        assert_eq!(evaluate(&r, &mut s, 0.85, TEST_BUFFER), ExitAction::Hold, "never been in profit");
     }
 
     /// Editing a profile must not re-arm an order that already fired, nor
@@ -710,11 +743,11 @@ mod tests {
             orders: vec![SellOrder { at_pct: 100, amount_pct: 50 }],
             ..Default::default()
         };
-        assert!(matches!(evaluate(&r, &mut s, 2.5), ExitAction::Sell { .. }));
-        assert_eq!(evaluate(&r, &mut s, 2.5), ExitAction::Hold);
+        assert!(matches!(evaluate(&r, &mut s, 2.5, TEST_BUFFER), ExitAction::Sell { .. }));
+        assert_eq!(evaluate(&r, &mut s, 2.5, TEST_BUFFER), ExitAction::Hold);
 
         r.orders[0] = SellOrder { at_pct: 120, amount_pct: 25 };
-        match evaluate(&r, &mut s, 2.5) {
+        match evaluate(&r, &mut s, 2.5, TEST_BUFFER) {
             ExitAction::Sell { amount_pct_of_original, .. } => {
                 assert_eq!(amount_pct_of_original, 25)
             }
@@ -734,8 +767,8 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert_eq!(evaluate(&r, &mut s, 2.5), ExitAction::Hold);
-        assert!(matches!(evaluate(&r, &mut s, 3.0), ExitAction::Sell { .. }));
+        assert_eq!(evaluate(&r, &mut s, 2.5, TEST_BUFFER), ExitAction::Hold);
+        assert!(matches!(evaluate(&r, &mut s, 3.0, TEST_BUFFER), ExitAction::Sell { .. }));
     }
 
     /// The conversion that makes percent-of-original work against a shrinking
@@ -790,13 +823,13 @@ mod tests {
 
         let store = ExitStateStore::load(&p);
         let r = rules();
-        let (a, pct) = store.decide(&r, "MINT", 2.5, 1_000);
+        let (a, pct) = store.decide(&r, "MINT", 2.5, 1_000, TEST_BUFFER);
         assert!(matches!(a, ExitAction::Sell { .. }));
         assert_eq!(pct, 50, "a full position: of-original and of-current agree");
 
         let reloaded = ExitStateStore::load(&p);
         // Half sold, so the +250% order's 20%-of-original is 40% of the rest.
-        let (a2, pct2) = reloaded.decide(&r, "MINT", 3.5, 500);
+        let (a2, pct2) = reloaded.decide(&r, "MINT", 3.5, 500, TEST_BUFFER);
         assert!(matches!(a2, ExitAction::Sell { .. }), "the next target should fire");
         assert_eq!(pct2, 40);
         assert_eq!(reloaded.peak("MINT"), 3.5);
@@ -807,9 +840,9 @@ mod tests {
     fn forgetting_a_position_clears_its_ladder() {
         let store = ExitStateStore::ephemeral();
         let r = rules();
-        assert!(matches!(store.decide(&r, "M", 2.5, 100).0, ExitAction::Sell { .. }));
+        assert!(matches!(store.decide(&r, "M", 2.5, 100, TEST_BUFFER).0, ExitAction::Sell { .. }));
         store.forget("M");
-        assert!(matches!(store.decide(&r, "M", 2.5, 100).0, ExitAction::Sell { .. }), "fresh again");
+        assert!(matches!(store.decide(&r, "M", 2.5, 100, TEST_BUFFER).0, ExitAction::Sell { .. }), "fresh again");
     }
 
     /// The position that exposed the whole problem.
@@ -835,7 +868,7 @@ mod tests {
         let store = ExitStateStore::ephemeral();
         // 0.010 SOL basis, 1.0 whole token, realizable 0.006875 -> -31%.
         let h = holding("M", 0.010, 1_000_000, Some(0.006875));
-        let (sells, _) = plan_exits(&rules, &store, &[h]);
+        let (sells, _) = plan_exits(&rules, &store, &[h], TEST_BUFFER);
         assert_eq!(sells.len(), 1, "the position must be acted on, not skipped");
         assert_eq!(sells[0].pct_of_current, 100);
         assert!(
@@ -858,7 +891,7 @@ mod tests {
         };
         let store = ExitStateStore::ephemeral();
         let h = holding("M", 0.010, 1_000_000, Some(0.0125)); // +25% realizable
-        let (sells, _) = plan_exits(&rules, &store, &[h]);
+        let (sells, _) = plan_exits(&rules, &store, &[h], TEST_BUFFER);
         assert_eq!(sells.len(), 1);
         assert!(
             sells[0].reason.contains("25"),
@@ -919,15 +952,59 @@ fn the_simple_views_round_trip_without_losing_orders() {
         let mut st = PositionState::default();
 
         // Up a little. Nothing sells — it is still in profit.
-        assert!(matches!(evaluate(&rules, &mut st, 1.08), ExitAction::Hold));
+        assert!(matches!(evaluate(&rules, &mut st, 1.08, TEST_BUFFER), ExitAction::Hold));
         // Back to what it cost: exit flat, BEFORE the -15% stop is reached.
-        match evaluate(&rules, &mut st, 1.00) {
+        match evaluate(&rules, &mut st, 1.00, TEST_BUFFER) {
             ExitAction::Sell { amount_pct_of_original, reason } => {
                 assert_eq!(amount_pct_of_original, 100);
                 assert!(reason.contains("break-even"), "got: {reason}");
             }
             other => panic!("expected a break-even exit, got {other:?}"),
         }
+    }
+
+    /// The two live trades that exposed this: both exited on break-even and
+    /// both LOST money, at -2.9% and -4.7%, because the rule fired the moment
+    /// the quote read exactly cost — leaving the fill nowhere to land.
+    #[test]
+    fn breakeven_exits_above_cost_so_the_fill_can_land_at_it() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![],
+            breakeven: true,
+            ..Default::default()
+        };
+        let buffer = 0.02;
+        let mut st = PositionState::default();
+
+        // Up 5%: past the buffer, so break-even is armed.
+        assert!(matches!(evaluate(&rules, &mut st, 1.05, buffer), ExitAction::Hold));
+        // Back to exactly cost would be too late — it must have fired ABOVE it.
+        match evaluate(&rules, &mut st, 1.02, buffer) {
+            ExitAction::Sell { amount_pct_of_original, .. } => {
+                assert_eq!(amount_pct_of_original, 100, "closes the position");
+            }
+            other => panic!("must exit at cost + buffer, got {other:?}"),
+        }
+    }
+
+    /// A tick smaller than the fill headroom is not "in profit" — arming on it
+    /// is what produced a break-even exit at a loss.
+    #[test]
+    fn breakeven_does_not_arm_on_a_tick_inside_the_buffer() {
+        let rules = ExitRules {
+            enabled: true,
+            orders: vec![],
+            breakeven: true,
+            ..Default::default()
+        };
+        let buffer = 0.02;
+        let mut st = PositionState::default();
+        evaluate(&rules, &mut st, 1.01, buffer); // up 1%, inside the buffer
+        assert!(
+            matches!(evaluate(&rules, &mut st, 1.0, buffer), ExitAction::Hold),
+            "a 1% tick must not arm a rule that needs 2% to return the capital"
+        );
     }
 
     /// A position that never rose has no cost to return TO. Without this it
@@ -941,9 +1018,9 @@ fn the_simple_views_round_trip_without_losing_orders() {
             ..Default::default()
         };
         let mut st = PositionState::default();
-        assert!(matches!(evaluate(&rules, &mut st, 0.98), ExitAction::Hold));
-        assert!(matches!(evaluate(&rules, &mut st, 0.80), ExitAction::Hold));
-        assert!(matches!(evaluate(&rules, &mut st, 1.00), ExitAction::Hold));
+        assert!(matches!(evaluate(&rules, &mut st, 0.98, TEST_BUFFER), ExitAction::Hold));
+        assert!(matches!(evaluate(&rules, &mut st, 0.80, TEST_BUFFER), ExitAction::Hold));
+        assert!(matches!(evaluate(&rules, &mut st, 1.00, TEST_BUFFER), ExitAction::Hold));
     }
 
     /// Arming keys off the peak, so a dip cannot un-arm it.
@@ -956,9 +1033,9 @@ fn the_simple_views_round_trip_without_losing_orders() {
             ..Default::default()
         };
         let mut st = PositionState::default();
-        evaluate(&rules, &mut st, 1.50);
-        evaluate(&rules, &mut st, 1.10);
-        assert!(matches!(evaluate(&rules, &mut st, 1.0), ExitAction::Sell { .. }));
+        evaluate(&rules, &mut st, 1.50, TEST_BUFFER);
+        evaluate(&rules, &mut st, 1.10, TEST_BUFFER);
+        assert!(matches!(evaluate(&rules, &mut st, 1.0, TEST_BUFFER), ExitAction::Sell { .. }));
     }
 
     /// Off by default, and off means off.
@@ -967,7 +1044,7 @@ fn the_simple_views_round_trip_without_losing_orders() {
         let rules = ExitRules { enabled: true, orders: vec![], ..Default::default() };
         assert!(!rules.breakeven);
         let mut st = PositionState::default();
-        evaluate(&rules, &mut st, 2.0);
-        assert!(matches!(evaluate(&rules, &mut st, 1.0), ExitAction::Hold));
+        evaluate(&rules, &mut st, 2.0, TEST_BUFFER);
+        assert!(matches!(evaluate(&rules, &mut st, 1.0, TEST_BUFFER), ExitAction::Hold));
     }
 }

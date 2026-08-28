@@ -1584,7 +1584,15 @@ impl Sniper {
             }
         }
 
-        let (sells, closed) = crate::exits::plan_exits(&rules, state, &holdings);
+        // Room for the fill to land, derived from the configured sell slippage
+        // rather than being another knob. Capped: at a 15% tolerance an
+        // uncapped buffer would put "break-even" at +15%, which is a target,
+        // not a break-even. Floored so a very tight slippage setting still
+        // leaves the rule able to return the capital.
+        let breakeven_buffer =
+            (self.cfg.sell_slippage_bps as f64 / 10_000.0).clamp(0.01, 0.03);
+        let (sells, closed) =
+            crate::exits::plan_exits(&rules, state, &holdings, breakeven_buffer);
         for mint in closed {
             state.forget(&mint);
         }
