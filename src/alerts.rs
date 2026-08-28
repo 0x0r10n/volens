@@ -638,11 +638,11 @@ pub fn render_smart_buy(
     Some(match outcome {
         BuyOutcome::Refused { reason } => format!(
             "⚪ <b>Smart buy skipped</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(reason)
+            escape_html(&short), escape_html(&explain_failure(reason))
         ),
         BuyOutcome::Failed { reason, .. } => format!(
             "❌ <b>Smart buy FAILED</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(reason)
+            escape_html(&short), escape_html(&explain_failure(reason))
         ),
         BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
             "🧪 <b>Smart buy rehearsed</b> · <code>{}</code>\n{sol_in} SOL\n{}\n\
@@ -676,11 +676,11 @@ pub fn render_auto_sell(
         SellOutcome::NoPosition { .. } => return None,
         SellOutcome::Refused { reason: r } => format!(
             "⚪ <b>Auto-sell skipped</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(r)
+            escape_html(&short), escape_html(&explain_failure(r))
         ),
         SellOutcome::Failed { reason: r, .. } => format!(
             "❌ <b>Auto-sell FAILED</b> · <code>{}</code>\n{}\n{}",
-            escape_html(&short), escape_html(reason), escape_html(r)
+            escape_html(&short), escape_html(reason), escape_html(&explain_failure(r))
         ),
         SellOutcome::Rehearsed { sol_out, would_succeed, .. } => format!(
             "🧪 <b>Auto-sell rehearsed</b> · <code>{}</code>\n\
@@ -705,14 +705,117 @@ fn describe_submission(r: &crate::sniper::SubmitOutcome) -> String {
             Some(s) => format!("confirmed in slot {s} · {reference}"),
             None => format!("confirmed · {reference}"),
         },
-        SubmitOutcome::NotExecuted { reason } => format!("not executed: {reason}"),
+        SubmitOutcome::NotExecuted { reason } => {
+            format!("not executed — {}", explain_failure(reason))
+        }
         SubmitOutcome::Indeterminate { reason, reference } => {
+            let reason = explain_failure(reason);
             // The reference is the only way to check what actually happened, so
             // it belongs in the message that says we do not know.
             format!(
                 "UNKNOWN outcome — may have landed, do NOT retry blindly: {reason} ({reference})"
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod failure_text {
+    use super::explain_failure;
+
+    /// The message that prompted this: 2,000 characters of program log for a
+    /// wallet that was simply out of SOL.
+    #[test]
+    fn an_empty_wallet_reads_as_an_empty_wallet() {
+        let raw = "preflight failed: {\"InstructionError\":[2,{\"Custom\":1}]} :: Program \
+                   ComputeBudget111 invoke [1] | Program log: CreateIdempotent | Program \
+                   11111111111111111111111111111111 invoke [2] | Transfer: insufficient \
+                   lamports 1834389, need 2074080 | Program 111 failed: custom program error: 0x1";
+        let out = explain_failure(raw);
+        assert_eq!(out, "not enough SOL: have 0.001834, need 0.002074");
+        assert!(out.len() < 60, "the whole point is that it is short");
+    }
+
+    #[test]
+    fn slippage_reads_as_slippage() {
+        assert_eq!(
+            explain_failure("... BuySlippageBelowMinTokensOut ... 400 lines of log"),
+            "slippage: fewer tokens than the floor"
+        );
+        assert_eq!(
+            explain_failure("Program JUP6 failed: custom program error: 0x1771"),
+            "slippage exceeded"
+        );
+    }
+
+    /// Anything unrecognised keeps its head and drops the program log, so a new
+    /// failure mode is still readable rather than unbounded.
+    #[test]
+    fn an_unknown_failure_is_truncated_not_dumped() {
+        let raw = format!("something new went wrong :: {}", "Program log: noise | ".repeat(200));
+        let out = explain_failure(&raw);
+        assert_eq!(out, "something new went wrong");
+
+        let long = "x".repeat(500);
+        assert!(explain_failure(&long).chars().count() <= 160);
+    }
+}
+
+/// Turn a program failure into one line a person can act on.
+///
+/// # Why this exists
+///
+/// A rejected transaction carries the whole simulation log — every compute-unit
+/// line from every program it touched. That is exactly what you want in the log
+/// file and exactly what you do not want in a chat message: the useful sentence
+/// is one line somewhere in the middle of two thousand characters, and by the
+/// time it reaches Telegram nobody reads any of it.
+///
+/// So the alert gets the meaning and the log keeps the evidence.
+fn explain_failure(raw: &str) -> String {
+    // Ordered by specificity: the inner cause beats the wrapper that carries it.
+    if let Some(i) = raw.find("insufficient lamports") {
+        // "Transfer: insufficient lamports 1834389, need 2074080"
+        let tail = &raw[i..];
+        let nums: Vec<f64> = tail
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|t| !t.is_empty())
+            .filter_map(|t| t.parse::<f64>().ok())
+            .take(2)
+            .collect();
+        if let [have, need] = nums[..] {
+            return format!(
+                "not enough SOL: have {:.6}, need {:.6}",
+                have / 1e9,
+                need / 1e9
+            );
+        }
+        return "not enough SOL".into();
+    }
+    for (needle, plain) in [
+        ("BuySlippageBelowMinTokensOut", "slippage: fewer tokens than the floor"),
+        ("TooMuchSolRequired", "slippage: cost more SOL than the ceiling"),
+        ("BuybackFeeRecipientMissing", "pump.fun rejected the fee accounts"),
+        ("InvalidBondingCurveV2", "pump.fun rejected the curve accounts"),
+        ("NotAuthorized", "pump.fun rejected the fee recipient"),
+        ("InvalidCashbackAccumulator", "pump.fun cashback accounts rejected"),
+        ("0x1771", "slippage exceeded"),
+        ("Slippage", "slippage exceeded"),
+        ("AccountNotFound", "an account the trade needs does not exist"),
+        ("BlockhashNotFound", "too slow — the blockhash expired"),
+    ] {
+        if raw.contains(needle) {
+            return plain.into();
+        }
+    }
+    // Unrecognised: keep the head, drop the program log that follows it.
+    let head = raw.split(" :: ").next().unwrap_or(raw);
+    let head = head.trim();
+    if head.chars().count() > 160 {
+        let cut: String = head.chars().take(157).collect();
+        format!("{cut}…")
+    } else {
+        head.to_string()
     }
 }
 
