@@ -343,10 +343,27 @@ impl SignalStore {
     /// Drop signals older than `max_age_secs` from memory. The JSONL keeps the
     /// history; this only bounds what gets re-priced.
     pub fn retire(&self, now: DateTime<Utc>, max_age_secs: i64) -> usize {
+        self.retire_taking(now, max_age_secs).len()
+    }
+
+    /// Retire, and hand back what was dropped.
+    ///
+    /// A retired signal is not worthless — it is the moment its peak stops
+    /// moving and the call becomes a finished result. Wallet scoring archives
+    /// these, which is the only reason a wallet can have a 30-day record out of
+    /// a store that holds one day.
+    pub fn retire_taking(&self, now: DateTime<Utc>, max_age_secs: i64) -> Vec<SignalRecord> {
         let mut map = self.lock();
-        let before = map.len();
-        map.retain(|_, r| r.age_secs(now) <= max_age_secs);
-        before - map.len()
+        let mut gone = Vec::new();
+        map.retain(|_, r| {
+            if r.age_secs(now) <= max_age_secs {
+                true
+            } else {
+                gone.push(r.clone());
+                false
+            }
+        });
+        gone
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, SignalRecord>> {
@@ -620,6 +637,7 @@ pub fn spawn_tracker(
     rpc: std::sync::Arc<crate::rpc::RpcClient>,
     prices: std::sync::Arc<crate::prices::PriceIndex>,
     cfg: crate::config::TrackedConfig,
+    ledger: std::sync::Arc<crate::alpha::ScoreLedger>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     tokio::spawn(async move {
@@ -644,7 +662,16 @@ pub fn spawn_tracker(
             }
 
             let now = Utc::now();
-            let retired = store.retire(now, max_age);
+            // Archived BEFORE they are forgotten. This is the hand-off from
+            // live tracking to permanent record.
+            let dropped = store.retire_taking(now, max_age);
+            let retired = dropped.len();
+            if !dropped.is_empty() {
+                let calls: Vec<crate::alpha::Call> =
+                    dropped.iter().map(crate::alpha::Call::from_signal).collect();
+                ledger.append(&calls);
+                tracing::info!(archived = calls.len(), "resolved calls archived for wallet scoring");
+            }
             // Newest first, then capped: a sweep must finish well inside its
             // own interval or updates arrive after they stop being useful.
             let mut batch = store.ranked_by_recency(now, max_age);

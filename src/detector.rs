@@ -88,6 +88,8 @@ pub struct Detector {
     /// per buy would put a full history scan in the hot path of the stream.
     #[cfg(feature = "sniper")]
     alpha_wallets: std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>,
+    /// The permanent record wallet scoring is built from.
+    alpha_ledger: std::sync::Arc<crate::alpha::ScoreLedger>,
 }
 
 impl Detector {
@@ -150,6 +152,9 @@ impl Detector {
             Duration::from_secs(cfg.tracked.track_for_secs),
         );
 
+        let alpha_ledger =
+            Arc::new(crate::alpha::ScoreLedger::new(cfg.sniper.alpha_ledger_path.clone()));
+
         Ok(Self {
             cfg,
             alerter,
@@ -175,6 +180,7 @@ impl Detector {
             alpha_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "sniper")]
             alpha_wallets: std::sync::Mutex::new(None),
+            alpha_ledger,
         })
     }
 
@@ -352,6 +358,7 @@ impl Detector {
                 self.rpc.clone(),
                 self.prices.clone(),
                 self.cfg.tracked.clone(),
+                self.alpha_ledger.clone(),
                 shutdown.clone(),
             );
         }
@@ -383,6 +390,61 @@ impl Detector {
                     let (considered, sold) = sniper.sweep_exits(&state, &alerter).await;
                     if sold > 0 {
                         info!(considered, sold, "auto-sell sweep");
+                    }
+                }
+            });
+        }
+
+        // DAILY WALLET RANKING. Scores are continuous — a wallet's record
+        // accumulates across the whole lookback — so this is a periodic
+        // REPORT of that running record, not a fresh measurement.
+        //
+        // It also prunes the archive. The ledger is the scoring history, so it
+        // is pruned to the lookback and nothing tighter: dropping a call still
+        // inside the window would silently shorten every wallet's record.
+        #[cfg(feature = "sniper")]
+        {
+            let ledger = self.alpha_ledger.clone();
+            let signals = self.signals.clone();
+            let sniper = self.sniper.clone();
+            let mut shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                // First pass shortly after boot, then daily. A 24h-only timer
+                // means a box restarted each day never ranks at all.
+                let mut every = Duration::from_secs(600);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(every) => {}
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return; }
+                            continue;
+                        }
+                    }
+                    every = Duration::from_secs(86_400);
+                    let rules = sniper.alpha_rules();
+                    let now = chrono::Utc::now();
+                    let dropped = ledger.prune(now, rules.lookback_secs);
+                    let calls = crate::alpha::merge_calls(ledger.load(), &signals.all());
+                    let ranked = crate::alpha::wallet_performance(&calls, &rules, now);
+                    let qualified = ranked.iter().filter(|p| p.qualifies(&rules, now)).count();
+                    info!(
+                        calls_scored = calls.len(),
+                        wallets_scored = ranked.len(),
+                        qualified,
+                        pruned = dropped,
+                        lookback_days = rules.lookback_secs / 86_400,
+                        "daily wallet ranking"
+                    );
+                    for p in ranked.iter().filter(|p| p.samples >= rules.min_samples).take(15) {
+                        info!(
+                            wallet = %p.address,
+                            samples = p.samples,
+                            hit_rate = format!("{:.1}%", p.hit_rate() * 100.0),
+                            median = format!("{:.2}x", p.median_peak),
+                            best = format!("{:.1}x", p.best_peak),
+                            alpha = p.qualifies(&rules, now),
+                            "wallet rank"
+                        );
                     }
                 }
             });
@@ -1045,11 +1107,18 @@ impl Detector {
         };
         if stale {
             let rules = self.sniper.alpha_rules();
-            let records = self.signals.all();
-            let set = crate::alpha::qualifying_set(&records, &rules, chrono::Utc::now());
+            // ARCHIVE first, live store second. The archive is the 30-day
+            // record; the live store is today, which has not been archived yet.
+            // Scoring on the live store alone silently capped every wallet's
+            // record at `track_for_secs` — one day — no matter what the
+            // lookback said.
+            let calls = crate::alpha::merge_calls(self.alpha_ledger.load(), &self.signals.all());
+            let set = crate::alpha::qualifying_set(&calls, &rules, chrono::Utc::now());
             info!(
                 qualifying = set.len(),
                 of_wallets = self.wallets.len(),
+                calls_scored = calls.len(),
+                lookback_days = rules.lookback_secs / 86_400,
                 min_samples = rules.min_samples,
                 min_hit_rate = rules.min_hit_rate,
                 "alpha wallet set refreshed"

@@ -34,7 +34,148 @@
 
 use crate::signals::SignalRecord;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+
+/// One resolved call: a token, the tracked wallets that bought it, and the
+/// highest multiple it reached.
+///
+/// The unit scoring works in, and deliberately not `SignalRecord`. A signal is
+/// LIVE STATE — the tracker retires it after `track_for_secs`, which is a day —
+/// while a track record has to outlive the thing it was measured on. Scoring
+/// read the live store directly at first, so "look back 7 days" silently meant
+/// "look back over whatever is still being tracked", and every score was built
+/// on a single day no matter what the lookback said.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Call {
+    pub mint: String,
+    pub wallets: Vec<String>,
+    /// Highest multiple this call reached, measured from the call.
+    pub peak: f64,
+    /// When the call was made — what the lookback and maturity windows use.
+    pub at: DateTime<Utc>,
+}
+
+impl Call {
+    pub fn from_signal(r: &SignalRecord) -> Self {
+        Self {
+            mint: r.mint.clone(),
+            wallets: r.wallets.clone(),
+            peak: r.peak(),
+            at: r.first_seen_utc,
+        }
+    }
+}
+
+/// Append-only archive of resolved calls.
+///
+/// Written when the tracker retires a signal, which is the moment its peak
+/// stops changing and the call becomes history. This is what lets a wallet
+/// accumulate a record over 30 days out of a store that only holds one.
+pub struct ScoreLedger {
+    path: String,
+}
+
+impl ScoreLedger {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into() }
+    }
+
+    /// Load every archived call. A corrupt line is skipped, not fatal — a
+    /// half-written final line from a crash must not blank the whole record.
+    pub fn load(&self) -> Vec<Call> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Vec::new();
+        };
+        text.lines().filter_map(|l| serde_json::from_str::<Call>(l.trim()).ok()).collect()
+    }
+
+    /// Archive calls the tracker has just retired.
+    pub fn append(&self, calls: &[Call]) {
+        use std::io::Write;
+        if calls.is_empty() || self.path.is_empty() {
+            return;
+        }
+        let mut buf = String::new();
+        for c in calls {
+            // A call nobody tracked teaches nothing and would only grow the file.
+            if c.wallets.is_empty() {
+                continue;
+            }
+            if let Ok(line) = serde_json::to_string(c) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        if buf.is_empty() {
+            return;
+        }
+        match std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(buf.as_bytes()) {
+                    tracing::warn!(path = %self.path, error = %e, "could not archive resolved calls");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %self.path, error = %e, "could not open the score ledger")
+            }
+        }
+    }
+
+    /// Rewrite the file keeping only calls inside `keep_secs`.
+    ///
+    /// Called rarely. The ledger is the scoring history, so pruning is bounded
+    /// by the lookback and nothing else — dropping a call still inside the
+    /// window would silently shorten every wallet's record.
+    pub fn prune(&self, now: DateTime<Utc>, keep_secs: i64) -> usize {
+        let all = self.load();
+        let kept: Vec<&Call> =
+            all.iter().filter(|c| (now - c.at).num_seconds() <= keep_secs).collect();
+        let dropped = all.len() - kept.len();
+        if dropped == 0 {
+            return 0;
+        }
+        let mut buf = String::new();
+        for c in &kept {
+            if let Ok(line) = serde_json::to_string(c) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        let tmp = format!("{}.tmp", self.path);
+        if std::fs::write(&tmp, buf).is_ok() && std::fs::rename(&tmp, &self.path).is_ok() {
+            dropped
+        } else {
+            0
+        }
+    }
+}
+
+/// Merge the archive with the calls still being tracked.
+///
+/// Both are needed. The archive holds everything older than the tracking
+/// window; the live store holds today, which has not been archived yet and is
+/// the half a wallet's recency is judged on. Keyed by mint, and where both have
+/// the same call the HIGHER peak wins — the live one is still being re-priced
+/// and may have moved up since it was written.
+pub fn merge_calls(archived: Vec<Call>, live: &[SignalRecord]) -> Vec<Call> {
+    let mut by_mint: HashMap<String, Call> = HashMap::new();
+    for c in archived {
+        by_mint.insert(c.mint.clone(), c);
+    }
+    for r in live {
+        let c = Call::from_signal(r);
+        by_mint
+            .entry(c.mint.clone())
+            .and_modify(|e| {
+                if c.peak > e.peak {
+                    e.peak = c.peak;
+                }
+            })
+            .or_insert(c);
+    }
+    by_mint.into_values().collect()
+}
 
 /// The bar a wallet must clear to be treated as Alpha.
 ///
@@ -86,10 +227,10 @@ impl Default for AlphaRules {
             // confidence interval spans most of the range — indistinguishable
             // from chance, yet it read as a qualification.
             min_samples: 20,
-            min_hit_rate: 0.50,
+            min_hit_rate: 0.51,
             min_median_peak: 1.5,
             hit_multiple: 2.0,
-            lookback_secs: 7 * 24 * 3600,
+            lookback_secs: 30 * 24 * 3600,
             recency_secs: 3 * 24 * 3600,
             maturity_secs: 3600,
         }
@@ -145,7 +286,7 @@ impl WalletPerf {
 /// `records` is the whole signal store; this filters to the lookback window
 /// itself so callers cannot get it subtly wrong in two places.
 pub fn wallet_performance(
-    records: &[SignalRecord],
+    records: &[Call],
     rules: &AlphaRules,
     now: DateTime<Utc>,
 ) -> Vec<WalletPerf> {
@@ -160,14 +301,14 @@ pub fn wallet_performance(
     let mut by_wallet: HashMap<String, Acc> = HashMap::new();
 
     for rec in records {
-        let age = (now - rec.first_seen_utc).num_seconds();
+        let age = (now - rec.at).num_seconds();
         if age > rules.lookback_secs || age < 0 {
             continue;
         }
         // Fresh calls still update recency — a wallet buying right now is
         // active — but they are not yet evidence of anything.
         let mature = age >= rules.maturity_secs;
-        let peak = rec.peak();
+        let peak = rec.peak;
         let hit = peak >= rules.hit_multiple;
 
         // One wallet can appear once per token. A wallet that bought the same
@@ -180,10 +321,10 @@ pub fn wallet_performance(
                 best_peak: 0.0,
                 sum_peak: 0.0,
                 peaks: Vec::new(),
-                last_seen: rec.first_seen_utc,
+                last_seen: rec.at,
             });
-            if rec.first_seen_utc > acc.last_seen {
-                acc.last_seen = rec.first_seen_utc;
+            if rec.at > acc.last_seen {
+                acc.last_seen = rec.at;
             }
             if !mature {
                 continue;
@@ -233,7 +374,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 /// The set of wallet addresses currently trusted with Alpha money.
 pub fn qualifying_set(
-    records: &[SignalRecord],
+    records: &[Call],
     rules: &AlphaRules,
     now: DateTime<Utc>,
 ) -> HashSet<String> {
@@ -253,26 +394,12 @@ mod tests {
         DateTime::parse_from_rfc3339("2026-08-28T12:00:00Z").unwrap().with_timezone(&Utc)
     }
 
-    fn rec(mint: &str, age_secs: i64, peak: f64, wallets: &[&str]) -> SignalRecord {
-        SignalRecord {
+    fn rec(mint: &str, age_secs: i64, peak: f64, wallets: &[&str]) -> Call {
+        Call {
             mint: mint.to_string(),
-            name: String::new(),
-            symbol: String::new(),
-            first_seen_utc: now() - Duration::seconds(age_secs),
-            message_id: None,
-            reference_sol: 1.0,
-            reference_tokens_raw: 1,
-            decimals: 6,
-            fdv_usd_at_signal: None,
-            supply: None,
             wallets: wallets.iter().map(|s| s.to_string()).collect(),
-            total_sol: 1.0,
-            sol_usd_at_signal: None,
-            total_fees_sol: 0.0,
-            last_reported_multiple: 1.0,
-            last_multiple: peak,
-            peak_multiple: peak,
-            last_checked_utc: None,
+            peak,
+            at: now() - Duration::seconds(age_secs),
         }
     }
 
@@ -390,13 +517,100 @@ mod tests {
 
     /// A record written before `peak_multiple` existed carries 0.0 and falls
     /// back to `last_multiple`; it must not read as a catastrophic loss.
+    /// `Call::from_signal` folds `peak_multiple`/`last_multiple` together, so a
+    /// record written before peak tracking existed still scores correctly
+    /// rather than reading as a total loss.
     #[test]
-    fn a_record_predating_peak_tracking_uses_its_last_multiple() {
-        let mut r = rec("A", 7200, 0.0, &["w1"]);
-        r.peak_multiple = 0.0;
-        r.last_multiple = 3.0;
-        let p = perf_of(&wallet_performance(&[r], &rules(), now()), "w1");
+    fn a_signal_predating_peak_tracking_uses_its_last_multiple() {
+        let mut sr = crate::signals::SignalRecord {
+            mint: "A".into(),
+            name: String::new(),
+            symbol: String::new(),
+            first_seen_utc: now() - Duration::seconds(7200),
+            message_id: None,
+            reference_sol: 1.0,
+            reference_tokens_raw: 1,
+            decimals: 6,
+            fdv_usd_at_signal: None,
+            supply: None,
+            wallets: vec!["w1".into()],
+            total_sol: 1.0,
+            sol_usd_at_signal: None,
+            total_fees_sol: 0.0,
+            last_reported_multiple: 1.0,
+            last_multiple: 3.0,
+            peak_multiple: 0.0,
+            last_checked_utc: None,
+        };
+        sr.peak_multiple = 0.0;
+        let c = Call::from_signal(&sr);
+        assert_eq!(c.peak, 3.0);
+        let p = perf_of(&wallet_performance(&[c], &rules(), now()), "w1");
         assert_eq!(p.hits, 1);
+    }
+
+    /// The bug this whole archive exists to fix: the live store retires a call
+    /// after a day, so scoring it directly capped every record at one day no
+    /// matter what the lookback said. The archive holds the older half.
+    #[test]
+    fn the_archive_and_the_live_store_are_merged() {
+        // Five days old: long past the live store's one-day retention, so it
+        // can only be here because the archive kept it.
+        let archived = vec![rec("OLD", 5 * 24 * 3600, 5.0, &["w1"])];
+        let live = vec![crate::signals::SignalRecord {
+            mint: "NEW".into(),
+            name: String::new(),
+            symbol: String::new(),
+            first_seen_utc: now() - Duration::seconds(7200),
+            message_id: None,
+            reference_sol: 1.0,
+            reference_tokens_raw: 1,
+            decimals: 6,
+            fdv_usd_at_signal: None,
+            supply: None,
+            wallets: vec!["w1".into()],
+            total_sol: 1.0,
+            sol_usd_at_signal: None,
+            total_fees_sol: 0.0,
+            last_reported_multiple: 1.0,
+            last_multiple: 4.0,
+            peak_multiple: 4.0,
+            last_checked_utc: None,
+        }];
+        let merged = merge_calls(archived, &live);
+        assert_eq!(merged.len(), 2, "a 20-day-old call survives alongside today's");
+        let p = perf_of(&wallet_performance(&merged, &rules(), now()), "w1");
+        assert_eq!(p.samples, 2);
+    }
+
+    /// A call in both places takes the higher peak: the live copy is still
+    /// being re-priced and may have run further since it was archived.
+    #[test]
+    fn a_call_in_both_places_keeps_the_higher_peak() {
+        let archived = vec![rec("M", 7200, 2.0, &["w1"])];
+        let live = vec![crate::signals::SignalRecord {
+            mint: "M".into(),
+            name: String::new(),
+            symbol: String::new(),
+            first_seen_utc: now() - Duration::seconds(7200),
+            message_id: None,
+            reference_sol: 1.0,
+            reference_tokens_raw: 1,
+            decimals: 6,
+            fdv_usd_at_signal: None,
+            supply: None,
+            wallets: vec!["w1".into()],
+            total_sol: 1.0,
+            sol_usd_at_signal: None,
+            total_fees_sol: 0.0,
+            last_reported_multiple: 1.0,
+            last_multiple: 9.0,
+            peak_multiple: 9.0,
+            last_checked_utc: None,
+        }];
+        let merged = merge_calls(archived, &live);
+        assert_eq!(merged.len(), 1, "one token, not two");
+        assert_eq!(merged[0].peak, 9.0);
     }
 
     /// The case that exposed the flaw: a wallet on the live book with a 44.4%

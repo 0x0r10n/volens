@@ -439,8 +439,15 @@ pub struct SniperConfig {
     #[serde(default = "default_alpha_min_median_peak")]
     pub alpha_min_median_peak: f64,
     /// How far back to look for samples.
+    ///
+    /// Scoring reads the ARCHIVE, not the live signal store, so this window is
+    /// real: the store retires a call after `track_for_secs` (a day), and a
+    /// lookback longer than that used to be silently truncated to it.
     #[serde(default = "default_alpha_lookback_hours")]
     pub alpha_lookback_hours: i64,
+    /// Where resolved calls are archived for wallet scoring.
+    #[serde(default = "default_alpha_ledger")]
+    pub alpha_ledger_path: String,
     /// A wallet must have bought inside this window to stay qualified.
     #[serde(default = "default_alpha_recency_hours")]
     pub alpha_recency_hours: i64,
@@ -719,13 +726,18 @@ fn default_alpha_min_median_peak() -> f64 {
 /// reach 2x, but the median wallet with enough samples already scores 32.9% —
 /// so the original 0.35 admitted half the book. See `AlphaRules::min_hit_rate`.
 fn default_alpha_min_hit_rate() -> f64 {
-    0.50
+    0.51
 }
 fn default_alpha_hit_multiple() -> f64 {
     2.0
 }
 fn default_alpha_lookback_hours() -> i64 {
-    168
+    // 30 days. Scoring is continuous: a wallet's record accumulates rather
+    // than being re-derived from whatever happens to still be tracked.
+    720
+}
+fn default_alpha_ledger() -> String {
+    "wallet_scores.jsonl".to_string()
 }
 fn default_alpha_recency_hours() -> i64 {
     72
@@ -823,6 +835,7 @@ impl Default for SniperConfig {
             alpha_hit_multiple: default_alpha_hit_multiple(),
             alpha_min_median_peak: default_alpha_min_median_peak(),
             alpha_lookback_hours: default_alpha_lookback_hours(),
+            alpha_ledger_path: default_alpha_ledger(),
             alpha_recency_hours: default_alpha_recency_hours(),
             alpha_maturity_mins: default_alpha_maturity_mins(),
             settings_path: default_settings_path(),
