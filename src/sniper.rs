@@ -1968,6 +1968,73 @@ impl Sniper {
         })
     }
 
+    /// Close emptied token accounts and take the rent back.
+    ///
+    /// Runs as its own transaction, deliberately NOT bundled into the sell.
+    /// Appending a close to the exit would mean a failed rent reclaim takes the
+    /// EXIT down with it, and an exit that does not land is far more expensive
+    /// than rent that stays locked one cycle longer. Here a failure costs
+    /// nothing and simply retries next time.
+    ///
+    /// Returns how many accounts were closed.
+    pub async fn reclaim_rent(&self) -> usize {
+        // Nothing to sign in a dry run, and nothing to reclaim either.
+        let Mode::Armed(cap) = &self.mode else { return 0 };
+        if self.kill_switch_engaged() {
+            return 0;
+        }
+        let Some(owner) = self.owner() else { return 0 };
+        let owner_s = owner.to_string();
+        let Ok(audit) = tokio::fs::read_to_string(&self.cfg.audit_log).await else { return 0 };
+        let mints: Vec<String> =
+            crate::positions::cost_basis_from_audit(&audit).into_keys().collect();
+        if mints.is_empty() {
+            return 0;
+        }
+        let Some(empties) = self.rpc.empty_token_atas(&owner_s, &mints).await else { return 0 };
+        if empties.is_empty() {
+            return 0;
+        }
+
+        // Bounded per transaction: each close is an instruction, and an
+        // oversized transaction is rejected outright.
+        const MAX_PER_TX: usize = 12;
+        let mut ixs = Vec::new();
+        for (ata, program) in empties.iter().take(MAX_PER_TX) {
+            let (Ok(ata_pk), Ok(prog_pk)) = (crate::tx::pk(ata), crate::tx::pk(program)) else {
+                continue;
+            };
+            match spl_token_interface::instruction::close_account(
+                &prog_pk, &ata_pk, &owner, &owner, &[],
+            ) {
+                Ok(ix) => ixs.push(ix),
+                Err(e) => warn!(%ata, error = %e, "could not build a close instruction"),
+            }
+        }
+        if ixs.is_empty() {
+            return 0;
+        }
+        let count = ixs.len();
+        match self.submitter.send(&ixs, &cap.wallet.pubkey(), cap.wallet.keypair()).await {
+            Ok(sub) if sub.definitely_did_not_execute() => {
+                warn!(count, "rent reclaim did not land");
+                0
+            }
+            Ok(_) => {
+                info!(
+                    count,
+                    reclaimed_sol = count as f64 * 0.00203928,
+                    "closed emptied token accounts and reclaimed their rent"
+                );
+                count
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "rent reclaim failed");
+                0
+            }
+        }
+    }
+
     /// How many positions this lane currently holds open.
     ///
     /// A position is open when the bot bought it AND the wallet still holds
@@ -2878,8 +2945,15 @@ impl Sniper {
         pct: u8,
         plan: crate::execute::ExecutionPlan,
     ) -> SellOutcome {
-        // What the curve quote says we receive, in SOL.
-        let sol_out = plan.quote.minimum_out as f64 / 1e9;
+        // EXPECTED proceeds, not the slippage floor.
+        //
+        // This reported `minimum_out`, which is expected minus the whole
+        // slippage tolerance. At a 15% tolerance a break-even exit that really
+        // returned 0.010097 SOL was announced as 0.00862 — a 14% loss that
+        // never happened — and the same fiction was written to the audit as
+        // `sol_out_est`, where the PnL reads it. The floor protects the trade;
+        // it was never an estimate of the result.
+        let sol_out = plan.quote.expected_out as f64 / 1e9;
         match &self.mode {
             Mode::DryRun { .. } => {
                 info!(%mint, pct, sol_out, "sniper: DRY RUN CURVE SELL (nothing signed)");
