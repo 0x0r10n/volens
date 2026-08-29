@@ -54,15 +54,45 @@ pub struct Call {
     pub peak: f64,
     /// When the call was made — what the lookback and maturity windows use.
     pub at: DateTime<Utc>,
+    /// Was this call ever actually re-priced?
+    ///
+    /// A peak of 1.00x means two completely different things: "it was measured
+    /// and went nowhere", and "nobody ever managed to price it". Measured on
+    /// the live book, 66.9% of calls fall in the second group — the re-pricing
+    /// sweep is capped per pass and the quote endpoint fails in bursts, so most
+    /// calls are never checked even once.
+    ///
+    /// Counting those as misses does not measure wallets, it measures which
+    /// wallets happened to have their tokens priced. An unmeasured call is not
+    /// evidence either way and is excluded, exactly like one that is too fresh.
+    #[serde(default)]
+    pub measured: bool,
 }
 
 impl Call {
+    /// What makes two rows the SAME call.
+    ///
+    /// Mint alone is wrong in both directions. A restart re-archives calls that
+    /// are already in the file, and keying on mint would still let those
+    /// through as separate samples; a token that is called AGAIN days later is
+    /// a genuinely new call, and keying on mint would collapse it into the
+    /// first, robbing the second cohort of its sample. The call time separates
+    /// them, and it is stable — it comes from `first_seen_utc`, which never
+    /// changes once a signal is announced.
+    pub fn identity(&self) -> (String, i64) {
+        (self.mint.clone(), self.at.timestamp())
+    }
+
     pub fn from_signal(r: &SignalRecord) -> Self {
         Self {
             mint: r.mint.clone(),
             wallets: r.wallets.clone(),
             peak: r.peak(),
             at: r.first_seen_utc,
+            // A signal the tracker has priced at least once carries the time it
+            // last looked. Nothing else distinguishes a real 1.00x from a
+            // never-measured one.
+            measured: r.last_checked_utc.is_some(),
         }
     }
 }
@@ -74,11 +104,18 @@ impl Call {
 /// accumulate a record over 30 days out of a store that only holds one.
 pub struct ScoreLedger {
     path: String,
+    /// Serialises writes against the daily prune.
+    ///
+    /// Prune is read-modify-rewrite; the tracker appends whenever a call
+    /// retires. Without this, rows archived between the prune's read and its
+    /// rename are silently dropped — and a dropped row is a sample a wallet
+    /// never gets credit for.
+    write: std::sync::Mutex<()>,
 }
 
 impl ScoreLedger {
     pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into() }
+        Self { path: path.into(), write: std::sync::Mutex::new(()) }
     }
 
     /// Load every archived call. A corrupt line is skipped, not fatal — a
@@ -110,6 +147,7 @@ impl ScoreLedger {
         if buf.is_empty() {
             return;
         }
+        let _guard = self.write.lock().unwrap_or_else(|p| p.into_inner());
         match std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
             Ok(mut f) => {
                 if let Err(e) = f.write_all(buf.as_bytes()) {
@@ -128,9 +166,23 @@ impl ScoreLedger {
     /// by the lookback and nothing else — dropping a call still inside the
     /// window would silently shorten every wallet's record.
     pub fn prune(&self, now: DateTime<Utc>, keep_secs: i64) -> usize {
+        let _guard = self.write.lock().unwrap_or_else(|p| p.into_inner());
         let all = self.load();
-        let kept: Vec<&Call> =
-            all.iter().filter(|c| (now - c.at).num_seconds() <= keep_secs).collect();
+        // Age AND duplicates. The signal store reloads its whole file on boot
+        // and `retire` only drops from memory, so every restart re-retires the
+        // same calls and archives them a second time. Reading dedups by
+        // identity so the scores are right either way; this keeps the FILE from
+        // growing by a full day of calls on every restart.
+        let mut seen = HashSet::new();
+        let mut kept: Vec<&Call> = Vec::new();
+        for c in &all {
+            if (now - c.at).num_seconds() > keep_secs {
+                continue;
+            }
+            if seen.insert(c.identity()) {
+                kept.push(c);
+            }
+        }
         let dropped = all.len() - kept.len();
         if dropped == 0 {
             return 0;
@@ -159,22 +211,36 @@ impl ScoreLedger {
 /// the same call the HIGHER peak wins — the live one is still being re-priced
 /// and may have moved up since it was written.
 pub fn merge_calls(archived: Vec<Call>, live: &[SignalRecord]) -> Vec<Call> {
-    let mut by_mint: HashMap<String, Call> = HashMap::new();
+    let mut by_id: HashMap<(String, i64), Call> = HashMap::new();
+    // Keyed by identity, not by mint — see `Call::identity`. This is also what
+    // makes duplicate archive rows harmless: a call written twice collapses to
+    // one sample instead of counting twice.
     for c in archived {
-        by_mint.insert(c.mint.clone(), c);
-    }
-    for r in live {
-        let c = Call::from_signal(r);
-        by_mint
-            .entry(c.mint.clone())
+        by_id
+            .entry(c.identity())
             .and_modify(|e| {
                 if c.peak > e.peak {
                     e.peak = c.peak;
                 }
+                e.measured |= c.measured;
             })
             .or_insert(c);
     }
-    by_mint.into_values().collect()
+    for r in live {
+        let c = Call::from_signal(r);
+        by_id
+            .entry(c.identity())
+            .and_modify(|e| {
+                if c.peak > e.peak {
+                    e.peak = c.peak;
+                }
+                // Priced by either side is priced. The live copy is still being
+                // re-priced and may have been measured since it was archived.
+                e.measured |= c.measured;
+            })
+            .or_insert(c);
+    }
+    by_id.into_values().collect()
 }
 
 /// The bar a wallet must clear to be treated as Alpha.
@@ -306,8 +372,9 @@ pub fn wallet_performance(
             continue;
         }
         // Fresh calls still update recency — a wallet buying right now is
-        // active — but they are not yet evidence of anything.
-        let mature = age >= rules.maturity_secs;
+        // active — but they are not yet evidence of anything. Neither is a call
+        // nobody ever managed to price: see `Call::measured`.
+        let mature = age >= rules.maturity_secs && rec.measured;
         let peak = rec.peak;
         let hit = peak >= rules.hit_multiple;
 
@@ -400,6 +467,7 @@ mod tests {
             wallets: wallets.iter().map(|s| s.to_string()).collect(),
             peak,
             at: now() - Duration::seconds(age_secs),
+            measured: true,
         }
     }
 
@@ -540,7 +608,9 @@ mod tests {
             last_reported_multiple: 1.0,
             last_multiple: 3.0,
             peak_multiple: 0.0,
-            last_checked_utc: None,
+            // Priced at least once: this test is about the peak FIELD being
+            // absent, not about the call never having been measured.
+            last_checked_utc: Some(now()),
         };
         sr.peak_multiple = 0.0;
         let c = Call::from_signal(&sr);
@@ -575,16 +645,106 @@ mod tests {
             last_reported_multiple: 1.0,
             last_multiple: 4.0,
             peak_multiple: 4.0,
-            last_checked_utc: None,
+            last_checked_utc: Some(now()),
         }];
         let merged = merge_calls(archived, &live);
-        assert_eq!(merged.len(), 2, "a 20-day-old call survives alongside today's");
+        assert_eq!(merged.len(), 2, "a 5-day-old call survives alongside today's");
         let p = perf_of(&wallet_performance(&merged, &rules(), now()), "w1");
         assert_eq!(p.samples, 2);
     }
 
     /// A call in both places takes the higher peak: the live copy is still
     /// being re-priced and may have run further since it was archived.
+    /// A peak of 1.00x means two different things, and only one of them is a
+    /// miss. On the live book 66.9% of calls were never priced even once, so
+    /// counting them would measure the pricing sweep rather than the wallet.
+    #[test]
+    fn a_call_that_was_never_priced_is_not_a_sample() {
+        let mut unpriced = rec("A", 7200, 1.0, &["w1"]);
+        unpriced.measured = false;
+        let recs = vec![
+            rec("B", 7200, 5.0, &["w1"]),
+            rec("C", 7200, 4.0, &["w1"]),
+            unpriced,
+        ];
+        let p = perf_of(&wallet_performance(&recs, &rules(), now()), "w1");
+        assert_eq!(p.samples, 2, "the unpriced call is excluded, not counted as a miss");
+        assert_eq!(p.hit_rate(), 1.0);
+    }
+
+    /// A measured 1.00x IS a miss — the distinction has to cut both ways.
+    #[test]
+    fn a_measured_flat_call_is_still_a_miss() {
+        let recs = vec![
+            rec("A", 7200, 5.0, &["w1"]),
+            rec("B", 7200, 1.0, &["w1"]),
+        ];
+        let p = perf_of(&wallet_performance(&recs, &rules(), now()), "w1");
+        assert_eq!(p.samples, 2);
+        assert_eq!(p.hit_rate(), 0.5);
+    }
+
+    /// Priced by either copy counts: the live one is still being re-priced and
+    /// may have been measured since it was archived.
+    #[test]
+    fn measurement_survives_the_merge() {
+        let mut archived = rec("M", 7200, 1.0, &["w1"]);
+        archived.measured = false;
+        let live = vec![crate::signals::SignalRecord {
+            mint: "M".into(),
+            name: String::new(),
+            symbol: String::new(),
+            first_seen_utc: archived.at,
+            message_id: None,
+            reference_sol: 1.0,
+            reference_tokens_raw: 1,
+            decimals: 6,
+            fdv_usd_at_signal: None,
+            supply: None,
+            wallets: vec!["w1".into()],
+            total_sol: 1.0,
+            sol_usd_at_signal: None,
+            total_fees_sol: 0.0,
+            last_reported_multiple: 1.0,
+            last_multiple: 3.0,
+            peak_multiple: 3.0,
+            last_checked_utc: Some(now()),
+        }];
+        let merged = merge_calls(vec![archived], &live);
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].measured, "the live copy was priced");
+        assert_eq!(merged[0].peak, 3.0);
+    }
+
+    /// THE restart bug. `SignalStore::load` reads its whole file on boot and
+    /// `retire` only drops from memory, so every restart re-retires the same
+    /// calls and archives them again. Counted naively, a wallet's sample count
+    /// would grow by a full day of calls on each restart — inflating exactly
+    /// the number the qualification bar is measured against.
+    #[test]
+    fn a_call_archived_twice_counts_once() {
+        let c = rec("M", 7200, 5.0, &["w1"]);
+        let archived = vec![c.clone(), c.clone(), c];
+        let merged = merge_calls(archived, &[]);
+        assert_eq!(merged.len(), 1, "three identical rows are one call");
+        let p = perf_of(&wallet_performance(&merged, &rules(), now()), "w1");
+        assert_eq!(p.samples, 1);
+    }
+
+    /// The other direction: a token genuinely called twice, days apart, is two
+    /// results. Keying on mint alone would collapse them and rob the second
+    /// cohort of its sample.
+    #[test]
+    fn the_same_token_called_twice_is_two_calls() {
+        let first = rec("M", 5 * 24 * 3600, 1.0, &["w1"]);
+        let second = rec("M", 7200, 8.0, &["w2"]);
+        let merged = merge_calls(vec![first, second], &[]);
+        assert_eq!(merged.len(), 2, "different calls, same mint");
+        let ranked = wallet_performance(&merged, &rules(), now());
+        assert_eq!(perf_of(&ranked, "w1").samples, 1);
+        assert_eq!(perf_of(&ranked, "w2").hits, 1, "the second cohort keeps its win");
+    }
+
     #[test]
     fn a_call_in_both_places_keeps_the_higher_peak() {
         let archived = vec![rec("M", 7200, 2.0, &["w1"])];
@@ -606,7 +766,7 @@ mod tests {
             last_reported_multiple: 1.0,
             last_multiple: 9.0,
             peak_multiple: 9.0,
-            last_checked_utc: None,
+            last_checked_utc: Some(now()),
         }];
         let merged = merge_calls(archived, &live);
         assert_eq!(merged.len(), 1, "one token, not two");

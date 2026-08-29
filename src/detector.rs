@@ -1100,11 +1100,34 @@ impl Detector {
     #[cfg(feature = "sniper")]
     fn alpha_qualified(&self, wallet: &str) -> bool {
         const REFRESH: Duration = Duration::from_secs(300);
-        let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
-        let stale = match cache.as_ref() {
-            Some((at, _)) => at.elapsed() >= REFRESH,
-            None => true,
+
+        // Staleness is decided under the lock; the REBUILD is not.
+        //
+        // Rebuilding reads and parses the whole score archive — tens of
+        // thousands of rows — and this is called on the tracked-buy path, which
+        // carries roughly 861 transactions a minute. Doing that file work while
+        // holding the lock stalled every other caller behind it on an async
+        // worker thread.
+        //
+        // The timestamp is stamped BEFORE the rebuild, so a burst of callers
+        // arriving together does not each start their own scan.
+        let stale = {
+            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
+            match cache.as_mut() {
+                Some((at, _)) if at.elapsed() < REFRESH => false,
+                Some((at, _)) => {
+                    *at = Instant::now();
+                    true
+                }
+                None => {
+                    // Nothing to serve yet: claim the rebuild with an empty set
+                    // so concurrent callers wait for it rather than duplicating.
+                    *cache = Some((Instant::now(), std::collections::HashSet::new()));
+                    true
+                }
+            }
         };
+
         if stale {
             let rules = self.sniper.alpha_rules();
             // ARCHIVE first, live store second. The archive is the 30-day
@@ -1123,8 +1146,11 @@ impl Detector {
                 min_hit_rate = rules.min_hit_rate,
                 "alpha wallet set refreshed"
             );
+            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
             *cache = Some((Instant::now(), set));
         }
+
+        let cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
         cache.as_ref().map(|(_, s)| s.contains(wallet)).unwrap_or(false)
     }
 
