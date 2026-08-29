@@ -1913,6 +1913,21 @@ impl Sniper {
     }
 
     /// Turn the supply-share ceiling on or off, keeping the tuned percentage.
+    /// Smart-money SOL volume Alpha requires on top of the wallet. 0 = off.
+    pub fn set_alpha_min_smart_sol(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("volume must be zero or positive".into());
+        }
+        self.settings.update(|s| {
+            s.alpha_min_smart_sol = v;
+            Ok(if v > 0.0 {
+                format!("alpha also needs {v} SOL of smart-money volume")
+            } else {
+                "alpha volume requirement off — the wallet alone triggers it".to_string()
+            })
+        })
+    }
+
     /// Most concurrent positions a lane may hold. 0 = unlimited.
     pub fn set_max_open_positions(&self, lane: Lane, v: u32) -> Result<String, String> {
         if v > 50 {

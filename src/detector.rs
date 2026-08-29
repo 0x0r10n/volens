@@ -1100,7 +1100,8 @@ impl Detector {
             // a token both agree on is entered by both, which is the point.
             #[cfg(feature = "sniper")]
             {
-                if self.sniper.live().alpha_enabled
+                let alpha_live = self.sniper.live();
+                if alpha_live.alpha_enabled
                     // Same cohort filter the volume trigger uses. Performance
                     // is not the only question: the excluded cohorts are full
                     // of launch bundlers whose entries sit inside creation
@@ -1109,7 +1110,45 @@ impl Detector {
                     && self.wallets.in_groups(&buy.wallet, &self.cfg.tracked.auto_buy_groups)
                     && self.alpha_qualified(&buy.wallet)
                 {
-                    self.spawn_alpha_buy(&buy.mint, &buy.wallet).await;
+                    // SECOND PIECE OF EVIDENCE, when configured.
+                    //
+                    // Identity says the buyer is good; it does not say this
+                    // entry was a real position rather than a dust-sized look.
+                    // Requiring volume alongside it makes both agree before any
+                    // money moves. Checked AFTER qualification because it is
+                    // the more expensive lookup of the two.
+                    let need = alpha_live.alpha_min_smart_sol;
+                    let ok = if need > 0.0 {
+                        let smart_sol = {
+                            let tracker = match self.conviction.lock() {
+                                Ok(t) => t,
+                                Err(p) => p.into_inner(),
+                            };
+                            tracker.sol_in_window(&buy.mint, Instant::now())
+                        };
+                        if smart_sol < need {
+                            info!(
+                                mint = %buy.mint,
+                                smart_sol,
+                                need,
+                                "skip: alpha smart-money volume below the threshold"
+                            );
+                            false
+                        } else {
+                            info!(
+                                mint = %buy.mint,
+                                smart_sol,
+                                need,
+                                "alpha volume confirmed"
+                            );
+                            true
+                        }
+                    } else {
+                        true
+                    };
+                    if ok {
+                        self.spawn_alpha_buy(&buy.mint, &buy.wallet).await;
+                    }
                 }
             }
 

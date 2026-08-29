@@ -1809,6 +1809,7 @@ impl Bot {
             "alphabuy" => ("alpha buy amount", "e.g. <code>0.05</code> (SOL)"),
             "maxopen" => ("max open positions", "e.g. <code>2</code>, 0 = unlimited"),
             "alphamaxopen" => ("alpha max open positions", "e.g. <code>2</code>, 0 = unlimited"),
+            "alphasmartsol" => ("alpha smart volume", "e.g. <code>5</code> (SOL), 0 = off"),
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -2138,11 +2139,17 @@ impl Bot {
         } else {
             live.alpha_max_open_positions.to_string()
         };
+        let vol_s = if live.alpha_min_smart_sol > 0.0 {
+            format!("{} SOL", live.alpha_min_smart_sol)
+        } else {
+            "off".to_string()
+        };
         let mut text = format!(
             "⭐ <b>Alpha</b> · {onoff}\n\n\
-             Buy amount  <b>{amt_s}</b>\n\
-             Max open    <b>{open_s}</b>\n\
-             Orders      <b>{}</b>",
+             Buy amount    <b>{amt_s}</b>\n\
+             Smart volume  <b>{vol_s}</b>\n\
+             Max open      <b>{open_s}</b>\n\
+             Orders        <b>{}</b>",
             crate::exits::describe_orders(&live.alpha_exits)
         );
         if live.alpha_enabled && live.alpha_buy_sol <= 0.0 {
@@ -2156,8 +2163,9 @@ impl Bot {
             [{"text": format!("Alpha · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
             [{"text": format!("💰 Buy · {amt_s}"), "callback_data": "set:alphabuy"},
              {"text": "📋 Orders", "callback_data": "set:aladder"}],
-            [{"text": format!("📌 Max open · {open_s}"), "callback_data": "set:alphamaxopen"},
-             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("💸 Smart volume · {vol_s}"), "callback_data": "set:alphasmartsol"},
+             {"text": format!("📌 Max open · {open_s}"), "callback_data": "set:alphamaxopen"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -2474,6 +2482,11 @@ impl Bot {
                     if live.max_open_positions == 0 { "unlimited".to_string() }
                     else { live.max_open_positions.to_string() },
                     vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
+                "alphasmartsol" => ("⭐ Alpha smart volume",
+                    "SOL the tracked cohort must have put in before Alpha buys. 0 = wallet alone.",
+                    if live.alpha_min_smart_sol <= 0.0 { "off".to_string() }
+                    else { format!("{} SOL", live.alpha_min_smart_sol) },
+                    vec![0.0, 1.0, 2.0, 5.0, 10.0, 20.0], " SOL", false),
                 "alphamaxopen" => ("⭐ Alpha max open",
                     "Most positions Alpha may hold at once. 0 = unlimited.",
                     if live.alpha_max_open_positions == 0 { "unlimited".to_string() }
@@ -2608,6 +2621,7 @@ impl Bot {
             "alphabuy" => sniper.set_alpha_buy_sol(v),
             "maxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Normal, v as u32),
             "alphamaxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Alpha, v as u32),
+            "alphasmartsol" => sniper.set_alpha_min_smart_sol(v),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),

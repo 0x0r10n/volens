@@ -168,6 +168,21 @@ pub struct LiveSettings {
     #[serde(default = "alpha_exits_default")]
     pub alpha_exits: crate::exits::ExitRules,
 
+    /// Smart-money SOL that must have gone into a token, inside the signal
+    /// window, before ALPHA will buy it. 0 = not required.
+    ///
+    /// Alpha's trigger is identity — a wallet with a measured record bought.
+    /// That says the buyer is good; it says nothing about whether THIS entry
+    /// was a real position or a dust-sized look. Requiring volume alongside it
+    /// makes the two pieces of evidence agree: a proven wallet, and enough
+    /// money behind the move to be worth following.
+    ///
+    /// Independent of the normal trigger's `min_smart_sol_in`, like every other
+    /// Alpha setting — the two lanes are separate strategies and one should
+    /// never be tuned by moving the other.
+    #[serde(default)]
+    pub alpha_min_smart_sol: f64,
+
     /// Most positions the NORMAL trigger may hold open at once. 0 = unlimited.
     ///
     /// Counted per lane, not globally. Alpha and the volume trigger are
@@ -369,6 +384,7 @@ impl LiveSettings {
             alpha_tp_pct: 0,
             alpha_sl_pct: 0,
             alpha_exits: alpha_exits_default(),
+            alpha_min_smart_sol: 0.0,
             max_open_positions: one_position(),
             alpha_max_open_positions: one_position(),
             supply_cap: false,
