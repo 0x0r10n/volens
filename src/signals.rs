@@ -660,16 +660,44 @@ async fn curve_price_fallback(
     rpc: &crate::rpc::RpcClient,
     mint: &str,
     decimals: u32,
-) -> Option<f64> {
-    let pk = crate::tx::pk(mint).ok()?;
+) -> CurvePrice {
+    let Ok(pk) = crate::tx::pk(mint) else { return CurvePrice::Never };
     let addr = crate::pumpfun::bonding_curve_pda(&pk).to_string();
-    let data = rpc.account_data(&addr).await?;
-    let curve = crate::pumpfun::BondingCurve::decode(&data).ok()?;
+    // A missing account is a permanent answer; a failed READ is not, but the
+    // two are indistinguishable here, so this is treated as retryable and the
+    // caller bounds how often it tries.
+    let Some(data) = rpc.account_data(&addr).await else { return CurvePrice::Unavailable };
+    let Ok(curve) = crate::pumpfun::BondingCurve::decode(&data) else {
+        return CurvePrice::Never;
+    };
+    // Graduated, or quoted in something other than SOL. Neither reverts: once a
+    // curve completes its reserves stop being the price forever. A graduated
+    // token that trades again is priced by the STREAM, which is the right
+    // source for something actually trading.
     if curve.complete || !curve.quote_is_sol() {
-        return None;
+        return CurvePrice::Never;
     }
     let price = crate::execute::curve_price_sol(&curve, decimals as u8);
-    (price > 0.0 && price.is_finite()).then_some(price)
+    if price > 0.0 && price.is_finite() {
+        CurvePrice::Priced(price)
+    } else {
+        CurvePrice::Unavailable
+    }
+}
+
+/// Outcome of a curve price attempt.
+///
+/// `Never` is what stops the sweep re-reading the same unpriceable mints
+/// forever: once the whole never-measured backlog is drained, every remaining
+/// candidate is one of these, and without the distinction the budget was spent
+/// on 25 guaranteed-failing RPC reads on every single sweep.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CurvePrice {
+    Priced(f64),
+    /// No curve, not a pump.fun mint, or graduated. Will not change.
+    Never,
+    /// Could not read it this time. Worth trying again.
+    Unavailable,
 }
 
 /// Without the sniper feature the curve decoders are not compiled in.
@@ -678,8 +706,8 @@ async fn curve_price_fallback(
     _rpc: &crate::rpc::RpcClient,
     _mint: &str,
     _decimals: u32,
-) -> Option<f64> {
-    None
+) -> CurvePrice {
+    CurvePrice::Never
 }
 
 pub fn spawn_tracker(
@@ -697,6 +725,10 @@ pub fn spawn_tracker(
         // in microseconds, so the floor exists only to stop a config typo
         // spinning the task.
         let interval = std::time::Duration::from_secs(cfg.update_check_secs.max(5));
+        // Mints with no live bonding curve — graduated, or never pump.fun.
+        // Lives across sweeps: the answer does not change, and re-asking cost a
+        // full RPC budget every few seconds once the backlog was drained.
+        let mut no_curve: std::collections::HashSet<String> = std::collections::HashSet::new();
         // A price older than this is not a price. A token nobody has traded in
         // an hour cannot be marked to market, and saying so is more honest
         // than reporting the last trade as if it were current.
@@ -853,11 +885,14 @@ pub fn spawn_tracker(
                 if quoted.is_none()
                     && (never_measured || stale_enough)
                     && curve_reads < MAX_CURVE_PRICES_PER_SWEEP
+                    && !no_curve.contains(&rec.mint)
                 {
                     curve_reads += 1;
-                    if let Some(unit) =
-                        curve_price_fallback(&rpc, &rec.mint, rec.decimals).await
-                    {
+                    let attempt = curve_price_fallback(&rpc, &rec.mint, rec.decimals).await;
+                    if attempt == CurvePrice::Never {
+                        no_curve.insert(rec.mint.clone());
+                    }
+                    if let CurvePrice::Priced(unit) = attempt {
                         let v = unit * tokens_ui(rec.reference_tokens_raw, rec.decimals);
                         // Sanity bound. The stream price is corroborated by
                         // real fills; this one is derived from reserves and a
