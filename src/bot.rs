@@ -1714,14 +1714,20 @@ impl Bot {
         } else {
             live.max_trades_per_day.to_string()
         };
+        let open_s = if live.max_open_positions == 0 {
+            "unlimited".to_string()
+        } else {
+            live.max_open_positions.to_string()
+        };
         let text = format!(
             "🛡 <b>Limits</b>\n\n\
-             Trades per day · <b>{trades}</b>\n\n\
-"
+             Trades per day · <b>{trades}</b>\n\
+             Max open positions · <b>{open_s}</b>"
         );
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("🔢 Trades per day · {trades}"), "callback_data": "set:maxtrades"},
-             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+             {"text": format!("📌 Max open · {open_s}"), "callback_data": "set:maxopen"}],
+            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -1801,6 +1807,8 @@ impl Bot {
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
             "alphabuy" => ("alpha buy amount", "e.g. <code>0.05</code> (SOL)"),
+            "maxopen" => ("max open positions", "e.g. <code>2</code>, 0 = unlimited"),
+            "alphamaxopen" => ("alpha max open positions", "e.g. <code>2</code>, 0 = unlimited"),
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -2125,9 +2133,15 @@ impl Bot {
         let onoff = if live.alpha_enabled { "🟢 On" } else { "⚪ Off" };
         let amt_s = format!("{} SOL", live.alpha_buy_sol);
 
+        let open_s = if live.alpha_max_open_positions == 0 {
+            "unlimited".to_string()
+        } else {
+            live.alpha_max_open_positions.to_string()
+        };
         let mut text = format!(
             "⭐ <b>Alpha</b> · {onoff}\n\n\
              Buy amount  <b>{amt_s}</b>\n\
+             Max open    <b>{open_s}</b>\n\
              Orders      <b>{}</b>",
             crate::exits::describe_orders(&live.alpha_exits)
         );
@@ -2142,7 +2156,8 @@ impl Bot {
             [{"text": format!("Alpha · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
             [{"text": format!("💰 Buy · {amt_s}"), "callback_data": "set:alphabuy"},
              {"text": "📋 Orders", "callback_data": "set:aladder"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("📌 Max open · {open_s}"), "callback_data": "set:alphamaxopen"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -2454,6 +2469,16 @@ impl Bot {
                     "Max share of a token's supply. Excess is sold after the buy.",
                     fmt_supply_pct(live.max_supply_pct),
                     vec![0.0, 0.5, 1.0, 2.0, 5.0, 10.0], "%", false),
+                "maxopen" => ("🔢 Max open positions",
+                    "Most positions the normal trigger may hold at once. 0 = unlimited.",
+                    if live.max_open_positions == 0 { "unlimited".to_string() }
+                    else { live.max_open_positions.to_string() },
+                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
+                "alphamaxopen" => ("⭐ Alpha max open",
+                    "Most positions Alpha may hold at once. 0 = unlimited.",
+                    if live.alpha_max_open_positions == 0 { "unlimited".to_string() }
+                    else { live.alpha_max_open_positions.to_string() },
+                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
                 "alphabuy" => ("⭐ Alpha buy amount",
                     "SOL per Alpha entry.",
                     format!("{} SOL", live.alpha_buy_sol),
@@ -2532,7 +2557,13 @@ impl Bot {
         // Back goes to the screen this editor was opened FROM, not the root.
         // Setting an Alpha level and landing in the top-level settings menu
         // makes the next Alpha change a three-tap journey.
-        let back = if field.starts_with("alpha") { "set:alpha" } else { "cmd:settings" };
+        let back = if field.starts_with("alpha") {
+            "set:alpha"
+        } else if field == "maxopen" {
+            "set:limits"
+        } else {
+            "cmd:settings"
+        };
         rows.push(serde_json::json!([
             {"text": "✏️ Custom value", "callback_data": format!("ask:{field}")},
             {"text": "◀️ Back", "callback_data": back},
@@ -2575,6 +2606,8 @@ impl Bot {
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsupply" => sniper.set_max_supply_pct(v),
             "alphabuy" => sniper.set_alpha_buy_sol(v),
+            "maxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Normal, v as u32),
+            "alphamaxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Alpha, v as u32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),

@@ -163,6 +163,19 @@ pub fn alpha_mints_from_audit(audit_jsonl: &str) -> std::collections::HashSet<St
     out
 }
 
+/// Split the bot's positions into the lane that owns each one.
+///
+/// A mint ALPHA opened belongs to the Alpha lane whatever else also bought it —
+/// the same rule that routes its exits, so a token both triggers entered is
+/// counted once, against Alpha, rather than consuming both allowances.
+pub fn mints_in_lane(
+    all: impl IntoIterator<Item = String>,
+    alpha_mints: &std::collections::HashSet<String>,
+    alpha_lane: bool,
+) -> Vec<String> {
+    all.into_iter().filter(|m| alpha_mints.contains(m) == alpha_lane).collect()
+}
+
 /// Did this outcome move funds? Mirrors the `SubmitOutcome::Executed` cases.
 /// Deliberately strict — an `unconfirmed`/`error`/`would-*` outcome is NOT a
 /// confirmed spend and must not be counted as cost basis.
@@ -403,6 +416,35 @@ mod tests {
             alpha_mints_from_audit(&log).contains("MINT_A"),
             "and it is governed by the alpha exits"
         );
+    }
+
+    /// Each lane counts only its own positions, so one strategy filling up
+    /// never locks the other out.
+    #[test]
+    fn the_lanes_count_separate_positions() {
+        let mut alpha = std::collections::HashSet::new();
+        alpha.insert("ALPHA_ONLY".to_string());
+        alpha.insert("BOTH".to_string());
+        let all =
+            vec!["ALPHA_ONLY".to_string(), "BOTH".to_string(), "NORMAL_ONLY".to_string()];
+
+        let a = mints_in_lane(all.clone(), &alpha, true);
+        assert_eq!(a.len(), 2, "alpha owns the one it opened and the shared one");
+        assert!(a.contains(&"BOTH".to_string()));
+
+        let n = mints_in_lane(all, &alpha, false);
+        assert_eq!(n, vec!["NORMAL_ONLY".to_string()]);
+    }
+
+    /// A token both triggers entered is ONE position, counted against Alpha —
+    /// counting it twice would consume both allowances for a single holding.
+    #[test]
+    fn a_shared_position_is_not_counted_in_both_lanes() {
+        let mut alpha = std::collections::HashSet::new();
+        alpha.insert("BOTH".to_string());
+        let all = vec!["BOTH".to_string()];
+        assert_eq!(mints_in_lane(all.clone(), &alpha, true).len(), 1);
+        assert_eq!(mints_in_lane(all, &alpha, false).len(), 0);
     }
 
     #[test]

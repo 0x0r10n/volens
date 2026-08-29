@@ -168,6 +168,23 @@ pub struct LiveSettings {
     #[serde(default = "alpha_exits_default")]
     pub alpha_exits: crate::exits::ExitRules,
 
+    /// Most positions the NORMAL trigger may hold open at once. 0 = unlimited.
+    ///
+    /// Counted per lane, not globally. Alpha and the volume trigger are
+    /// separate strategies with separate capital theses, and a shared counter
+    /// would mean whichever fired first silently locked the other out — the
+    /// exact coupling the two-lane design exists to avoid.
+    ///
+    /// Defaults to 1: concentration is the point. A bot that opens a position
+    /// on every signal it likes spreads the same balance across trades it
+    /// cannot then size properly, and on a small wallet it runs out of fees
+    /// before it runs out of signals.
+    #[serde(default = "one_position")]
+    pub max_open_positions: u32,
+    /// Most positions ALPHA may hold open at once. 0 = unlimited.
+    #[serde(default = "one_position")]
+    pub alpha_max_open_positions: u32,
+
     /// Enforce the supply-share ceiling. Separate from the percentage so the
     /// rule can be switched off without losing the number you tuned.
     #[serde(default)]
@@ -352,6 +369,8 @@ impl LiveSettings {
             alpha_tp_pct: 0,
             alpha_sl_pct: 0,
             alpha_exits: alpha_exits_default(),
+            max_open_positions: one_position(),
+            alpha_max_open_positions: one_position(),
             supply_cap: false,
             max_supply_pct: 0.0,
             volume_mode: false,
@@ -922,6 +941,11 @@ mod tests {
         assert_eq!(r.trailing_pct, 35, "and alpha's own trailing stop");
         assert!(r.exit_on_liquidity_pull, "while safety behaviour is still inherited");
     }
+}
+
+/// One concurrent position per lane until the operator says otherwise.
+fn one_position() -> u32 {
+    1
 }
 
 /// Alpha starts with NO orders of its own.

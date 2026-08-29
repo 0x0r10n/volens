@@ -966,6 +966,36 @@ impl Sniper {
 
         let live = self.settings.snapshot();
         let env = self.settings.envelope();
+        // CONCURRENT POSITION LIMIT, per lane.
+        //
+        // Placed before the quote and the safety reads: this is the cheapest
+        // possible "no", and a refusal here costs one batched balance read
+        // rather than a full pricing round trip.
+        let cap = if alpha { live.alpha_max_open_positions } else { live.max_open_positions };
+        if cap > 0 {
+            match self.open_positions(alpha).await {
+                Some(open) if open >= cap as usize => {
+                    let reason = if alpha {
+                        "skip: alpha max open positions reached"
+                    } else {
+                        "skip: max open positions reached"
+                    };
+                    info!(%mint, open, cap, alpha, "{reason}");
+                    return BuyOutcome::Refused { reason: format!("{reason} ({open}/{cap})") };
+                }
+                Some(_) => {}
+                // Fail CLOSED. An unreadable count is not zero, and treating it
+                // as zero turns a limit of 1 into no limit at all at exactly
+                // the moment the chain is being flaky.
+                None => {
+                    warn!(%mint, alpha, "could not count open positions — refusing the buy");
+                    return BuyOutcome::Refused {
+                        reason: "open position count unavailable".into(),
+                    };
+                }
+            }
+        }
+
         // An Alpha entry brings its own size; otherwise use the configured one.
         let size = size_override.unwrap_or(live.trade_size_sol);
         let max_size = live.effective_max_trade_size(&env);
@@ -1883,6 +1913,24 @@ impl Sniper {
     }
 
     /// Turn the supply-share ceiling on or off, keeping the tuned percentage.
+    /// Most concurrent positions a lane may hold. 0 = unlimited.
+    pub fn set_max_open_positions(&self, lane: Lane, v: u32) -> Result<String, String> {
+        if v > 50 {
+            return Err("that is not a concentration limit".into());
+        }
+        self.settings.update(|s| {
+            match lane {
+                Lane::Normal => s.max_open_positions = v,
+                Lane::Alpha => s.alpha_max_open_positions = v,
+            }
+            Ok(if v == 0 {
+                format!("{} open positions unlimited", lane.label())
+            } else {
+                format!("{} limited to {v} open position{}", lane.label(), if v == 1 { "" } else { "s" })
+            })
+        })
+    }
+
     /// ALPHA SMART MONEY MODE on/off.
     pub fn toggle_alpha(&self) -> Result<String, String> {
         self.settings.update(|s| {
@@ -1918,6 +1966,33 @@ impl Sniper {
                 "alpha buy amount cleared — alpha cannot trade until it is set".to_string()
             })
         })
+    }
+
+    /// How many positions this lane currently holds open.
+    ///
+    /// A position is open when the bot bought it AND the wallet still holds
+    /// some. Counted per lane from the audit tag, so an Alpha entry never
+    /// consumes the normal trigger's allowance or the reverse.
+    ///
+    /// `None` means the count could not be established. Callers must treat that
+    /// as a refusal rather than as zero: reading "no positions" from a failed
+    /// query is how a limit of 1 quietly becomes a limit of none at all.
+    pub async fn open_positions(&self, alpha_lane: bool) -> Option<usize> {
+        let owner = self.owner()?.to_string();
+        let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.ok()?;
+        let basis = crate::positions::cost_basis_from_audit(&audit);
+        if basis.is_empty() {
+            return Some(0);
+        }
+        let alpha_mints = crate::positions::alpha_mints_from_audit(&audit);
+        // A mint Alpha opened belongs to the Alpha lane, whatever else also
+        // bought it — the same rule that routes its exits.
+        let mints = crate::positions::mints_in_lane(basis.into_keys(), &alpha_mints, alpha_lane);
+        if mints.is_empty() {
+            return Some(0);
+        }
+        let balances = self.rpc.token_balances_raw(&owner, &mints).await?;
+        Some(balances.values().filter(|(raw, _)| *raw > 0).count())
     }
 
     /// Do we already hold an ALPHA position in this mint?
