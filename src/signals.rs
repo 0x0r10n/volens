@@ -631,6 +631,57 @@ pub async fn quote_sol_value(
 /// Jupiter's free tier rate-limits, and a burst of parallel requests across
 /// every tracked signal is the reliable way to get throttled into silence.
 #[allow(clippy::too_many_arguments)]
+
+/// Price a token from its bonding curve when the stream cannot.
+///
+/// # Why this exists
+///
+/// Re-pricing reads the in-process fill index, which only knows tokens that
+/// have actually traded where we can see them. Measured on the live book,
+/// **66.9% of tracked calls had never been priced even once** — the token went
+/// quiet, or never traded through a venue the index observes, so it sat at
+/// 1.00x forever.
+///
+/// That is not a cosmetic gap. A never-measured call is indistinguishable from
+/// a flat one in the stored record, so it polluted the leaderboard, `/positions`
+/// and — worst — wallet scoring, where two thirds of every wallet's sample was
+/// really a measure of whether its tokens happened to get observed.
+///
+/// A pump.fun curve needs no observation. Its reserves ARE the price, the
+/// address is a PDA of the mint, and one account read gives an exact answer for
+/// a token nobody has traded in hours.
+///
+/// Returns `None` for a graduated curve — the reserves stop being the price
+/// once it moves to PumpSwap — and for anything that is not a pump.fun mint.
+/// Those keep relying on the stream, which is the right source for a token
+/// that is actually trading.
+#[cfg(feature = "sniper")]
+async fn curve_price_fallback(
+    rpc: &crate::rpc::RpcClient,
+    mint: &str,
+    decimals: u32,
+) -> Option<f64> {
+    let pk = crate::tx::pk(mint).ok()?;
+    let addr = crate::pumpfun::bonding_curve_pda(&pk).to_string();
+    let data = rpc.account_data(&addr).await?;
+    let curve = crate::pumpfun::BondingCurve::decode(&data).ok()?;
+    if curve.complete || !curve.quote_is_sol() {
+        return None;
+    }
+    let price = crate::execute::curve_price_sol(&curve, decimals as u8);
+    (price > 0.0 && price.is_finite()).then_some(price)
+}
+
+/// Without the sniper feature the curve decoders are not compiled in.
+#[cfg(not(feature = "sniper"))]
+async fn curve_price_fallback(
+    _rpc: &crate::rpc::RpcClient,
+    _mint: &str,
+    _decimals: u32,
+) -> Option<f64> {
+    None
+}
+
 pub fn spawn_tracker(
     store: std::sync::Arc<SignalStore>,
     alerter: std::sync::Arc<crate::alerts::Alerter>,
@@ -725,6 +776,14 @@ pub fn spawn_tracker(
             // records are repaired per sweep — they converge within minutes.
             const MAX_BACKFILLS_PER_SWEEP: usize = 8;
             let mut backfills = 0usize;
+            // On-chain price reads for calls the stream cannot price. Bounded
+            // for the same reason as the backfills: this is a real RPC round
+            // trip, and the sweep runs every few seconds. Newest-first ordering
+            // means the freshest unpriced calls are repaired first, and the
+            // rest converge over the following sweeps.
+            const MAX_CURVE_PRICES_PER_SWEEP: usize = 12;
+            let mut curve_reads = 0usize;
+            let mut curve_priced = 0usize;
 
             for rec in batch {
                 if *shutdown.borrow() {
@@ -767,10 +826,38 @@ pub fn spawn_tracker(
                 // A zero is not a price: `tokens_ui` returns 0 when decimals
                 // are unknown, and multiplying through would report a real
                 // token as worthless rather than as unpriceable.
-                let quoted = prices
+                let mut quoted = prices
                     .price_sol(&rec.mint, max_price_age)
                     .map(|p| p.price_sol * tokens_ui(rec.reference_tokens_raw, rec.decimals))
                     .filter(|v| *v > 0.0);
+
+                // The stream did not see it. Ask the chain before writing it
+                // off as unpriceable — see `curve_price_fallback`.
+                if quoted.is_none() && curve_reads < MAX_CURVE_PRICES_PER_SWEEP {
+                    curve_reads += 1;
+                    if let Some(unit) =
+                        curve_price_fallback(&rpc, &rec.mint, rec.decimals).await
+                    {
+                        let v = unit * tokens_ui(rec.reference_tokens_raw, rec.decimals);
+                        // Sanity bound. The stream price is corroborated by
+                        // real fills; this one is derived from reserves and a
+                        // stored `decimals`, so a wrong decimals would show up
+                        // as an absurd multiple and be written into the
+                        // permanent record. Refusing to price is recoverable;
+                        // recording a fabricated 10,000x is not.
+                        let implied = if rec.reference_sol > 0.0 { v / rec.reference_sol } else { 0.0 };
+                        if v > 0.0 && implied <= 10_000.0 {
+                            curve_priced += 1;
+                            quoted = Some(v);
+                        } else if implied > 10_000.0 {
+                            tracing::warn!(
+                                mint = %rec.mint, implied,
+                                "curve price implies an absurd multiple — ignoring it"
+                            );
+                        }
+                    }
+                }
+                let quoted = quoted;
 
                 // Pacing is applied on EVERY iteration, including failures.
                 // Putting it after an early `continue` meant a failing endpoint
@@ -814,7 +901,10 @@ pub fn spawn_tracker(
                     }
                 } else {
                     unpriced += 1;
-                    tracing::debug!(mint = %rec.mint, "no recent fills — cannot price yet");
+                    tracing::debug!(
+                        mint = %rec.mint,
+                        "no recent fills and no live curve — cannot price yet"
+                    );
                 }
 
                 // No sleep here: `jupiter::throttle` spaces every request
@@ -830,6 +920,8 @@ pub fn spawn_tracker(
                 priced,
                 unpriced,
                 named,
+                from_curve = curve_priced,
+                curve_reads,
                 best = format!("{best:.2}x"),
                 took_secs = started.elapsed().as_secs(),
                 "re-pricing sweep complete"
