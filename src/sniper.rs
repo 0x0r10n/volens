@@ -1950,6 +1950,7 @@ impl Sniper {
         crate::alpha::AlphaRules {
             min_samples: self.cfg.alpha_min_samples,
             min_hit_rate: self.cfg.alpha_min_hit_rate,
+            min_median_peak: self.cfg.alpha_min_median_peak,
             hit_multiple: self.cfg.alpha_hit_multiple,
             lookback_secs: self.cfg.alpha_lookback_hours * 3600,
             recency_secs: self.cfg.alpha_recency_hours * 3600,
@@ -3195,6 +3196,7 @@ mod tests {
             max_trades_per_day: 5,
             alpha_min_samples: 8,
             alpha_min_hit_rate: 0.35,
+            alpha_min_median_peak: 1.5,
             alpha_hit_multiple: 2.0,
             alpha_lookback_hours: 168,
             alpha_recency_hours: 72,

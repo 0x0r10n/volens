@@ -433,6 +433,11 @@ pub struct SniperConfig {
     /// The multiple that counts as a hit.
     #[serde(default = "default_alpha_hit_multiple")]
     pub alpha_hit_multiple: f64,
+    /// Median peak a wallet's calls must reach. See
+    /// `crate::alpha::AlphaRules::min_median_peak` — this is what separates
+    /// "usually right" from "occasionally lucky".
+    #[serde(default = "default_alpha_min_median_peak")]
+    pub alpha_min_median_peak: f64,
     /// How far back to look for samples.
     #[serde(default = "default_alpha_lookback_hours")]
     pub alpha_lookback_hours: i64,
@@ -705,12 +710,16 @@ fn default_max_watch() -> u64 { 600 }
 fn default_jupiter_url() -> String { "https://lite-api.jup.ag/swap/v1".to_string() }
 fn default_kill_switch() -> String { "HALT".into() }
 fn default_alpha_min_samples() -> usize {
-    8
+    20
 }
-/// A bar set from what the tracked book actually does. Most wallets sit well
-/// under this; the ones that clear it are the reason Alpha exists.
+fn default_alpha_min_median_peak() -> f64 {
+    1.5
+}
+/// Set against the MEASURED baseline, not intuition. 18.7% of called tokens
+/// reach 2x, but the median wallet with enough samples already scores 32.9% —
+/// so the original 0.35 admitted half the book. See `AlphaRules::min_hit_rate`.
 fn default_alpha_min_hit_rate() -> f64 {
-    0.35
+    0.50
 }
 fn default_alpha_hit_multiple() -> f64 {
     2.0
@@ -812,6 +821,7 @@ impl Default for SniperConfig {
             alpha_min_samples: default_alpha_min_samples(),
             alpha_min_hit_rate: default_alpha_min_hit_rate(),
             alpha_hit_multiple: default_alpha_hit_multiple(),
+            alpha_min_median_peak: default_alpha_min_median_peak(),
             alpha_lookback_hours: default_alpha_lookback_hours(),
             alpha_recency_hours: default_alpha_recency_hours(),
             alpha_maturity_mins: default_alpha_maturity_mins(),

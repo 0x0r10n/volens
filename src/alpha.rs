@@ -47,7 +47,22 @@ pub struct AlphaRules {
     /// against promoting a wallet that got lucky once.
     pub min_samples: usize,
     /// Share of its samples that must be hits, 0.0–1.0.
+    ///
+    /// Must be read against the BASELINE, not against intuition. Measured on
+    /// the live book: 18.7% of called tokens reach 2x, but the median wallet
+    /// with enough samples sits at 32.9% — because a wallet's rate is only ever
+    /// measured on tokens that got CALLED, and those already had several smart
+    /// wallets buying them. A bar of 35% therefore admitted half the book while
+    /// looking selective. It has to clear the median by a real margin.
     pub min_hit_rate: f64,
+    /// The MEDIAN peak a wallet's calls must reach.
+    ///
+    /// Hit rate alone cannot tell "usually right" from "occasionally lucky". A
+    /// wallet on the live book scored a 44.4% hit rate with a median of 1.00x —
+    /// half its calls went nowhere at all — and qualified anyway, because
+    /// touching 2x on the other half was enough. This is the check that says
+    /// what the TYPICAL call did, and it is the one that rejects that wallet.
+    pub min_median_peak: f64,
     /// The multiple that counts as a hit.
     pub hit_multiple: f64,
     /// How far back to look for samples, in seconds.
@@ -67,8 +82,12 @@ pub struct AlphaRules {
 impl Default for AlphaRules {
     fn default() -> Self {
         Self {
-            min_samples: 8,
-            min_hit_rate: 0.35,
+            // Raised from 8. At 8 samples a 37.5% rate is three hits, and its
+            // confidence interval spans most of the range — indistinguishable
+            // from chance, yet it read as a qualification.
+            min_samples: 20,
+            min_hit_rate: 0.50,
+            min_median_peak: 1.5,
             hit_multiple: 2.0,
             lookback_secs: 7 * 24 * 3600,
             recency_secs: 3 * 24 * 3600,
@@ -90,6 +109,9 @@ pub struct WalletPerf {
     /// Mean peak across its samples. Reported, never used to qualify: one
     /// 900x drags an average somewhere no median would go.
     pub avg_peak: f64,
+    /// Median peak — what a TYPICAL call by this wallet did. Unlike the mean,
+    /// a single moonshot cannot lift it, which is exactly why it qualifies.
+    pub median_peak: f64,
     /// Most recent buy seen, including calls too fresh to be samples — this
     /// measures activity, not performance.
     pub last_seen: DateTime<Utc>,
@@ -111,6 +133,9 @@ impl WalletPerf {
         if self.hit_rate() < rules.min_hit_rate {
             return false;
         }
+        if self.median_peak < rules.min_median_peak {
+            return false;
+        }
         (now - self.last_seen).num_seconds() <= rules.recency_secs
     }
 }
@@ -129,6 +154,7 @@ pub fn wallet_performance(
         hits: usize,
         best_peak: f64,
         sum_peak: f64,
+        peaks: Vec<f64>,
         last_seen: DateTime<Utc>,
     }
     let mut by_wallet: HashMap<String, Acc> = HashMap::new();
@@ -153,6 +179,7 @@ pub fn wallet_performance(
                 hits: 0,
                 best_peak: 0.0,
                 sum_peak: 0.0,
+                peaks: Vec::new(),
                 last_seen: rec.first_seen_utc,
             });
             if rec.first_seen_utc > acc.last_seen {
@@ -164,6 +191,7 @@ pub fn wallet_performance(
             acc.samples += 1;
             acc.hits += usize::from(hit);
             acc.sum_peak += peak;
+            acc.peaks.push(peak);
             if peak > acc.best_peak {
                 acc.best_peak = peak;
             }
@@ -178,6 +206,7 @@ pub fn wallet_performance(
             hits: a.hits,
             best_peak: a.best_peak,
             avg_peak: if a.samples == 0 { 0.0 } else { a.sum_peak / a.samples as f64 },
+            median_peak: median(a.peaks),
             last_seen: a.last_seen,
         })
         .collect();
@@ -190,6 +219,16 @@ pub fn wallet_performance(
             .then(b.samples.cmp(&a.samples))
     });
     out
+}
+
+/// Middle value of a sample, 0.0 when there is nothing to measure.
+fn median(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
 }
 
 /// The set of wallet addresses currently trusted with Alpha money.
@@ -241,6 +280,9 @@ mod tests {
         AlphaRules {
             min_samples: 3,
             min_hit_rate: 0.5,
+            // Off for the older tests, which predate this rule and exercise
+            // the hit-rate logic on purpose.
+            min_median_peak: 0.0,
             hit_multiple: 2.0,
             lookback_secs: 7 * 24 * 3600,
             recency_secs: 3 * 24 * 3600,
@@ -355,6 +397,68 @@ mod tests {
         r.last_multiple = 3.0;
         let p = perf_of(&wallet_performance(&[r], &rules(), now()), "w1");
         assert_eq!(p.hits, 1);
+    }
+
+    /// The case that exposed the flaw: a wallet on the live book with a 44.4%
+    /// hit rate whose MEDIAN call did 1.00x — half its picks went nowhere at
+    /// all. Hit rate alone admitted it, and Alpha bought on its signal.
+    #[test]
+    fn a_wallet_whose_typical_call_goes_nowhere_is_rejected() {
+        let mut r = rules();
+        r.min_median_peak = 1.5;
+        // Four calls: two big winners, two flat. 50% hit rate, median 1.0x.
+        let recs = vec![
+            rec("A", 7200, 8.0, &["lucky"]),
+            rec("B", 7200, 6.0, &["lucky"]),
+            rec("C", 7200, 1.0, &["lucky"]),
+            rec("D", 7200, 1.0, &["lucky"]),
+        ];
+        let p = perf_of(&wallet_performance(&recs, &r, now()), "lucky");
+        assert_eq!(p.hit_rate(), 0.5, "it clears the hit-rate bar");
+        assert_eq!(p.median_peak, 3.5, "(1.0 + 6.0) / 2 across the middle pair");
+
+        // Now the real shape: mostly flat with a couple of spikes.
+        let recs = vec![
+            rec("A", 7200, 20.0, &["lucky"]),
+            rec("B", 7200, 1.0, &["lucky"]),
+            rec("C", 7200, 1.0, &["lucky"]),
+        ];
+        let p = perf_of(&wallet_performance(&recs, &r, now()), "lucky");
+        assert_eq!(p.median_peak, 1.0, "the typical call did nothing");
+        assert!(!p.qualifies(&r, now()), "and that is disqualifying");
+    }
+
+    /// A single moonshot must not carry a wallet. The mean would let it.
+    #[test]
+    fn one_huge_winner_cannot_lift_the_median() {
+        let mut r = rules();
+        r.min_median_peak = 1.5;
+        let recs = vec![
+            rec("A", 7200, 900.0, &["onehit"]),
+            rec("B", 7200, 1.0, &["onehit"]),
+            rec("C", 7200, 1.0, &["onehit"]),
+            rec("D", 7200, 1.0, &["onehit"]),
+        ];
+        let p = perf_of(&wallet_performance(&recs, &r, now()), "onehit");
+        assert!(p.avg_peak > 200.0, "the mean is dragged all the way up");
+        assert_eq!(p.median_peak, 1.0, "the median is not");
+        assert!(!p.qualifies(&r, now()));
+    }
+
+    /// A wallet that is consistently right still qualifies.
+    #[test]
+    fn a_consistently_good_wallet_still_qualifies() {
+        let mut r = rules();
+        r.min_median_peak = 1.5;
+        let recs = vec![
+            rec("A", 7200, 3.0, &["steady"]),
+            rec("B", 7200, 2.5, &["steady"]),
+            rec("C", 7200, 1.8, &["steady"]),
+            rec("D", 7200, 1.2, &["steady"]),
+        ];
+        let p = perf_of(&wallet_performance(&recs, &r, now()), "steady");
+        assert_eq!(p.median_peak, 2.15);
+        assert!(p.qualifies(&r, now()));
     }
 
     #[test]
