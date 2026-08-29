@@ -781,7 +781,10 @@ pub fn spawn_tracker(
             // trip, and the sweep runs every few seconds. Newest-first ordering
             // means the freshest unpriced calls are repaired first, and the
             // rest converge over the following sweeps.
-            const MAX_CURVE_PRICES_PER_SWEEP: usize = 12;
+            // Raised alongside the never-measured-first ordering: the budget
+            // now advances through the backlog instead of re-reading the same
+            // records, so it is worth spending more of it per sweep.
+            const MAX_CURVE_PRICES_PER_SWEEP: usize = 25;
             let mut curve_reads = 0usize;
             let mut curve_priced = 0usize;
 
@@ -833,7 +836,24 @@ pub fn spawn_tracker(
 
                 // The stream did not see it. Ask the chain before writing it
                 // off as unpriceable — see `curve_price_fallback`.
-                if quoted.is_none() && curve_reads < MAX_CURVE_PRICES_PER_SWEEP {
+                // Budget goes to calls that have NEVER been measured first,
+                // then to measured ones only once their price is properly
+                // stale.
+                //
+                // Without this the budget was spent re-reading the same newest
+                // unpriced calls on every sweep — 10 successful reads a sweep
+                // that never advanced, while a backlog of 475 never-measured
+                // calls sat untouched. Skipping what was just measured is what
+                // makes the backlog actually drain.
+                let never_measured = rec.last_checked_utc.is_none();
+                let stale_enough = rec
+                    .last_checked_utc
+                    .map(|t| (now - t).num_seconds() >= 600)
+                    .unwrap_or(true);
+                if quoted.is_none()
+                    && (never_measured || stale_enough)
+                    && curve_reads < MAX_CURVE_PRICES_PER_SWEEP
+                {
                     curve_reads += 1;
                     if let Some(unit) =
                         curve_price_fallback(&rpc, &rec.mint, rec.decimals).await
