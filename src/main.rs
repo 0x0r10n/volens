@@ -33,6 +33,7 @@ mod prices;
 mod pumpfun;
 #[cfg(feature = "sniper")]
 mod quote;
+mod rebound;
 #[cfg(feature = "sniper")]
 mod routes;
 mod rpc;

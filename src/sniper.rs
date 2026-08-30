@@ -379,6 +379,7 @@ pub fn smart_buy_record(
     outcome: &str,
     armed: bool,
     alpha_addon: f64,
+    action: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "ts": Utc::now().to_rfc3339(),
@@ -386,7 +387,7 @@ pub fn smart_buy_record(
         // normal buy rather than opening a trade of its own, so it is recorded
         // as a property of the trade — how much of `sol` was conviction — and
         // not as a different kind of trade.
-        "action": "smart_buy",
+        "action": action,
         "alpha_addon": alpha_addon,
         "owner": owner,
         "mint": mint,
@@ -911,7 +912,26 @@ impl Sniper {
     /// sell route, so its exit is quote-API-dependent until pool discovery
     /// exists. That is the main reason to keep the size small.
     pub async fn buy_mint(&self, mint: &str, reason: &str) -> BuyOutcome {
-        self.buy_mint_sized(mint, reason, 0.0).await
+        self.buy_mint_sized(mint, reason, 0.0, None).await
+    }
+
+    /// A REBOUND entry: its own size and its own audit tag, every other guard
+    /// shared with the normal path.
+    ///
+    /// Routed through the same body deliberately. Rebound is an independent
+    /// strategy, but "independent" means its own trigger, size and exits — not
+    /// its own copy of the kill switch, the rug blacklist, the daily caps and
+    /// the mint-safety reads. A parallel path would be a second place for a
+    /// veto to be forgotten.
+    pub async fn rebound_buy(&self, mint: &str, reason: &str) -> BuyOutcome {
+        let live = self.settings.snapshot();
+        if !live.rebound_enabled {
+            return BuyOutcome::Refused { reason: "rebound mode off".into() };
+        }
+        if live.rebound_buy_sol <= 0.0 {
+            return BuyOutcome::Refused { reason: "rebound buy amount not set".into() };
+        }
+        self.buy_mint_sized(mint, reason, 0.0, Some(live.rebound_buy_sol)).await
     }
 
     /// A normal buy with the ALPHA ADD-ON applied on top of the chosen size.
@@ -924,7 +944,7 @@ impl Sniper {
         let live = self.settings.snapshot();
         let addon =
             if live.alpha_enabled { live.alpha_buy_sol.max(0.0) } else { 0.0 };
-        self.buy_mint_sized(mint, reason, addon).await
+        self.buy_mint_sized(mint, reason, addon, None).await
     }
 
     /// The shared body. `alpha_addon` is extra SOL added to whatever size the
@@ -936,6 +956,7 @@ impl Sniper {
         mint: &str,
         reason: &str,
         alpha_addon: f64,
+        rebound_size: Option<f64>,
     ) -> BuyOutcome {
         use crate::jupiter::Jupiter;
         use crate::model::WSOL_MINT;
@@ -970,13 +991,15 @@ impl Sniper {
         // Placed before the quote and the safety reads: this is the cheapest
         // possible "no", and a refusal here costs one batched balance read
         // rather than a full pricing round trip.
-        let cap = live.max_open_positions;
+        let rebound = rebound_size.is_some();
+        let cap = if rebound { live.rebound_max_open } else { live.max_open_positions };
         if cap > 0 {
-            match self.open_positions().await {
+            match self.open_positions(rebound).await {
                 Some(open) if open >= cap as usize => {
-                    info!(%mint, open, cap, "skip: max open positions reached");
+                    let what = if rebound { "rebound max open positions" } else { "max open positions" };
+                    info!(%mint, open, cap, rebound, "skip: {what} reached");
                     return BuyOutcome::Refused {
-                        reason: format!("skip: max open positions reached ({open}/{cap})"),
+                        reason: format!("skip: {what} reached ({open}/{cap})"),
                     };
                 }
                 Some(_) => {}
@@ -992,7 +1015,9 @@ impl Sniper {
             }
         }
 
-        let size = live.trade_size_sol;
+        // Rebound brings its own size; the normal path uses the configured one
+        // and may then be re-sized by a market-cap band below.
+        let size = rebound_size.unwrap_or(live.trade_size_sol);
         let max_size = live.effective_max_trade_size(&env);
         if size <= 0.0 || (max_size > 0.0 && size > max_size) {
             return BuyOutcome::Refused {
@@ -1124,7 +1149,11 @@ impl Sniper {
         // trade. One extra round trip, and only when a band actually applies.
         let mut size = size;
         let mut quote = quote;
-        if !live.buy_tiers.is_empty()
+        // Bands are skipped for a rebound: its amount IS the decision, and
+        // re-sizing it off a market-cap table would overrule the one number the
+        // operator set for that strategy.
+        if !rebound
+            && !live.buy_tiers.is_empty()
             && let Ok(q) = &quote
         {
             let tokens_ui = q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
@@ -1177,6 +1206,7 @@ impl Sniper {
         // Everything downstream — the ceiling, affordability, price impact, the
         // supply share, the daily spend — is then measured against the TOTAL,
         // because the total is what leaves the wallet.
+        let action = if rebound { "rebound_buy" } else { "smart_buy" };
         let mut applied_addon = 0.0f64;
         if alpha_addon > 0.0 {
             let total = size + alpha_addon;
@@ -1282,7 +1312,7 @@ impl Sniper {
                             }
                         }
                         return self
-                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now, applied_addon)
+                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now, applied_addon, action)
                             .await;
                     }
                     Err(e) => {
@@ -1365,7 +1395,7 @@ impl Sniper {
                 info!(%mint, size, tokens_out, would_succeed, %reason,
                       "sniper: DRY RUN SMART BUY (nothing signed)");
                 self.audit_smart_buy(&owner, mint, size, reason,
-                    if would_succeed { "would-succeed" } else { "would-FAIL" }, applied_addon).await;
+                    if would_succeed { "would-succeed" } else { "would-FAIL" }, applied_addon, action).await;
                 BuyOutcome::Rehearsed { mint: mint.into(), sol_in: size, tokens_out, would_succeed }
             }
             Mode::Armed(cap) => {
@@ -1376,7 +1406,7 @@ impl Sniper {
                 self.reserve(mint, size, now);
                 let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(&owner, mint, size, reason, &outcome, applied_addon).await;
+                self.audit_smart_buy(&owner, mint, size, reason, &outcome, applied_addon, action).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1398,12 +1428,13 @@ impl Sniper {
         plan: crate::execute::ExecutionPlan,
         now: DateTime<Utc>,
         alpha_addon: f64,
+        action: &str,
     ) -> BuyOutcome {
         match &self.mode {
             Mode::DryRun { .. } => {
                 info!(%mint, size, tokens_out, %reason,
                       "sniper: DRY RUN CURVE BUY (nothing signed)");
-                self.audit_smart_buy(owner, mint, size, reason, "would-succeed", alpha_addon).await;
+                self.audit_smart_buy(owner, mint, size, reason, "would-succeed", alpha_addon, action).await;
                 BuyOutcome::Rehearsed {
                     mint: mint.into(),
                     sol_in: size,
@@ -1420,7 +1451,7 @@ impl Sniper {
                     .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
                     .await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(owner, mint, size, reason, &outcome, alpha_addon).await;
+                self.audit_smart_buy(owner, mint, size, reason, &outcome, alpha_addon, action).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1511,12 +1542,13 @@ impl Sniper {
         reason: &str,
         outcome: &str,
         alpha_addon: f64,
+        action: &str,
     ) {
         if self.cfg.audit_log.is_empty() {
             return;
         }
         let armed = matches!(self.mode, Mode::Armed(_));
-        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed, alpha_addon);
+        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed, alpha_addon, action);
         if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
             warn!(error = %e, "failed to write smart buy audit");
         }
@@ -1601,8 +1633,15 @@ impl Sniper {
         state: &Arc<crate::exits::ExitStateStore>,
         alerter: &crate::alerts::Alerter,
     ) -> (usize, usize) {
-        let rules = self.settings.snapshot().exits;
-        if !rules.enabled || self.kill_switch_engaged() {
+        let live0 = self.settings.snapshot();
+        let rules = live0.exits.clone();
+        // EITHER ladder being on is enough to run the sweep. Gating on the
+        // normal switch alone would make "auto-sell off" silently mean
+        // "rebound exits off" too, leaving a live position unprotected with no
+        // screen saying so.
+        let rebound_on =
+            live0.rebound_enabled && live0.rebound_exits.orders.iter().any(|o| o.is_armed());
+        if (!rules.enabled && !rebound_on) || self.kill_switch_engaged() {
             return (0, 0);
         }
         let Some(owner) = self.owner() else { return (0, 0) };
@@ -1737,10 +1776,33 @@ impl Sniper {
         let breakeven_buffer =
             (self.cfg.sell_slippage_bps as f64 / 10_000.0).clamp(0.01, 0.03);
 
-        // ONE ladder for one position. Alpha adds size to a normal entry, so
-        // there is no separate kind of position to route to separate exits.
-        let (sells, closed) =
-            crate::exits::plan_exits(&rules, state, &holdings, breakeven_buffer);
+        // Rebound positions are planned under REBOUND's ladder, everything
+        // else under the normal one. Two calls over disjoint sets rather than
+        // one rule set with exceptions inside it: `plan_exits` stays a pure
+        // function of (rules, positions).
+        //
+        // Alpha is absent here on purpose — it adds size to a normal entry
+        // rather than opening its own, so it has no separate kind of position.
+        let live = self.settings.snapshot();
+        let rebound_mints = crate::positions::rebound_mints_from_audit(&audit);
+        let (rebound_held, normal_held): (Vec<_>, Vec<_>) =
+            holdings.iter().cloned().partition(|h| rebound_mints.contains(&h.mint));
+
+        let (mut sells, mut closed) =
+            crate::exits::plan_exits(&rules, state, &normal_held, breakeven_buffer);
+        if !rebound_held.is_empty() {
+            let mut rrules = crate::settings::rebound_exit_rules(&live, &rules);
+            // Rebound's ladder runs on Rebound's own switch: the inherited
+            // `enabled` comes from the normal rules, and `plan_exits` returns
+            // nothing at all when that is off.
+            if live.rebound_enabled && live.rebound_exits.orders.iter().any(|o| o.is_armed()) {
+                rrules.enabled = true;
+            }
+            let (r_sells, r_closed) =
+                crate::exits::plan_exits(&rrules, state, &rebound_held, breakeven_buffer);
+            sells.extend(r_sells);
+            closed.extend(r_closed);
+        }
         for mint in closed {
             state.forget(&mint);
         }
@@ -1921,6 +1983,128 @@ impl Sniper {
     }
 
     /// ALPHA SMART MONEY MODE on/off.
+    /// REBOUND mode on/off.
+    pub fn toggle_rebound(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            s.rebound_enabled = !s.rebound_enabled;
+            Ok(if s.rebound_enabled {
+                if s.rebound_buy_sol > 0.0 && s.rebound_min_volume_sol > 0.0 {
+                    format!(
+                        "rebound ON — {} SOL when a watched token trades {} SOL fresh",
+                        s.rebound_buy_sol, s.rebound_min_volume_sol
+                    )
+                } else {
+                    "rebound ON — set a buy amount and a volume threshold".to_string()
+                }
+            } else {
+                "rebound off".to_string()
+            })
+        })
+    }
+
+    pub fn set_rebound_buy_sol(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("amount must be zero or positive".into());
+        }
+        let env = self.settings.envelope();
+        let max = self.settings.snapshot().effective_max_trade_size(&env);
+        if max > 0.0 && v > max {
+            return Err(format!("rebound buy {v} SOL exceeds the {max} SOL ceiling"));
+        }
+        self.settings.update(|s| {
+            s.rebound_buy_sol = v;
+            Ok(if v > 0.0 {
+                format!("rebound buys {v} SOL")
+            } else {
+                "rebound buy amount cleared — it cannot trade until set".to_string()
+            })
+        })
+    }
+
+    pub fn set_rebound_watch_hours(&self, h: i64) -> Result<String, String> {
+        if !(1..=720).contains(&h) {
+            return Err("watch duration must be between 1 and 720 hours".into());
+        }
+        self.settings.update(|s| {
+            s.rebound_watch_hours = h;
+            Ok(format!("rebound watches each token for {h}h"))
+        })
+    }
+
+    pub fn set_rebound_min_volume(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("volume must be zero or positive".into());
+        }
+        self.settings.update(|s| {
+            s.rebound_min_volume_sol = v;
+            Ok(if v > 0.0 {
+                format!("rebound needs {v} SOL of fresh volume")
+            } else {
+                "rebound volume threshold cleared — it cannot trigger".to_string()
+            })
+        })
+    }
+
+    pub fn set_rebound_max_open(&self, v: u32) -> Result<String, String> {
+        if v > 50 {
+            return Err("that is not a concentration limit".into());
+        }
+        self.settings.update(|s| {
+            s.rebound_max_open = v;
+            Ok(if v == 0 {
+                "rebound open positions unlimited".to_string()
+            } else {
+                format!("rebound limited to {v} open position{}", if v == 1 { "" } else { "s" })
+            })
+        })
+    }
+
+    pub fn rebound_add_order(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            if s.rebound_exits.orders.len() >= crate::exits::MAX_ORDERS {
+                return Err(format!("at most {} orders", crate::exits::MAX_ORDERS));
+            }
+            s.rebound_exits.orders.push(crate::exits::SellOrder { at_pct: 0, amount_pct: 0 });
+            Ok(format!("rebound order {} added", s.rebound_exits.orders.len()))
+        })
+    }
+
+    pub fn rebound_remove_order(&self, idx: usize) -> Result<String, String> {
+        self.settings.update(|s| {
+            if idx >= s.rebound_exits.orders.len() {
+                return Err("no such order".into());
+            }
+            let gone = s.rebound_exits.orders.remove(idx);
+            Ok(format!("removed {}", gone.label()))
+        })
+    }
+
+    pub fn set_rebound_order_trigger(&self, idx: usize, at_pct: i32) -> Result<String, String> {
+        if !(-99..=100_000).contains(&at_pct) {
+            return Err("trigger must be between -99% and +100000%".into());
+        }
+        self.settings.update(|s| {
+            let Some(o) = s.rebound_exits.orders.get_mut(idx) else {
+                return Err("no such order".into());
+            };
+            o.at_pct = at_pct;
+            Ok(format!("rebound order {} at {at_pct}%", idx + 1))
+        })
+    }
+
+    pub fn set_rebound_order_amount(&self, idx: usize, amount_pct: u8) -> Result<String, String> {
+        if amount_pct > 100 {
+            return Err("amount cannot exceed 100%".into());
+        }
+        self.settings.update(|s| {
+            let Some(o) = s.rebound_exits.orders.get_mut(idx) else {
+                return Err("no such order".into());
+            };
+            o.amount_pct = amount_pct;
+            Ok(format!("rebound order {} sells {amount_pct}%", idx + 1))
+        })
+    }
+
     pub fn toggle_alpha(&self) -> Result<String, String> {
         self.settings.update(|s| {
             s.alpha_enabled = !s.alpha_enabled;
@@ -2024,45 +2208,30 @@ impl Sniper {
         }
     }
 
-    /// How many positions the bot currently holds open.
+    /// How many positions the bot currently holds open, in one lane.
     ///
     /// A position is open when the bot bought it AND the wallet still holds
-    /// some.
+    /// some. Rebound counts only rebound entries and the normal path counts
+    /// only its own, so one strategy filling up never locks the other out.
     ///
     /// `None` means the count could not be established. Callers must treat that
     /// as a refusal rather than as zero: reading "no positions" from a failed
     /// query is how a limit of 1 quietly becomes a limit of none at all.
-    pub async fn open_positions(&self) -> Option<usize> {
+    pub async fn open_positions(&self, rebound_lane: bool) -> Option<usize> {
         let owner = self.owner()?.to_string();
         let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.ok()?;
-        let mints: Vec<String> =
-            crate::positions::cost_basis_from_audit(&audit).into_keys().collect();
+        let basis = crate::positions::cost_basis_from_audit(&audit);
+        if basis.is_empty() {
+            return Some(0);
+        }
+        let rebound_mints = crate::positions::rebound_mints_from_audit(&audit);
+        let mints =
+            crate::positions::mints_in_lane(basis.into_keys(), &rebound_mints, rebound_lane);
         if mints.is_empty() {
             return Some(0);
         }
         let balances = self.rpc.token_balances_raw(&owner, &mints).await?;
         Some(balances.values().filter(|(raw, _)| *raw > 0).count())
-    }
-
-    /// Do we already hold an ALPHA position in this mint?
-    ///
-    /// The detector's per-mint guard is in-memory, so it is empty after a
-    /// restart and a qualifying wallet buying again would open a SECOND Alpha
-    /// position in a token already held. This is the check that survives a
-    /// restart, and it is deliberately narrow: it asks whether ALPHA opened
-    /// this position, so Alpha adding to one the normal trigger opened — which
-    /// is the intended overlap — is still allowed.
-    pub async fn already_alpha_holding(&self, mint: &str) -> bool {
-        let Some(owner) = self.owner() else { return false };
-        let Ok(audit) = tokio::fs::read_to_string(&self.cfg.audit_log).await else {
-            return false;
-        };
-        if !crate::positions::alpha_mints_from_audit(&audit).contains(mint) {
-            return false;
-        }
-        // Held only if there is still a balance: a closed Alpha position may be
-        // re-entered like any other.
-        matches!(self.rpc.token_balance_raw(&owner.to_string(), mint).await, Some((raw, _)) if raw > 0)
     }
 
     /// The wallets currently trusted with Alpha money.

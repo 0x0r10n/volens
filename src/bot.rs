@@ -753,6 +753,20 @@ impl Bot {
             return Some(self.alpha_screen());
         }
         #[cfg(feature = "sniper")]
+        if data == "set:rebound" {
+            return Some(self.rebound_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if data == "set:rladder" {
+            return Some(self.rebound_ladder_screen());
+        }
+        #[cfg(feature = "sniper")]
+        if let Some(n) = data.strip_prefix("set:rorder") {
+            if let Ok(i) = n.parse::<usize>() {
+                return Some(self.rebound_order_screen(i));
+            }
+        }
+        #[cfg(feature = "sniper")]
         if data == "set:ladder" {
             return Some(self.ladder_screen());
         }
@@ -1598,8 +1612,14 @@ impl Bot {
             } else {
                 "off".to_string()
             };
+            let rb = if live.rebound_enabled {
+                format!("on · {} SOL", live.rebound_buy_sol)
+            } else {
+                "off".to_string()
+            };
             rows.push(serde_json::json!([
-                {"text": format!("⭐ Alpha · {al}"), "callback_data": "set:alpha"}
+                {"text": format!("⭐ Alpha · {al}"), "callback_data": "set:alpha"},
+                {"text": format!("🔄 Rebound · {rb}"), "callback_data": "set:rebound"},
             ]));
             rows.push(serde_json::json!([
                 {"text": format!("🔎 Filters · {}", if live.volume_mode { "on" } else { "off" }),
@@ -1792,6 +1812,17 @@ impl Bot {
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
             "alphabuy" => ("alpha add-on amount", "e.g. <code>0.05</code> (SOL)"),
             "maxopen" => ("max open positions", "e.g. <code>2</code>, 0 = unlimited"),
+            "rbuy" => ("rebound buy amount", "e.g. <code>0.05</code> (SOL)"),
+            "rvol" => ("rebound volume", "e.g. <code>10</code> (SOL of fresh volume)"),
+            "rwatch" => ("rebound watch duration", "e.g. <code>72</code> (hours)"),
+            "rmaxopen" => ("rebound max open positions", "e.g. <code>2</code>, 0 = unlimited"),
+            f if f.starts_with("rordt") => (
+                "trigger",
+                "e.g. <code>150</code> for a +150% target, or <code>-30</code> for a stop",
+            ),
+            f if f.starts_with("rorda") => {
+                ("amount", "e.g. <code>35</code> (% of the original position)")
+            }
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -2132,6 +2163,171 @@ impl Bot {
         (text, rows)
     }
 
+    /// REBOUND — its own trigger, size, exits and limit.
+    #[cfg(feature = "sniper")]
+    fn rebound_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let live = sniper.live();
+        let onoff = if live.rebound_enabled { "🟢 On" } else { "⚪ Off" };
+        let amt = format!("{} SOL", live.rebound_buy_sol);
+        let vol = if live.rebound_min_volume_sol > 0.0 {
+            format!("{} SOL", live.rebound_min_volume_sol)
+        } else {
+            "not set".to_string()
+        };
+        let watch = format!("{}h", live.rebound_watch_hours);
+        let open_s = if live.rebound_max_open == 0 {
+            "unlimited".to_string()
+        } else {
+            live.rebound_max_open.to_string()
+        };
+
+        let mut text = format!(
+            "🔄 <b>Rebound</b> · {onoff}\n\n\
+             Buy       <b>{amt}</b>\n\
+             Volume    <b>{vol}</b>\n\
+             Watch     <b>{watch}</b>\n\
+             Max open  <b>{open_s}</b>\n\
+             Orders    <b>{}</b>\n\n\
+             <i>Every token tracked money touches is watched. If it starts \
+             trading again on fresh volume inside the window, it is bought once.</i>",
+            crate::exits::describe_orders(&live.rebound_exits)
+        );
+        if live.rebound_enabled && (live.rebound_buy_sol <= 0.0 || live.rebound_min_volume_sol <= 0.0) {
+            text.push_str("\n\n⚠️ Needs both a buy amount and a volume threshold to trigger.");
+        }
+
+        let rows = serde_json::json!({ "inline_keyboard": [
+            [{"text": format!("Rebound · {onoff}"), "callback_data": "setv:rebound_on:toggle"}],
+            [{"text": format!("💰 Buy · {amt}"), "callback_data": "set:rbuy"},
+             {"text": format!("💸 Volume · {vol}"), "callback_data": "set:rvol"}],
+            [{"text": format!("⏳ Watch · {watch}"), "callback_data": "set:rwatch"},
+             {"text": format!("📌 Max open · {open_s}"), "callback_data": "set:rmaxopen"}],
+            [{"text": "📋 Orders", "callback_data": "set:rladder"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
+        ]});
+        (text, rows)
+    }
+
+    /// Rebound's exit order table.
+    #[cfg(feature = "sniper")]
+    fn rebound_ladder_screen(&self) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let e = sniper.live().rebound_exits;
+        let mut shown: Vec<(usize, crate::exits::SellOrder)> =
+            e.orders.iter().copied().enumerate().collect();
+        shown.sort_by_key(|(_, o)| (!o.is_stop(), o.at_pct));
+
+        let mut body = String::new();
+        for (_, o) in shown.iter().filter(|(_, o)| o.is_armed()) {
+            body.push_str(&format!(
+                "{}{}%  →  sell {}%\n",
+                if o.at_pct > 0 { "+" } else { "" },
+                o.at_pct,
+                o.amount_pct
+            ));
+        }
+        if body.is_empty() {
+            body.push_str("none — falls back to the auto-sell ladder\n");
+        }
+        let total = e.target_total_pct();
+        let mut text = format!("📋 <b>Rebound orders</b>\n\n<code>{body}</code>");
+        text.push_str(&format!("\nTargets total <b>{total}%</b>"));
+        if total > 100 {
+            text.push_str("  ⚠️ over 100%");
+        }
+
+        let mut rows: Vec<serde_json::Value> = Vec::new();
+        for (i, o) in shown {
+            let label = if !o.is_armed() {
+                "⚪ not set".to_string()
+            } else if o.is_stop() {
+                format!("🛑 {}% → {}%", o.at_pct, o.amount_pct)
+            } else {
+                format!("🎯 +{}% → {}%", o.at_pct, o.amount_pct)
+            };
+            rows.push(serde_json::json!([
+                {"text": label, "callback_data": format!("set:rorder{i}")},
+                {"text": "✕", "callback_data": format!("setv:rdelorder:{i}")},
+            ]));
+        }
+        if e.orders.len() < crate::exits::MAX_ORDERS {
+            rows.push(serde_json::json!([
+                {"text": "➕ Add order", "callback_data": "setv:raddorder:1"}
+            ]));
+        }
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "set:rebound"}]));
+        (text, serde_json::json!({ "inline_keyboard": rows }))
+    }
+
+    /// One rebound order.
+    #[cfg(feature = "sniper")]
+    fn rebound_order_screen(&self, idx: usize) -> (String, serde_json::Value) {
+        let Some(sniper) = &self.sniper else {
+            return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
+        };
+        let orders = sniper.live().rebound_exits.orders;
+        let Some(o) = orders.get(idx).copied() else {
+            return self.rebound_ladder_screen();
+        };
+        let kind = if !o.is_armed() {
+            "⚪ <b>Not set</b>"
+        } else if o.is_stop() {
+            "🛑 <b>Stop</b>"
+        } else {
+            "🎯 <b>Target</b>"
+        };
+        let text = format!(
+            "{kind}\n\nTrigger <b>{}</b>\nSells   <b>{}</b>",
+            if o.at_pct == 0 {
+                "not set".to_string()
+            } else {
+                format!("{}{}%", if o.at_pct > 0 { "+" } else { "" }, o.at_pct)
+            },
+            if (1..=100).contains(&o.amount_pct) {
+                format!("{}%", o.amount_pct)
+            } else {
+                "not set".to_string()
+            },
+        );
+        let row = |vals: &[i32]| -> Vec<serde_json::Value> {
+            vals.iter()
+                .map(|t| serde_json::json!({
+                    "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
+                                    if *t > 0 { "+" } else { "" }, t),
+                    "callback_data": format!("setv:rordt{idx}:{t}"),
+                }))
+                .collect()
+        };
+        let amts: Vec<serde_json::Value> = [10u8, 20, 25, 33, 50, 100]
+            .iter()
+            .map(|a| serde_json::json!({
+                "text": format!("{}{}%", if *a == o.amount_pct { "✓ " } else { "" }, a),
+                "callback_data": format!("setv:rorda{idx}:{a}"),
+            }))
+            .collect();
+        let noop = format!("set:rorder{idx}");
+        let kb = serde_json::json!({"inline_keyboard": [
+            [{"text": "🛑 — stop below cost —", "callback_data": noop}],
+            row(&[-50, -35, -25, -15]),
+            [{"text": "🎯 — target above cost —", "callback_data": noop}],
+            row(&[50, 100, 250]),
+            row(&[400, 900, 2000]),
+            [{"text": "— how much to sell —", "callback_data": noop}],
+            amts[..3].to_vec(),
+            amts[3..].to_vec(),
+            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:rordt{idx}")},
+             {"text": "✏️ Custom amount", "callback_data": format!("ask:rorda{idx}")}],
+            [{"text": "✕ Remove", "callback_data": format!("setv:rdelorder:{idx}")},
+             {"text": "◀️ Back", "callback_data": "set:rladder"}],
+        ]});
+        (text, kb)
+    }
+
     /// The order table for a lane — the whole exit strategy in one screen.
     ///
     /// Both lanes render through this. The normal ladder and Alpha's are
@@ -2305,6 +2501,17 @@ impl Bot {
             "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
             "breakeven_on" => (sniper.toggle_breakeven(), "ladder".into()),
             "alpha_on" => (sniper.toggle_alpha(), "alpha".into()),
+            "rebound_on" => (sniper.toggle_rebound(), "rebound".into()),
+            "raddorder" => (sniper.rebound_add_order(), "rladder".into()),
+            "rdelorder" => (sniper.rebound_remove_order(value.parse().ok()?), "rladder".into()),
+            f if f.starts_with("rordt") => {
+                let i: usize = f[5..].parse().ok()?;
+                (sniper.set_rebound_order_trigger(i, value.parse().ok()?), format!("rorder{i}"))
+            }
+            f if f.starts_with("rorda") => {
+                let i: usize = f[5..].parse().ok()?;
+                (sniper.set_rebound_order_amount(i, value.parse().ok()?), format!("rorder{i}"))
+            }
             "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
             "addorder" => (sniper.add_order(), "ladder".into()),
             "delorder" => (sniper.remove_order(value.parse().ok()?), "ladder".into()),
@@ -2319,7 +2526,13 @@ impl Bot {
             _ => return None,
         };
         info!(field, value, ok = res.is_ok(), "auto-sell setting changed from telegram");
-        let (text, kb) = if let Some(n) = screen.strip_prefix("order") {
+        let (text, kb) = if let Some(n) = screen.strip_prefix("rorder") {
+            self.rebound_order_screen(n.parse().unwrap_or(0))
+        } else if screen == "rladder" {
+            self.rebound_ladder_screen()
+        } else if screen == "rebound" {
+            self.rebound_screen()
+        } else if let Some(n) = screen.strip_prefix("order") {
             self.order_screen(n.parse().unwrap_or(0))
         } else if screen == "ladder" {
             self.ladder_screen()
@@ -2409,6 +2622,25 @@ impl Bot {
                     if live.max_open_positions == 0 { "unlimited".to_string() }
                     else { live.max_open_positions.to_string() },
                     vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
+                "rbuy" => ("🔄 Rebound buy",
+                    "SOL per rebound entry.",
+                    format!("{} SOL", live.rebound_buy_sol),
+                    vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5], " SOL", false),
+                "rvol" => ("💸 Rebound volume",
+                    "Fresh SOL traded in the last few minutes that arms an entry.",
+                    if live.rebound_min_volume_sol > 0.0 {
+                        format!("{} SOL", live.rebound_min_volume_sol)
+                    } else { "not set".to_string() },
+                    vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0], " SOL", false),
+                "rwatch" => ("⏳ Rebound watch",
+                    "How long a touched token stays on the watchlist, in hours.",
+                    format!("{}h", live.rebound_watch_hours),
+                    vec![6.0, 12.0, 24.0, 48.0, 72.0, 168.0], "h", false),
+                "rmaxopen" => ("📌 Rebound max open",
+                    "Most rebound positions at once. 0 = unlimited.",
+                    if live.rebound_max_open == 0 { "unlimited".to_string() }
+                    else { live.rebound_max_open.to_string() },
+                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
                 "alphabuy" => ("⭐ Alpha add-on",
                     "Extra SOL added when a proven wallet is in the token.",
                     format!("{} SOL", live.alpha_buy_sol),
@@ -2489,6 +2721,8 @@ impl Bot {
         // makes the next Alpha change a three-tap journey.
         let back = if field.starts_with("alpha") {
             "set:alpha"
+        } else if field.starts_with('r') && field != "reset" {
+            "set:rebound"
         } else if field == "maxopen" {
             "set:limits"
         } else {
@@ -2537,6 +2771,10 @@ impl Bot {
             "maxsupply" => sniper.set_max_supply_pct(v),
             "alphabuy" => sniper.set_alpha_buy_sol(v),
             "maxopen" => sniper.set_max_open_positions(v as u32),
+            "rbuy" => sniper.set_rebound_buy_sol(v),
+            "rvol" => sniper.set_rebound_min_volume(v),
+            "rwatch" => sniper.set_rebound_watch_hours(v as i64),
+            "rmaxopen" => sniper.set_rebound_max_open(v as u32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),

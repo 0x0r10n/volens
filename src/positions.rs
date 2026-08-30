@@ -77,7 +77,7 @@ pub fn cost_basis_from_audit(audit_jsonl: &str) -> HashMap<String, CostBasis> {
             // An Alpha entry is money out of the wallet exactly like any other
             // buy, so it carries cost basis identically. The tag only decides
             // which exit rules the position gets, never whether it is counted.
-            Some("smart_buy") | Some("alpha_buy") => {
+            Some("smart_buy") | Some("alpha_buy") | Some("rebound_buy") => {
                 let Some(mint) = rec.get("mint").and_then(|m| m.as_str()) else { continue };
                 let size = rec.get("sol").and_then(|s| s.as_f64()).unwrap_or(0.0);
                 if size <= 0.0 {
@@ -126,30 +126,23 @@ pub fn cost_basis_from_audit(audit_jsonl: &str) -> HashMap<String, CostBasis> {
     out
 }
 
-/// Mints opened by ALPHA SMART MONEY MODE, from the same audit log.
+/// Mints opened by REBOUND, from the same audit log.
 ///
-/// A position is Alpha if any executed Alpha buy contributed to it. Both
-/// triggers may fire on the same token, and when they do there is still only
-/// ONE position on chain with one balance and one cost basis — so there is only
-/// one set of exits to apply, and this decides which.
-///
-/// Alpha wins the overlap deliberately. It is the more specific thesis: it
-/// fired because a wallet with a measured record bought, and its TP/SL were
-/// chosen for exactly that case. Letting the general rules govern a position
-/// that Alpha also wanted would mean the Alpha settings silently did nothing on
-/// precisely the strongest signals the mode exists to catch.
-pub fn alpha_mints_from_audit(audit_jsonl: &str) -> std::collections::HashSet<String> {
+/// A position is Rebound's if a rebound entry opened it. That is what routes it
+/// to Rebound's own exits and counts it against Rebound's own position limit,
+/// so the two strategies never consume each other's allowance.
+pub fn rebound_mints_from_audit(audit_jsonl: &str) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     for line in audit_jsonl.lines() {
         let Ok(rec) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
-        if rec.get("action").and_then(|a| a.as_str()) != Some("alpha_buy") {
+        if rec.get("action").and_then(|a| a.as_str()) != Some("rebound_buy") {
             continue;
         }
         // Same bar as cost basis: only entries that actually moved funds. A
-        // rehearsed or failed Alpha buy did not open a position, so it must not
-        // redirect the exits of one opened by the normal trigger.
+        // rehearsed or failed buy opened nothing, so it must not redirect the
+        // exits of a position the normal trigger really did open.
         if rec.get("mode").and_then(|m| m.as_str()) != Some("armed") {
             continue;
         }
@@ -165,9 +158,9 @@ pub fn alpha_mints_from_audit(audit_jsonl: &str) -> std::collections::HashSet<St
 
 /// Split the bot's positions into the lane that owns each one.
 ///
-/// A mint ALPHA opened belongs to the Alpha lane whatever else also bought it —
-/// the same rule that routes its exits, so a token both triggers entered is
-/// counted once, against Alpha, rather than consuming both allowances.
+/// A mint REBOUND opened belongs to the Rebound lane whatever else also bought
+/// it — the same rule that routes its exits, so a token both strategies entered
+/// is counted once rather than consuming both allowances.
 pub fn mints_in_lane(
     all: impl IntoIterator<Item = String>,
     alpha_mints: &std::collections::HashSet<String>,
@@ -251,7 +244,7 @@ mod tests {
     #[test]
     fn the_reader_understands_what_the_writer_actually_writes() {
         let rec = crate::sniper::smart_buy_record(
-            "OWNER", "MINT_A", 0.05, "4 tracked wallets in window", "confirmed:sig", true, 0.0,
+            "OWNER", "MINT_A", 0.05, "4 tracked wallets in window", "confirmed:sig", true, 0.0, "smart_buy",
         );
         let basis = cost_basis_from_audit(&rec.to_string());
         let a = basis
@@ -261,7 +254,7 @@ mod tests {
 
         // …and a rehearsal from the same writer must NOT become a position.
         let dry = crate::sniper::smart_buy_record(
-            "OWNER", "MINT_A", 0.05, "r", "would-succeed", false, 0.0,
+            "OWNER", "MINT_A", 0.05, "r", "would-succeed", false, 0.0, "smart_buy",
         );
         assert!(cost_basis_from_audit(&dry.to_string()).is_empty());
     }
@@ -379,10 +372,10 @@ mod tests {
         assert_eq!(p.pct, 0.0);
     }
 
-    fn alpha_line(mint: &str, mode: &str, outcome: &str) -> String {
+    fn rebound_line(mint: &str, mode: &str, outcome: &str) -> String {
         serde_json::json!({
-            "ts": "2026-08-28T12:00:00Z", "action": "alpha_buy", "owner": "O",
-            "mint": mint, "sol": 0.05, "reason": "alpha wallet W",
+            "ts": "2026-08-28T12:00:00Z", "action": "rebound_buy", "owner": "O",
+            "mint": mint, "sol": 0.05, "reason": "rebound",
             "outcome": outcome, "mode": mode,
         })
         .to_string()
@@ -391,8 +384,8 @@ mod tests {
     /// An Alpha entry is spend like any other: it must carry cost basis, or the
     /// exit sweep cannot see the position it opened.
     #[test]
-    fn an_alpha_buy_produces_a_cost_basis() {
-        let log = alpha_line("MINT_A", "armed", "confirmed:sig");
+    fn a_rebound_buy_produces_a_cost_basis() {
+        let log = rebound_line("MINT_A", "armed", "confirmed:sig");
         let basis = cost_basis_from_audit(&log);
         assert_eq!(basis.get("MINT_A").map(|b| b.sol_spent), Some(0.05));
     }
@@ -400,20 +393,20 @@ mod tests {
     /// Both triggers on one token is one position with the SUM of both sizes.
     /// Counting only one would under-report what is actually at risk.
     #[test]
-    fn both_triggers_on_one_token_aggregate_into_one_position() {
+    fn both_strategies_on_one_token_aggregate_into_one_position() {
         let log = format!(
             "{}\n{}",
             crate::sniper::smart_buy_record(
-                "O", "MINT_A", 0.05, "r", "confirmed:s1", true, 0.0
+                "O", "MINT_A", 0.05, "r", "confirmed:s1", true, 0.0, "smart_buy"
             ),
-            alpha_line("MINT_A", "armed", "confirmed:s2")
+            rebound_line("MINT_A", "armed", "confirmed:s2")
         );
         let basis = cost_basis_from_audit(&log);
         let b = basis.get("MINT_A").expect("one position");
         assert_eq!(b.trades, 2);
         assert!((b.sol_spent - 0.10).abs() < 1e-9, "0.05 + 0.05");
         assert!(
-            alpha_mints_from_audit(&log).contains("MINT_A"),
+            rebound_mints_from_audit(&log).contains("MINT_A"),
             "and it is governed by the alpha exits"
         );
     }
@@ -448,24 +441,24 @@ mod tests {
     }
 
     #[test]
-    fn a_normal_buy_is_not_an_alpha_position() {
+    fn a_normal_buy_is_not_a_rebound_position() {
         let log = crate::sniper::smart_buy_record(
-            "O", "MINT_A", 0.05, "r", "confirmed:s", true, 0.0,
+            "O", "MINT_A", 0.05, "r", "confirmed:s", true, 0.0, "smart_buy",
         )
         .to_string();
-        assert!(alpha_mints_from_audit(&log).is_empty());
+        assert!(rebound_mints_from_audit(&log).is_empty());
     }
 
     /// A rehearsed or failed Alpha buy opened nothing, so it must not divert
     /// the exits of a position the normal trigger really did open.
     #[test]
-    fn only_alpha_buys_that_moved_funds_route_the_exits() {
+    fn only_rebound_buys_that_moved_funds_route_the_exits() {
         for (mode, outcome) in
             [("dry_run", "would-succeed"), ("armed", "error: blockhash"), ("armed", "unconfirmed")]
         {
-            let log = alpha_line("MINT_A", mode, outcome);
+            let log = rebound_line("MINT_A", mode, outcome);
             assert!(
-                alpha_mints_from_audit(&log).is_empty(),
+                rebound_mints_from_audit(&log).is_empty(),
                 "{mode}/{outcome} did not open a position"
             );
         }

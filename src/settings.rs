@@ -119,6 +119,30 @@ pub struct LiveSettings {
     pub alpha_buy_sol: f64,
 
 
+    /// REBOUND — buy a token smart money already left, if it trades again.
+    ///
+    /// Fully independent of auto-buy and Alpha: its own trigger, own size, own
+    /// exits and own position limit. See `crate::rebound`.
+    #[serde(default)]
+    pub rebound_enabled: bool,
+    /// How long a touched token stays under observation, in hours.
+    #[serde(default = "default_rebound_hours")]
+    pub rebound_watch_hours: i64,
+    /// Fresh SOL volume, in a short rolling window, that arms the entry.
+    /// 0 = never triggers — see `ReboundPool::evaluate`.
+    #[serde(default)]
+    pub rebound_min_volume_sol: f64,
+    /// SOL per rebound entry.
+    #[serde(default)]
+    pub rebound_buy_sol: f64,
+    /// Exits for rebound positions — its own ladder, since it enters on
+    /// different evidence from the normal trigger and is held differently.
+    #[serde(default = "empty_rules")]
+    pub rebound_exits: crate::exits::ExitRules,
+    /// Most rebound positions open at once. 0 = unlimited.
+    #[serde(default = "one_position")]
+    pub rebound_max_open: u32,
+
     /// Most positions the bot may hold open at once. 0 = unlimited.
     ///
     /// One limit, because there is one kind of position: Alpha adds size to a
@@ -312,6 +336,12 @@ impl LiveSettings {
             buy_tiers: Vec::new(),
             alpha_enabled: false,
             alpha_buy_sol: 0.0,
+            rebound_enabled: false,
+            rebound_watch_hours: default_rebound_hours(),
+            rebound_min_volume_sol: 0.0,
+            rebound_buy_sol: 0.0,
+            rebound_exits: empty_rules(),
+            rebound_max_open: one_position(),
             max_open_positions: one_position(),
             supply_cap: false,
             max_supply_pct: 0.0,
@@ -463,6 +493,12 @@ fn clamp(s: &mut LiveSettings, env: &Envelope) {
     }
     if max_size > 0.0 {
         s.alpha_buy_sol = s.alpha_buy_sol.min(max_size);
+    }
+    if !s.rebound_buy_sol.is_finite() || s.rebound_buy_sol < 0.0 {
+        s.rebound_buy_sol = 0.0;
+    }
+    if max_size > 0.0 {
+        s.rebound_buy_sol = s.rebound_buy_sol.min(max_size);
     }
 }
 
@@ -683,6 +719,39 @@ mod tests {
         assert_eq!(s.alpha_buy_sol, 0.0);
     }
 
+}
+
+fn default_rebound_hours() -> i64 {
+    72
+}
+
+/// Rebound starts with NO orders. `ExitRules::default()` carries the normal
+/// lane's five-rung ladder, and inheriting it would mean Rebound silently
+/// traded a strategy nobody chose for it.
+fn empty_rules() -> crate::exits::ExitRules {
+    crate::exits::ExitRules { orders: Vec::new(), ..Default::default() }
+}
+
+/// The exits a REBOUND position is governed by.
+///
+/// Falls back to the normal ladder when Rebound has no orders of its own: an
+/// unconfigured mode must not leave a live position with no stop and no target.
+pub fn rebound_exit_rules(
+    live: &LiveSettings,
+    base: &crate::exits::ExitRules,
+) -> crate::exits::ExitRules {
+    if !live.rebound_exits.orders.iter().any(|o| o.is_armed()) {
+        return base.clone();
+    }
+    crate::exits::ExitRules {
+        // Safety behaviour is not strategy: the master switch and the rug exit
+        // come from the normal rules either way.
+        enabled: base.enabled,
+        exit_on_liquidity_pull: base.exit_on_liquidity_pull,
+        orders: live.rebound_exits.orders.clone(),
+        trailing_pct: live.rebound_exits.trailing_pct,
+        breakeven: live.rebound_exits.breakeven,
+    }
 }
 
 /// One concurrent position until the operator says otherwise.

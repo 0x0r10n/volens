@@ -701,6 +701,43 @@ pub fn render_alpha_buy(
     })
 }
 
+/// Announce a REBOUND entry.
+///
+/// Marked distinctly from a smart buy: the token was bought because it started
+/// trading again, not because tracked wallets were buying it now, and reading
+/// the two as the same event would make the alert history impossible to reason
+/// about later.
+#[cfg(feature = "sniper")]
+pub fn render_rebound_buy(
+    mint: &str,
+    fresh_volume_sol: f64,
+    outcome: &crate::sniper::BuyOutcome,
+) -> Option<String> {
+    use crate::sniper::BuyOutcome;
+    let short = crate::conviction::short_mint(mint);
+    Some(match outcome {
+        // Silent on a refusal: the watcher re-evaluates every 30 seconds, so a
+        // standing condition would repeat the same message all day.
+        BuyOutcome::Refused { .. } => return None,
+        BuyOutcome::Failed { reason, .. } => format!(
+            "❌ <b>Rebound FAILED</b> · <code>{}</code>\n{}",
+            escape_html(&short),
+            escape_html(&explain_failure(reason))
+        ),
+        BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
+            "🧪 <b>Rebound rehearsed</b> · <code>{}</code>\n{sol_in} SOL · {}\n\
+             <i>Dry run — nothing was signed.</i>",
+            escape_html(&short),
+            if *would_succeed { "would succeed" } else { "would FAIL" }
+        ),
+        BuyOutcome::Submitted { sol_in, result, .. } => format!(
+            "🔄 <b>REBOUND BUY</b> · <code>{}</code>\n{sol_in} SOL · {fresh_volume_sol:.1} SOL volume\n{}",
+            escape_html(&short),
+            escape_html(&describe_submission(result))
+        ),
+    })
+}
+
 /// Announce an exit to the group.
 #[cfg(feature = "sniper")]
 pub fn render_auto_sell(

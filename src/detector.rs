@@ -90,6 +90,9 @@ pub struct Detector {
     alpha_wallets: std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>,
     /// The permanent record wallet scoring is built from.
     alpha_ledger: std::sync::Arc<crate::alpha::ScoreLedger>,
+    /// Tokens smart money has touched, watched for a rebound.
+    #[cfg(feature = "sniper")]
+    rebound: std::sync::Arc<std::sync::Mutex<crate::rebound::ReboundPool>>,
 }
 
 impl Detector {
@@ -181,6 +184,10 @@ impl Detector {
             #[cfg(feature = "sniper")]
             alpha_wallets: std::sync::Mutex::new(None),
             alpha_ledger,
+            #[cfg(feature = "sniper")]
+            rebound: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::rebound::ReboundPool::new(),
+            )),
         })
     }
 
@@ -390,6 +397,101 @@ impl Detector {
                     let (considered, sold) = sniper.sweep_exits(&state, &alerter).await;
                     if sold > 0 {
                         info!(considered, sold, "auto-sell sweep");
+                    }
+                }
+            });
+        }
+
+        // REBOUND WATCHER. Checks the pool for fresh volume and takes at most
+        // one entry per token per observation cycle.
+        //
+        // On its own loop, independent of the buy stream: the whole point is
+        // that the entry comes LATER than the smart-money activity that put the
+        // token on the list, so it cannot be driven by that activity arriving.
+        #[cfg(feature = "sniper")]
+        {
+            let sniper = self.sniper.clone();
+            let prices = self.prices.clone();
+            let alerter = self.alerter.clone();
+            let pool = self.rebound.clone();
+            // Fresh volume means RECENT volume. The signal window is what the
+            // rest of the bot already treats as "now", so it is reused rather
+            // than adding another number to tune.
+            let fresh_window = Duration::from_secs(self.cfg.tracked.window_secs.max(60));
+            let mut shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let every = Duration::from_secs(30);
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(every) => {}
+                        _ = shutdown.changed() => {
+                            if *shutdown.borrow() { return; }
+                            continue;
+                        }
+                    }
+                    let live = sniper.live();
+                    if !live.rebound_enabled || live.rebound_min_volume_sol <= 0.0 {
+                        continue;
+                    }
+                    let watch_secs = live.rebound_watch_hours.max(1) * 3600;
+                    let now = chrono::Utc::now();
+
+                    // Expire first so a closed window is never evaluated.
+                    let (expired, watching) = {
+                        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                        let n = p.expire(now, watch_secs);
+                        (n, p.mints())
+                    };
+                    if expired > 0 {
+                        info!(expired, watching = watching.len(), "rebound: watches closed");
+                    }
+
+                    for mint in watching {
+                        let fresh = prices.volume_sol_in(&mint, fresh_window);
+                        let armed = {
+                            let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                            p.evaluate(
+                                &mint,
+                                fresh,
+                                live.rebound_min_volume_sol,
+                                now,
+                                watch_secs,
+                            )
+                        };
+                        // Only the interesting outcome is logged. "Too quiet" is
+                        // the normal state of nearly every watched token and
+                        // would bury the log in noise every 30 seconds.
+                        if armed.is_err() {
+                            continue;
+                        }
+                        info!(
+                            %mint,
+                            fresh_volume = fresh,
+                            need = live.rebound_min_volume_sol,
+                            "rebound: triggered — fresh volume on a watched token"
+                        );
+                        let reason = format!("rebound: {fresh:.2} SOL fresh volume");
+                        let outcome = sniper.rebound_buy(&mint, &reason).await;
+                        // The entry is spent only when the buy actually landed.
+                        // A refusal — a veto, a position limit, a thin moment —
+                        // must not burn the token's one chance for the cycle.
+                        let landed = matches!(
+                            outcome,
+                            crate::sniper::BuyOutcome::Submitted {
+                                result: crate::sniper::SubmitOutcome::Executed { .. },
+                                ..
+                            }
+                        );
+                        if landed {
+                            let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                            p.mark_triggered(&mint);
+                        }
+                        info!(%mint, ?outcome, landed, "rebound buy");
+                        if let Some(msg) =
+                            crate::alerts::render_rebound_buy(&mint, fresh, &outcome)
+                        {
+                            alerter.send_html(msg).await;
+                        }
                     }
                 }
             });
@@ -998,6 +1100,30 @@ impl Detector {
                     first_wallet: buy.wallet.clone(),
                     sampled: Vec::new(),
                 });
+            }
+
+            // --- REBOUND OBSERVATION. Every token tracked money touches goes
+            // on the watchlist, whether or not anything is bought. Nothing is
+            // entered here: the pool is a watchlist, not a position.
+            #[cfg(feature = "sniper")]
+            {
+                let live = self.sniper.live();
+                if live.rebound_enabled {
+                    let watch_secs = live.rebound_watch_hours.max(1) * 3600;
+                    let opened = {
+                        let mut pool =
+                            self.rebound.lock().unwrap_or_else(|p| p.into_inner());
+                        pool.observe(&buy.mint, chrono::Utc::now(), watch_secs)
+                    };
+                    if opened {
+                        info!(
+                            mint = %buy.mint,
+                            wallet = %buy.wallet,
+                            watch_hours = live.rebound_watch_hours,
+                            "rebound: watching — touched by tracked money"
+                        );
+                    }
+                }
             }
 
             // --- Auto-buy. Evaluated on EVERY tracked buy, not only when a
