@@ -448,6 +448,10 @@ pub struct SniperConfig {
     /// Where resolved calls are archived for wallet scoring.
     #[serde(default = "default_alpha_ledger")]
     pub alpha_ledger_path: String,
+    /// Where the rebound watchlist is persisted, so a 72-hour observation
+    /// window survives a restart.
+    #[serde(default = "default_rebound_state")]
+    pub rebound_state_path: String,
     /// A wallet must have bought inside this window to stay qualified.
     #[serde(default = "default_alpha_recency_hours")]
     pub alpha_recency_hours: i64,
@@ -739,6 +743,9 @@ fn default_alpha_lookback_hours() -> i64 {
 fn default_alpha_ledger() -> String {
     "wallet_scores.jsonl".to_string()
 }
+fn default_rebound_state() -> String {
+    "rebound_watch.json".to_string()
+}
 fn default_alpha_recency_hours() -> i64 {
     72
 }
@@ -836,6 +843,7 @@ impl Default for SniperConfig {
             alpha_min_median_peak: default_alpha_min_median_peak(),
             alpha_lookback_hours: default_alpha_lookback_hours(),
             alpha_ledger_path: default_alpha_ledger(),
+            rebound_state_path: default_rebound_state(),
             alpha_recency_hours: default_alpha_recency_hours(),
             alpha_maturity_mins: default_alpha_maturity_mins(),
             settings_path: default_settings_path(),

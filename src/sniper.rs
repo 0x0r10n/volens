@@ -931,6 +931,32 @@ impl Sniper {
         if live.rebound_buy_sol <= 0.0 {
             return BuyOutcome::Refused { reason: "rebound buy amount not set".into() };
         }
+        // NOT into a position we already hold.
+        //
+        // Two reasons, and the second is the one that costs money. Rebound's
+        // thesis is a RE-ENTRY after the move is over, which is a different
+        // trade from adding to something already open. And because the audit
+        // tag decides which lane a position counts in, a rebound buy into a
+        // token the normal trigger holds would move that position into
+        // Rebound's lane — freeing a slot in the normal one and letting the bot
+        // hold more concurrent positions than either limit allows.
+        if let Some(owner) = self.owner() {
+            match self.rpc.token_balance_raw(&owner.to_string(), mint).await {
+                Some((raw, _)) if raw > 0 => {
+                    return BuyOutcome::Refused {
+                        reason: "skip: already holding this token".into(),
+                    };
+                }
+                // Unreadable is not "we hold none". Refuse rather than risk
+                // doubling into an open position.
+                None => {
+                    return BuyOutcome::Refused {
+                        reason: "could not read the current balance".into(),
+                    };
+                }
+                Some(_) => {}
+            }
+        }
         self.buy_mint_sized(mint, reason, 0.0, Some(live.rebound_buy_sol)).await
     }
 
@@ -3496,6 +3522,7 @@ mod tests {
             alpha_min_hit_rate: 0.35,
             alpha_min_median_peak: 1.5,
             alpha_ledger_path: String::new(),
+            rebound_state_path: String::new(),
             alpha_hit_multiple: 2.0,
             alpha_lookback_hours: 168,
             alpha_recency_hours: 72,

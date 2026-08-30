@@ -61,6 +61,12 @@ pub enum Skip {
 #[derive(Debug, Default)]
 pub struct ReboundPool {
     watching: HashMap<String, Watch>,
+    /// Set by any change; cleared when the caller persists.
+    ///
+    /// The pool takes on a token per tracked buy — thousands a day — and saving
+    /// rewrites the whole file, so writes are batched by the watcher loop
+    /// rather than done per observation on the stream's hot path.
+    dirty: bool,
 }
 
 impl ReboundPool {
@@ -69,7 +75,12 @@ impl ReboundPool {
     }
 
     pub fn from_watches(list: Vec<Watch>) -> Self {
-        Self { watching: list.into_iter().map(|w| (w.mint.clone(), w)).collect() }
+        Self { watching: list.into_iter().map(|w| (w.mint.clone(), w)).collect(), dirty: false }
+    }
+
+    /// Has the pool changed since it was last persisted? Clears the flag.
+    pub fn take_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
     }
 
     pub fn len(&self) -> usize {
@@ -106,6 +117,7 @@ impl ReboundPool {
                 if w.triggered || w.expired(now, watch_secs) {
                     w.since = now;
                     w.triggered = false;
+                    self.dirty = true;
                     true
                 } else {
                     false
@@ -114,6 +126,7 @@ impl ReboundPool {
             None => {
                 self.watching
                     .insert(mint.to_string(), Watch { mint: mint.to_string(), since: now, triggered: false });
+                self.dirty = true;
                 true
             }
         }
@@ -123,7 +136,11 @@ impl ReboundPool {
     pub fn expire(&mut self, now: DateTime<Utc>, watch_secs: i64) -> usize {
         let before = self.watching.len();
         self.watching.retain(|_, w| !w.expired(now, watch_secs));
-        before - self.watching.len()
+        let dropped = before - self.watching.len();
+        if dropped > 0 {
+            self.dirty = true;
+        }
+        dropped
     }
 
     /// Would this token trigger a rebound entry right now?
@@ -158,7 +175,53 @@ impl ReboundPool {
     pub fn mark_triggered(&mut self, mint: &str) {
         if let Some(w) = self.watching.get_mut(mint) {
             w.triggered = true;
+            self.dirty = true;
         }
+    }
+}
+
+/// Read a persisted watchlist. A missing file is normal on first run; a corrupt
+/// one is treated as empty rather than fatal.
+pub fn load_watches(path: &str) -> Vec<Watch> {
+    if path.is_empty() {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<Watch>>(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(path, error = %e, "unreadable rebound watchlist; starting empty");
+            Vec::new()
+        }
+    }
+}
+
+/// Write the watchlist atomically.
+///
+/// Whole-file rewrite through a temp file and a rename, not an append: the
+/// watchlist is CURRENT STATE, not history — entries expire, and the triggered
+/// flag flips — so a log of changes would have to be replayed to be understood.
+/// The rename means a crash mid-write leaves the previous list intact rather
+/// than a truncated one.
+///
+/// Without this the 72-hour window lived only in memory, so every restart wiped
+/// it. On a bot that gets deployed several times a day that is not a rare edge
+/// case — it is the normal state, and it would silently mean Rebound never saw
+/// a token long enough to watch it.
+pub fn save_watches(path: &str, watches: &[Watch]) {
+    if path.is_empty() {
+        return;
+    }
+    let Ok(body) = serde_json::to_string(watches) else { return };
+    let tmp = format!("{path}.tmp");
+    if std::fs::write(&tmp, body).is_err() {
+        tracing::warn!(path, "could not write the rebound watchlist");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        tracing::warn!(path, error = %e, "could not replace the rebound watchlist");
     }
 }
 
@@ -263,6 +326,74 @@ mod tests {
         assert!(!p.observe("M", mid, WATCH));
         let after = now() + Duration::seconds(WATCH + 1);
         assert_eq!(p.evaluate("M", 50.0, 10.0, after, WATCH), Err(Skip::Expired));
+    }
+
+    /// The whole point of persisting: a 72-hour window must outlive a deploy.
+    #[test]
+    fn the_watchlist_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("volens-rebound-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("watch.json");
+        let p = path.to_string_lossy().to_string();
+
+        let mut pool = ReboundPool::new();
+        pool.observe("A", now(), WATCH);
+        pool.observe("B", now(), WATCH);
+        pool.mark_triggered("B");
+        save_watches(&p, &pool.watches());
+
+        let restored = ReboundPool::from_watches(load_watches(&p));
+        assert_eq!(restored.len(), 2, "both watches came back");
+        assert_eq!(
+            restored.evaluate("B", 50.0, 1.0, now(), WATCH),
+            Err(Skip::AlreadyTriggered),
+            "and B is still spent — a restart must not re-arm it"
+        );
+        assert_eq!(restored.evaluate("A", 50.0, 1.0, now(), WATCH), Ok(()));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Saving is batched off the hot path, so the pool has to be able to say
+    /// whether it changed. A missed flag means a lost watch.
+    #[test]
+    fn every_change_marks_the_pool_dirty() {
+        let mut p = ReboundPool::new();
+        assert!(!p.take_dirty(), "a fresh pool has nothing to save");
+
+        p.observe("A", now(), WATCH);
+        assert!(p.take_dirty(), "a new watch");
+        assert!(!p.take_dirty(), "and the flag clears");
+
+        p.observe("A", now(), WATCH);
+        assert!(!p.take_dirty(), "a repeat touch in the same cycle changes nothing");
+
+        p.mark_triggered("A");
+        assert!(p.take_dirty(), "spending the entry must be persisted");
+
+        p.expire(now() + Duration::seconds(WATCH + 1), WATCH);
+        assert!(p.take_dirty(), "so must an expiry");
+    }
+
+    /// A restored pool is already in sync with the file it came from.
+    #[test]
+    fn a_loaded_pool_starts_clean() {
+        let mut p = ReboundPool::from_watches(vec![Watch {
+            mint: "A".into(),
+            since: now(),
+            triggered: false,
+        }]);
+        assert!(!p.take_dirty());
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_watchlist_is_not_fatal() {
+        assert!(load_watches("/nonexistent/volens/watch.json").is_empty());
+        let dir = std::env::temp_dir().join(format!("volens-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.json");
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_watches(&path.to_string_lossy()).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

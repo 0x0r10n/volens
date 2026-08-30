@@ -76,11 +76,6 @@ pub struct Detector {
     /// Mints already auto-bought, so one signal opens one position.
     #[cfg(feature = "sniper")]
     smart_bought: std::sync::Mutex<std::collections::HashSet<String>>,
-    /// Mints ALPHA has already entered. Separate from `smart_bought` on
-    /// purpose: the two triggers are independent, and sharing one set would
-    /// mean whichever fired first silently suppressed the other.
-    #[cfg(feature = "sniper")]
-    alpha_bought: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Qualifying Alpha wallets, with the time they were computed.
     ///
     /// Cached because the scoring pass walks the whole signal history and this
@@ -157,6 +152,8 @@ impl Detector {
 
         let alpha_ledger =
             Arc::new(crate::alpha::ScoreLedger::new(cfg.sniper.alpha_ledger_path.clone()));
+        #[cfg(feature = "sniper")]
+        let rebound_state_path = cfg.sniper.rebound_state_path.clone();
 
         Ok(Self {
             cfg,
@@ -180,13 +177,13 @@ impl Detector {
             #[cfg(feature = "sniper")]
             smart_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "sniper")]
-            alpha_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
-            #[cfg(feature = "sniper")]
             alpha_wallets: std::sync::Mutex::new(None),
             alpha_ledger,
             #[cfg(feature = "sniper")]
             rebound: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::rebound::ReboundPool::new(),
+                crate::rebound::ReboundPool::from_watches(crate::rebound::load_watches(
+                    &rebound_state_path,
+                )),
             )),
         })
     }
@@ -414,6 +411,7 @@ impl Detector {
             let prices = self.prices.clone();
             let alerter = self.alerter.clone();
             let pool = self.rebound.clone();
+            let state_path = self.cfg.sniper.rebound_state_path.clone();
             // Fresh volume means RECENT volume. The signal window is what the
             // rest of the bot already treats as "now", so it is reused rather
             // than adding another number to tune.
@@ -430,20 +428,43 @@ impl Detector {
                         }
                     }
                     let live = sniper.live();
-                    if !live.rebound_enabled || live.rebound_min_volume_sol <= 0.0 {
+                    if !live.rebound_enabled {
                         continue;
                     }
                     let watch_secs = live.rebound_watch_hours.max(1) * 3600;
                     let now = chrono::Utc::now();
 
-                    // Expire first so a closed window is never evaluated.
-                    let (expired, watching) = {
+                    // EXPIRY AND PERSISTENCE RUN BEFORE THE THRESHOLD GATE.
+                    //
+                    // Observation is on whenever the mode is, so the pool fills
+                    // whether or not a threshold has been chosen. Skipping this
+                    // when the threshold is unset — the exact state a new
+                    // operator sits in — meant the watchlist grew for every
+                    // token smart money touched and nothing ever aged out.
+                    let (expired, watching, snapshot, dirty) = {
                         let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
                         let n = p.expire(now, watch_secs);
-                        (n, p.mints())
+                        let dirty = p.take_dirty() || n > 0;
+                        (n, p.mints(), p.watches(), dirty)
                     };
                     if expired > 0 {
                         info!(expired, watching = watching.len(), "rebound: watches closed");
+                    }
+                    // Batched here rather than written on every observation.
+                    // The pool takes on a token per tracked buy — thousands a
+                    // day — and each save rewrites the whole file, so saving
+                    // per observation would rewrite a large file every few
+                    // seconds on the stream's own thread. Losing a few seconds
+                    // of observations to a crash costs nothing: the token is
+                    // re-observed the next time it is touched.
+                    if dirty {
+                        crate::rebound::save_watches(&state_path, &snapshot);
+                    }
+
+                    // Nothing can trigger without a threshold, and a zero one
+                    // would fire on every token in the pool.
+                    if live.rebound_min_volume_sol <= 0.0 {
+                        continue;
                     }
 
                     for mint in watching {
@@ -483,8 +504,14 @@ impl Detector {
                             }
                         );
                         if landed {
-                            let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
-                            p.mark_triggered(&mint);
+                            let snapshot = {
+                                let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                                p.mark_triggered(&mint);
+                                p.watches()
+                            };
+                            // Written immediately: a restart between the buy and
+                            // the next save would re-arm a token already bought.
+                            crate::rebound::save_watches(&state_path, &snapshot);
                         }
                         info!(%mint, ?outcome, landed, "rebound buy");
                         if let Some(msg) =
@@ -1110,15 +1137,19 @@ impl Detector {
                 let live = self.sniper.live();
                 if live.rebound_enabled {
                     let watch_secs = live.rebound_watch_hours.max(1) * 3600;
-                    let opened = {
+                    // Marks the pool dirty; the watcher loop persists it. This
+                    // runs on the stream's hot path, so it must not touch disk.
+                    let (opened, watching) = {
                         let mut pool =
                             self.rebound.lock().unwrap_or_else(|p| p.into_inner());
-                        pool.observe(&buy.mint, chrono::Utc::now(), watch_secs)
+                        let opened = pool.observe(&buy.mint, chrono::Utc::now(), watch_secs);
+                        (opened, pool.len())
                     };
                     if opened {
                         info!(
                             mint = %buy.mint,
                             wallet = %buy.wallet,
+                            watching,
                             watch_hours = live.rebound_watch_hours,
                             "rebound: watching — touched by tracked money"
                         );
