@@ -162,6 +162,15 @@ impl SignalStore {
         self.lock().values().cloned().collect()
     }
 
+    /// When a mint was first announced, and the highest multiple it has
+    /// reached since. `None` if it was never called, or has been retired.
+    ///
+    /// Backs the rebound alert: "trading again" says far more when it also says
+    /// the token was first flagged three days ago and ran to 40x in between.
+    pub fn call_context(&self, mint: &str) -> Option<(DateTime<Utc>, f64)> {
+        self.lock().get(mint).map(|r| (r.first_seen_utc, r.peak()))
+    }
+
     /// The ticker for a mint, if this token was ever announced.
     ///
     /// Cheap single lookup rather than cloning the whole store: used by alerts

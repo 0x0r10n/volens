@@ -135,6 +135,14 @@ pub struct LiveSettings {
     /// SOL per rebound entry.
     #[serde(default)]
     pub rebound_buy_sol: f64,
+    /// Whether Rebound actually BUYS, separate from whether it runs.
+    ///
+    /// Off means observe and alert only. The watchlist still fills, the alerts
+    /// still fire, and nothing is spent — which is how the thresholds get
+    /// chosen: by watching what the alerts would have bought. Kept apart from
+    /// the amount so turning buying off does not lose the number you tuned.
+    #[serde(default)]
+    pub rebound_buy_enabled: bool,
     /// Exits for rebound positions — its own ladder, since it enters on
     /// different evidence from the normal trigger and is held differently.
     #[serde(default = "empty_rules")]
@@ -329,6 +337,7 @@ impl LiveSettings {
             rebound_watch_hours: default_rebound_hours(),
             rebound_min_volume_sol: 0.0,
             rebound_buy_sol: 0.0,
+            rebound_buy_enabled: false,
             rebound_exits: empty_rules(),
             rebound_max_open: one_position(),
             max_open_positions: one_position(),

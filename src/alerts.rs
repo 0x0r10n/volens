@@ -634,25 +634,24 @@ pub fn render_smart_buy(
     entry_mcap_usd: Option<f64>,
 ) -> Option<String> {
     use crate::sniper::BuyOutcome;
-    let short = crate::conviction::short_mint(mint);
     Some(match outcome {
         BuyOutcome::Refused { reason } => format!(
             "⚪ <b>Smart buy skipped</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(&explain_failure(reason))
+            escape_html(mint), escape_html(&explain_failure(reason))
         ),
         BuyOutcome::Failed { reason, .. } => format!(
             "❌ <b>Smart buy FAILED</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(&explain_failure(reason))
+            escape_html(mint), escape_html(&explain_failure(reason))
         ),
         BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
             "🧪 <b>Smart buy rehearsed</b> · <code>{}</code>\n{sol_in} SOL\n{}\n\
              <i>Dry run — nothing was signed.</i>",
-            escape_html(&short),
+            escape_html(mint),
             if *would_succeed { "would succeed" } else { "would FAIL" }
         ),
         BuyOutcome::Submitted { sol_in, result, .. } => format!(
             "🟢 <b>SMART BUY</b> · <code>{}</code>\n{sol_in} SOL{}\n{}",
-            escape_html(&short),
+            escape_html(mint),
             match entry_mcap_usd {
                 Some(m) if m > 0.0 => format!("  ·  entry {}", short_usd(m)),
                 _ => String::new(),
@@ -670,23 +669,27 @@ pub fn render_smart_buy(
 /// configured to buy it. That is also how the thresholds get chosen — by
 /// watching these first.
 ///
-/// `since_watch` is the multiple against the price when the watch opened, which
-/// is what separates "a token is trading" from "a token that fell 90% is
-/// trading again".
+/// The mint is shown in FULL. Telegram copies a `<code>` block's literal
+/// contents, so a shortened form copies an address that does not exist.
 #[cfg(feature = "sniper")]
+#[allow(clippy::too_many_arguments)]
 pub fn render_rebound_signal(
     mint: &str,
     symbol: Option<&str>,
     fresh_volume_sol: f64,
     since_watch: Option<f64>,
     hours_watched: f64,
+    // `first_signal`: when smart money first called this token, and the peak it
+    // reached since — the history that turns "it is trading" into "it is
+    // trading again after running to 40x and coming back".
+    first_signal: Option<(chrono::DateTime<chrono::Utc>, f64)>,
+    tz_offset_hours: i32,
 ) -> String {
-    let short = crate::conviction::short_mint(mint);
-    // The ticker if we have one, with the mint underneath to tap and copy —
-    // a bare mint is unreadable and a bare ticker cannot be acted on.
     let head = match symbol {
-        Some(s) if !s.is_empty() => format!("{} · <code>{}</code>", escape_html(s), escape_html(mint)),
-        _ => format!("<code>{}</code>", escape_html(&short)),
+        Some(s) if !s.is_empty() => {
+            format!("{}\n<code>{}</code>", escape_html(s), escape_html(mint))
+        }
+        _ => format!("<code>{}</code>", escape_html(mint)),
     };
     let drawdown = match since_watch {
         // Below where smart money was: the interesting case, and the one the
@@ -697,10 +700,39 @@ pub fn render_rebound_signal(
         Some(m) if m >= 1.05 => format!("\n{m:.2}x since it was watched"),
         _ => String::new(),
     };
+    // The original call, when there is one. A token first flagged days ago that
+    // ran to 40x and came back is a different proposition from one flagged an
+    // hour ago that never moved, and the alert should not make them look alike.
+    let history = match first_signal {
+        Some((at, peak)) => {
+            let ath = if peak >= 1.05 { format!(" · ATH {peak:.2}x") } else { String::new() };
+            format!(
+                "\nfirst signal {}{ath}",
+                crate::conviction::stamp(at, tz_offset_hours)
+            )
+        }
+        None => String::new(),
+    };
     format!(
         "🔄 <b>TRADING AGAIN</b> · {head}\n\
-         {fresh_volume_sol:.1} SOL in the last few minutes · watched {hours_watched:.0}h{drawdown}"
+         {fresh_volume_sol:.1} SOL in the last few minutes · watched {hours_watched:.0}h\
+         {drawdown}{history}"
     )
+}
+
+/// A rebound that has run since it was announced.
+///
+/// Threaded under the original alert, so "up 3.2x" is attached to the token it
+/// refers to rather than floating loose in a busy group. Measured from the
+/// price when the REBOUND fired, not from the original call — the rebound alert
+/// is the entry this is reporting on.
+#[cfg(feature = "sniper")]
+pub fn render_rebound_update(mint: &str, symbol: Option<&str>, multiple: f64) -> String {
+    let head = match symbol {
+        Some(s) if !s.is_empty() => escape_html(s).to_string(),
+        _ => escape_html(&crate::conviction::short_mint(mint)).to_string(),
+    };
+    format!("📈 <b>{head}</b> · <b>{multiple:.2}x</b> since the rebound alert")
 }
 
 /// Announce a REBOUND entry.
@@ -716,25 +748,24 @@ pub fn render_rebound_buy(
     outcome: &crate::sniper::BuyOutcome,
 ) -> Option<String> {
     use crate::sniper::BuyOutcome;
-    let short = crate::conviction::short_mint(mint);
     Some(match outcome {
         // Silent on a refusal: the watcher re-evaluates every 30 seconds, so a
         // standing condition would repeat the same message all day.
         BuyOutcome::Refused { .. } => return None,
         BuyOutcome::Failed { reason, .. } => format!(
             "❌ <b>Rebound FAILED</b> · <code>{}</code>\n{}",
-            escape_html(&short),
+            escape_html(mint),
             escape_html(&explain_failure(reason))
         ),
         BuyOutcome::Rehearsed { sol_in, would_succeed, .. } => format!(
             "🧪 <b>Rebound rehearsed</b> · <code>{}</code>\n{sol_in} SOL · {}\n\
              <i>Dry run — nothing was signed.</i>",
-            escape_html(&short),
+            escape_html(mint),
             if *would_succeed { "would succeed" } else { "would FAIL" }
         ),
         BuyOutcome::Submitted { sol_in, result, .. } => format!(
             "🔄 <b>REBOUND BUY</b> · <code>{}</code>\n{sol_in} SOL · {fresh_volume_sol:.1} SOL volume\n{}",
-            escape_html(&short),
+            escape_html(mint),
             escape_html(&describe_submission(result))
         ),
     })
@@ -749,26 +780,25 @@ pub fn render_auto_sell(
     outcome: &crate::sniper::SellOutcome,
 ) -> Option<String> {
     use crate::sniper::SellOutcome;
-    let short = crate::conviction::short_mint(mint);
     Some(match outcome {
         SellOutcome::NoPosition { .. } => return None,
         SellOutcome::Refused { reason: r } => format!(
             "⚪ <b>Auto-sell skipped</b> · <code>{}</code>\n{}",
-            escape_html(&short), escape_html(&explain_failure(r))
+            escape_html(mint), escape_html(&explain_failure(r))
         ),
         SellOutcome::Failed { reason: r, .. } => format!(
             "❌ <b>Auto-sell FAILED</b> · <code>{}</code>\n{}\n{}",
-            escape_html(&short), escape_html(reason), escape_html(&explain_failure(r))
+            escape_html(mint), escape_html(reason), escape_html(&explain_failure(r))
         ),
         SellOutcome::Rehearsed { sol_out, would_succeed, .. } => format!(
             "🧪 <b>Auto-sell rehearsed</b> · <code>{}</code>\n\
              {pct}% · est {sol_out:.4} SOL\n{}\n{}\n<i>Dry run.</i>",
-            escape_html(&short), escape_html(reason),
+            escape_html(mint), escape_html(reason),
             if *would_succeed { "would succeed" } else { "would FAIL" }
         ),
         SellOutcome::Submitted { sol_out, result, .. } => format!(
             "🔴 <b>AUTO-SELL</b> · <code>{}</code>\n{pct}% · est {sol_out:.4} SOL\n{}\n{}",
-            escape_html(&short), escape_html(reason),
+            escape_html(mint), escape_html(reason),
             escape_html(&describe_submission(result))
         ),
     })
@@ -909,7 +939,7 @@ pub fn render_unpriceable(mint: &str) -> Option<String> {
         "🟠 <b>Position stopped trading</b> · <code>{}</code>\n\
          No fills observed, so it cannot be priced — or sold — right now.\n\
          <i>Auto-sell is holding rather than acting on a price it does not have.</i>",
-        escape_html(&crate::conviction::short_mint(mint))
+        escape_html(mint)
     ))
 }
 

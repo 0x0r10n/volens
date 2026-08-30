@@ -2141,6 +2141,7 @@ impl Bot {
         };
         let live = sniper.live();
         let onoff = if live.rebound_enabled { "🟢 On" } else { "⚪ Off" };
+        let buying = if live.rebound_buy_enabled { "🟢 On" } else { "⚪ Off" };
         let amt = format!("{} SOL", live.rebound_buy_sol);
         let vol = if live.rebound_min_volume_sol > 0.0 {
             format!("{} SOL", live.rebound_min_volume_sol)
@@ -2156,7 +2157,8 @@ impl Bot {
 
         let mut text = format!(
             "🔄 <b>Rebound</b> · {onoff}\n\n\
-             Buy       <b>{amt}</b>\n\
+             Buying    <b>{buying}</b>\n\
+             Buy size  <b>{amt}</b>\n\
              Volume    <b>{vol}</b>\n\
              Watch     <b>{watch}</b>\n\
              Max open  <b>{open_s}</b>\n\
@@ -2165,16 +2167,21 @@ impl Bot {
              trading again on fresh volume inside the window, it is bought once.</i>",
             crate::exits::describe_orders(&live.rebound_exits)
         );
-        if live.rebound_enabled && (live.rebound_buy_sol <= 0.0 || live.rebound_min_volume_sol <= 0.0) {
-            text.push_str("\n\n⚠️ Needs both a buy amount and a volume threshold to trigger.");
+        if live.rebound_enabled && live.rebound_min_volume_sol <= 0.0 {
+            text.push_str("\n\n⚠️ Set a volume threshold — nothing can trigger without one.");
+        }
+        if live.rebound_buy_enabled && live.rebound_buy_sol <= 0.0 {
+            text.push_str("\n\n⚠️ Buying is on but the size is 0.");
         }
 
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("Rebound · {onoff}"), "callback_data": "setv:rebound_on:toggle"}],
-            [{"text": format!("💰 Buy · {amt}"), "callback_data": "set:rbuy"},
-             {"text": format!("💸 Volume · {vol}"), "callback_data": "set:rvol"}],
-            [{"text": format!("⏳ Watch · {watch}"), "callback_data": "set:rwatch"},
-             {"text": format!("📌 Max open · {open_s}"), "callback_data": "set:rmaxopen"}],
+            [{"text": format!("💰 Buying · {buying}"),
+              "callback_data": "setv:rebound_buy_on:toggle"},
+             {"text": format!("🧮 Buy size · {amt}"), "callback_data": "set:rbuy"}],
+            [{"text": format!("💸 Volume · {vol}"), "callback_data": "set:rvol"},
+             {"text": format!("⏳ Watch · {watch}"), "callback_data": "set:rwatch"}],
+            [{"text": format!("📌 Max open · {open_s}"), "callback_data": "set:rmaxopen"}],
             [{"text": "📋 Orders", "callback_data": "set:rladder"},
              {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
@@ -2471,6 +2478,7 @@ impl Bot {
             "breakeven_on" => (sniper.toggle_breakeven(), "ladder".into()),
             "alpha_on" => (sniper.toggle_alpha(), "alpha".into()),
             "rebound_on" => (sniper.toggle_rebound(), "rebound".into()),
+            "rebound_buy_on" => (sniper.toggle_rebound_buy(), "rebound".into()),
             "raddorder" => (sniper.rebound_add_order(), "rladder".into()),
             "rdelorder" => (sniper.rebound_remove_order(value.parse().ok()?), "rladder".into()),
             f if f.starts_with("rordt") => {

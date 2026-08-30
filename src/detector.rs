@@ -412,6 +412,7 @@ impl Detector {
             let alerter = self.alerter.clone();
             let pool = self.rebound.clone();
             let signals = self.signals.clone();
+            let tz_offset = self.cfg.tracked.display_utc_offset_hours;
             let state_path = self.cfg.sniper.rebound_state_path.clone();
             // Fresh volume means RECENT volume. The signal window is what the
             // rest of the bot already treats as "now", so it is reused rather
@@ -490,6 +491,55 @@ impl Detector {
                         p.set_dirty();
                     }
 
+                    // FOLLOW-UP UPDATES on rebounds already announced.
+                    //
+                    // Runs before the threshold gate: once a rebound has been
+                    // called, reporting how it did is worth doing whether or
+                    // not anything new can still trigger.
+                    //
+                    // Measured from the price when the REBOUND fired, not from
+                    // the original smart-money signal — the rebound alert is
+                    // the entry being reported on.
+                    const REBOUND_RUNGS: &[f64] = &[2.0, 3.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+                    let announced = {
+                        let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                        p.announced()
+                    };
+                    for w in announced {
+                        let Some(base) = w.alert_price.filter(|p| *p > 0.0) else { continue };
+                        let Some(now_price) = prices
+                            .price_sol(&w.mint, std::time::Duration::from_secs(3600))
+                            .map(|p| p.price_sol)
+                        else {
+                            continue;
+                        };
+                        let multiple = now_price / base;
+                        let Some(rung) = crate::signals::next_rung(
+                            multiple,
+                            w.reported_multiple.max(1.0),
+                            REBOUND_RUNGS,
+                        ) else {
+                            continue;
+                        };
+                        info!(mint = %w.mint, multiple, rung, "rebound update");
+                        {
+                            let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                            p.set_reported(&w.mint, rung);
+                        }
+                        alerter
+                            .send_html_returning_id(
+                                crate::alerts::render_rebound_update(
+                                    &w.mint,
+                                    signals.symbol_of(&w.mint).as_deref(),
+                                    multiple,
+                                ),
+                                // Threaded under the rebound alert, so "3.2x"
+                                // is attached to the token it refers to.
+                                w.alert_msg_id,
+                            )
+                            .await;
+                    }
+
                     // Nothing can trigger without a threshold, and a zero one
                     // would fire on every token in the pool.
                     if live.rebound_min_volume_sol <= 0.0 {
@@ -562,6 +612,10 @@ impl Detector {
                                 })
                             }).flatten();
                             let symbol = signals.symbol_of(&mint);
+                            // The smart-money call this token came from, and
+                            // the peak it reached since. Absent once the signal
+                            // has retired, which is honest — we no longer know.
+                            let first_signal = signals.call_context(&mint);
                             info!(
                                 %mint,
                                 fresh_volume = fresh,
@@ -573,15 +627,31 @@ impl Detector {
                                 let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
                                 p.mark_alerted(&mint);
                             }
-                            alerter
-                                .send_html(crate::alerts::render_rebound_signal(
-                                    &mint,
-                                    symbol.as_deref(),
-                                    fresh,
-                                    since_watch,
-                                    hours,
-                                ))
+                            let price_now = prices
+                                .price_sol(&mint, std::time::Duration::from_secs(3600))
+                                .map(|p| p.price_sol);
+                            let msg_id = alerter
+                                .send_html_returning_id(
+                                    crate::alerts::render_rebound_signal(
+                                        &mint,
+                                        symbol.as_deref(),
+                                        fresh,
+                                        since_watch,
+                                        hours,
+                                        first_signal,
+                                        tz_offset,
+                                    ),
+                                    None,
+                                )
                                 .await;
+                            // The baseline every follow-up is measured from,
+                            // plus the message to thread them under. Both are
+                            // recorded even when the price is unknown, so the
+                            // alert is not silently re-announced later.
+                            {
+                                let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                                p.set_alert_baseline(&mint, price_now, msg_id);
+                            }
                         }
 
                         let armed = {

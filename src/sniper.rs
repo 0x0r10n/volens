@@ -928,6 +928,9 @@ impl Sniper {
         if !live.rebound_enabled {
             return BuyOutcome::Refused { reason: "rebound mode off".into() };
         }
+        if !live.rebound_buy_enabled {
+            return BuyOutcome::Refused { reason: "rebound buying is off (observing only)".into() };
+        }
         if live.rebound_buy_sol <= 0.0 {
             return BuyOutcome::Refused { reason: "rebound buy amount not set".into() };
         }
@@ -2028,6 +2031,22 @@ impl Sniper {
                 }
             } else {
                 "rebound off".to_string()
+            })
+        })
+    }
+
+    /// Turn rebound BUYING on or off without losing the configured amount.
+    pub fn toggle_rebound_buy(&self) -> Result<String, String> {
+        self.settings.update(|s| {
+            s.rebound_buy_enabled = !s.rebound_buy_enabled;
+            Ok(if s.rebound_buy_enabled {
+                if s.rebound_buy_sol > 0.0 {
+                    format!("rebound will BUY {} SOL on a trigger", s.rebound_buy_sol)
+                } else {
+                    "rebound buying ON — but the amount is still 0".to_string()
+                }
+            } else {
+                "rebound buying off — observing and alerting only".to_string()
             })
         })
     }

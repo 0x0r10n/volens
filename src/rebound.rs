@@ -59,6 +59,18 @@ pub struct Watch {
     /// threshold. Nothing can fire until then.
     #[serde(default)]
     pub went_quiet: bool,
+    /// Price when the REBOUND alert fired, and the message it was announced in.
+    ///
+    /// The baseline for follow-up updates: "3.2x" on a rebound means since the
+    /// rebound was called, not since the original smart-money signal, because
+    /// the rebound alert is the entry being reported on.
+    #[serde(default)]
+    pub alert_price: Option<f64>,
+    #[serde(default)]
+    pub alert_msg_id: Option<i64>,
+    /// Highest rung already announced for this rebound. Starts at 1.0.
+    #[serde(default)]
+    pub reported_multiple: f64,
     /// Price per token when the watch opened, if the stream could price it.
     ///
     /// What makes the alert readable: "trading again" is unremarkable on its
@@ -165,6 +177,9 @@ impl ReboundPool {
                     w.triggered = false;
                     w.alerted = false;
                     w.went_quiet = false;
+                    w.alert_price = None;
+                    w.alert_msg_id = None;
+                    w.reported_multiple = 0.0;
                     w.price_at_watch = price;
                     self.dirty = true;
                     true
@@ -181,6 +196,9 @@ impl ReboundPool {
                         triggered: false,
                         alerted: false,
                         went_quiet: false,
+                        alert_price: None,
+                        alert_msg_id: None,
+                        reported_multiple: 0.0,
                         price_at_watch: price,
                     },
                 );
@@ -284,6 +302,29 @@ impl ReboundPool {
     pub fn mark_alerted(&mut self, mint: &str) {
         if let Some(w) = self.watching.get_mut(mint) {
             w.alerted = true;
+            self.dirty = true;
+        }
+    }
+
+    /// Record the baseline a rebound's follow-up updates measure from.
+    pub fn set_alert_baseline(&mut self, mint: &str, price: Option<f64>, msg_id: Option<i64>) {
+        if let Some(w) = self.watching.get_mut(mint) {
+            w.alert_price = price;
+            w.alert_msg_id = msg_id;
+            w.reported_multiple = 1.0;
+            self.dirty = true;
+        }
+    }
+
+    /// Rebounds that have been announced and can still be re-priced.
+    pub fn announced(&self) -> Vec<Watch> {
+        self.watching.values().filter(|w| w.alert_price.is_some()).cloned().collect()
+    }
+
+    /// Raise the highest rung announced for a rebound.
+    pub fn set_reported(&mut self, mint: &str, multiple: f64) {
+        if let Some(w) = self.watching.get_mut(mint) {
+            w.reported_multiple = multiple;
             self.dirty = true;
         }
     }
@@ -602,6 +643,9 @@ mod tests {
             triggered: false,
             alerted: false,
             went_quiet: true,
+            alert_price: None,
+            alert_msg_id: None,
+            reported_multiple: 0.0,
             price_at_watch: None,
         }]);
         assert!(!p.take_dirty());
