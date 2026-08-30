@@ -83,6 +83,15 @@ pub struct Bot {
     signals: Option<Arc<crate::signals::SignalStore>>,
     /// How long a call stays tracked — bounds what `/calls` lists.
     track_for_secs: u64,
+    /// The SIGNAL window — how far back the buy triggers actually look.
+    ///
+    /// Distinct from `track_for_secs`, which is how long a call is tracked for
+    /// PERFORMANCE afterwards. The two screens below showed the tracking
+    /// duration by mistake, so a 10 SOL threshold read as "10 SOL in 24 hours"
+    /// — a bar almost any token clears — when it really means "10 SOL in 10
+    /// minutes", which is a serious one. Anyone setting the number from that
+    /// screen would have been off by orders of magnitude.
+    signal_window_secs: u64,
     tz_offset_hours: i32,
     /// Local wallet store for `/new-wallet`, `/wallets`, `/use`. `None` disables
     /// those commands (reports not configured).
@@ -152,6 +161,7 @@ impl Bot {
             rpc: None,
             signals: None,
             track_for_secs: 86_400,
+            signal_window_secs: 600,
             tz_offset_hours: 0,
             #[cfg(feature = "sniper")]
             store: None,
@@ -169,10 +179,12 @@ impl Bot {
         mut self,
         signals: Arc<crate::signals::SignalStore>,
         track_for_secs: u64,
+        signal_window_secs: u64,
         tz_offset_hours: i32,
     ) -> Self {
         self.signals = Some(signals);
         self.track_for_secs = track_for_secs;
+        self.signal_window_secs = signal_window_secs;
         self.tz_offset_hours = tz_offset_hours;
         self
     }
@@ -1886,9 +1898,9 @@ impl Bot {
             "🤖 <b>Auto-buy</b>\n\n\
              Status · <b>{}</b>\n\
              Smart volume · <b>{sol_s}</b>\n\n\
-<i>Over the last {win} min.</i>",
+<i>SOL from TRACKED WALLETS in the last {win} min. This is the trigger.</i>",
             if active { "🟢 on" } else { "⚪ off" },
-            win = self.track_for_secs.max(60) / 60,
+            win = self.signal_window_secs.max(60) / 60,
         );
 
         let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([
@@ -2053,10 +2065,10 @@ impl Bot {
             "📊 <b>Volume mode</b>\n\n\
              Status · <b>{}</b>\n\
              Token volume · <b>{}</b>\n\n\
-<i>Over the last {win} min.</i>",
+<i>SOL from ANYONE in the last {win} min. Can only refuse, never trigger.</i>",
             if on { "🟢 on" } else { "⚪ off" },
             fmt(live.min_token_volume_sol),
-            win = self.track_for_secs.max(60) / 60,
+            win = self.signal_window_secs.max(60) / 60,
         );
 
         let mut rows: Vec<serde_json::Value> = vec![serde_json::json!([

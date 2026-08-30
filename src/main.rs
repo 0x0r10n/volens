@@ -140,6 +140,7 @@ async fn main() -> Result<()> {
         .with_signals(
             detector.signals(),
             cfg.tracked.track_for_secs,
+            cfg.tracked.window_secs,
             cfg.tracked.display_utc_offset_hours,
         );
         #[cfg(feature = "sniper")]
