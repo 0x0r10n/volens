@@ -349,7 +349,7 @@ impl SnipeMode {
 /// Working values now live in [`crate::settings::SettingsStore`], which
 /// persists them. They used to sit in a plain in-memory struct here, so every
 /// value set from Telegram was silently reverted to `config.toml` on restart.
-pub use crate::settings::{Envelope, Lane, LiveSettings};
+pub use crate::settings::{Envelope, LiveSettings};
 
 /// Render a SOL ceiling for display: 0 means the cap is disabled (unlimited).
 fn fmt_cap_sol(v: f64) -> String {
@@ -378,14 +378,16 @@ pub fn smart_buy_record(
     reason: &str,
     outcome: &str,
     armed: bool,
-    alpha: bool,
+    alpha_addon: f64,
 ) -> serde_json::Value {
     serde_json::json!({
         "ts": Utc::now().to_rfc3339(),
-        // The tag is how an ALPHA position is recognised later: it is what
-        // routes the position to the Alpha exit rules instead of the normal
-        // ones, and it is the only record of which trigger opened the trade.
-        "action": if alpha { "alpha_buy" } else { "smart_buy" },
+        // One action, because there is one kind of entry. Alpha adds SIZE to a
+        // normal buy rather than opening a trade of its own, so it is recorded
+        // as a property of the trade — how much of `sol` was conviction — and
+        // not as a different kind of trade.
+        "action": "smart_buy",
+        "alpha_addon": alpha_addon,
         "owner": owner,
         "mint": mint,
         "sol": sol,
@@ -909,38 +911,31 @@ impl Sniper {
     /// sell route, so its exit is quote-API-dependent until pool discovery
     /// exists. That is the main reason to keep the size small.
     pub async fn buy_mint(&self, mint: &str, reason: &str) -> BuyOutcome {
-        self.buy_mint_sized(mint, reason, None, false).await
+        self.buy_mint_sized(mint, reason, 0.0).await
     }
 
-    /// An ALPHA entry: same token, same guards, its own size and its own tag.
+    /// A normal buy with the ALPHA ADD-ON applied on top of the chosen size.
     ///
-    /// Deliberately routed through `buy_mint_sized` rather than given a path of
-    /// its own. Every veto — kill switch, rug blacklist, daily caps,
-    /// affordability, mint safety, liquidity floor, price impact, market-cap
-    /// ceiling — is written once and applies to both triggers. A parallel buy
-    /// path would be a second place for a guard to be forgotten, and the guards
-    /// are the part that must never diverge.
-    pub async fn alpha_buy(&self, mint: &str, reason: &str) -> BuyOutcome {
+    /// Alpha is a conviction layer, not a strategy: it never discovers or opens
+    /// a trade. The normal trigger decides WHETHER to buy; a qualifying Alpha
+    /// wallet being among the buyers decides only that this valid trade is
+    /// worth more size. One position, one ladder, one set of limits.
+    pub async fn buy_mint_with_alpha(&self, mint: &str, reason: &str) -> BuyOutcome {
         let live = self.settings.snapshot();
-        if !live.alpha_enabled {
-            return BuyOutcome::Refused { reason: "alpha mode off".into() };
-        }
-        if live.alpha_buy_sol <= 0.0 {
-            return BuyOutcome::Refused { reason: "alpha buy amount not set".into() };
-        }
-        self.buy_mint_sized(mint, reason, Some(live.alpha_buy_sol), true).await
+        let addon =
+            if live.alpha_enabled { live.alpha_buy_sol.max(0.0) } else { 0.0 };
+        self.buy_mint_sized(mint, reason, addon).await
     }
 
-    /// The shared body. `size_override` replaces the configured size and
-    /// suppresses market-cap banding; `alpha` only changes how the trade is
-    /// TAGGED in the audit log, which is what later routes it to the Alpha
-    /// exit rules.
+    /// The shared body. `alpha_addon` is extra SOL added to whatever size the
+    /// normal path selects, AFTER the market-cap band has chosen it — every
+    /// guard below then runs against the combined total, which is the amount
+    /// actually being spent.
     async fn buy_mint_sized(
         &self,
         mint: &str,
         reason: &str,
-        size_override: Option<f64>,
-        alpha: bool,
+        alpha_addon: f64,
     ) -> BuyOutcome {
         use crate::jupiter::Jupiter;
         use crate::model::WSOL_MINT;
@@ -966,29 +961,30 @@ impl Sniper {
 
         let live = self.settings.snapshot();
         let env = self.settings.envelope();
-        // CONCURRENT POSITION LIMIT, per lane.
+        // CONCURRENT POSITION LIMIT.
+        //
+        // One limit, because there is now one kind of position. Alpha adds size
+        // to a normal entry rather than opening its own, so a second allowance
+        // would be counting a strategy that no longer exists.
         //
         // Placed before the quote and the safety reads: this is the cheapest
         // possible "no", and a refusal here costs one batched balance read
         // rather than a full pricing round trip.
-        let cap = if alpha { live.alpha_max_open_positions } else { live.max_open_positions };
+        let cap = live.max_open_positions;
         if cap > 0 {
-            match self.open_positions(alpha).await {
+            match self.open_positions().await {
                 Some(open) if open >= cap as usize => {
-                    let reason = if alpha {
-                        "skip: alpha max open positions reached"
-                    } else {
-                        "skip: max open positions reached"
+                    info!(%mint, open, cap, "skip: max open positions reached");
+                    return BuyOutcome::Refused {
+                        reason: format!("skip: max open positions reached ({open}/{cap})"),
                     };
-                    info!(%mint, open, cap, alpha, "{reason}");
-                    return BuyOutcome::Refused { reason: format!("{reason} ({open}/{cap})") };
                 }
                 Some(_) => {}
                 // Fail CLOSED. An unreadable count is not zero, and treating it
                 // as zero turns a limit of 1 into no limit at all at exactly
                 // the moment the chain is being flaky.
                 None => {
-                    warn!(%mint, alpha, "could not count open positions — refusing the buy");
+                    warn!(%mint, "could not count open positions — refusing the buy");
                     return BuyOutcome::Refused {
                         reason: "open position count unavailable".into(),
                     };
@@ -996,8 +992,7 @@ impl Sniper {
             }
         }
 
-        // An Alpha entry brings its own size; otherwise use the configured one.
-        let size = size_override.unwrap_or(live.trade_size_sol);
+        let size = live.trade_size_sol;
         let max_size = live.effective_max_trade_size(&env);
         if size <= 0.0 || (max_size > 0.0 && size > max_size) {
             return BuyOutcome::Refused {
@@ -1129,11 +1124,7 @@ impl Sniper {
         // trade. One extra round trip, and only when a band actually applies.
         let mut size = size;
         let mut quote = quote;
-        // Bands are skipped for an explicit size. Alpha's amount IS the
-        // decision; re-sizing it off a market-cap table would silently
-        // overrule the one number the operator set for this strategy.
-        if size_override.is_none()
-            && !live.buy_tiers.is_empty()
+        if !live.buy_tiers.is_empty()
             && let Ok(q) = &quote
         {
             let tokens_ui = q.out_lamports().unwrap_or(0) as f64 / 10f64.powi(decimals as i32);
@@ -1170,6 +1161,42 @@ impl Sniper {
                 // Reassigned, NOT shadowed: the curve builder below takes
                 // `lamports`, and a local binding here would have left it
                 // building at the default size while `size` said otherwise.
+                lamports = (size * 1e9) as u64;
+                quote = jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await;
+            }
+        }
+
+        // THE ALPHA ADD-ON, applied last.
+        //
+        // Deliberately after the band. The band answers "what is this token
+        // worth risking at this valuation"; Alpha answers "and a wallet with a
+        // measured record is in it, so risk more". Adding first would feed an
+        // inflated number into the market-cap estimate and let conviction
+        // quietly move the token into a different band.
+        //
+        // Everything downstream — the ceiling, affordability, price impact, the
+        // supply share, the daily spend — is then measured against the TOTAL,
+        // because the total is what leaves the wallet.
+        let mut applied_addon = 0.0f64;
+        if alpha_addon > 0.0 {
+            let total = size + alpha_addon;
+            if max_size > 0.0 && total > max_size {
+                // The add-on is the discretionary half, so it is what gives
+                // way: the trade still happens at the size the normal rules
+                // already approved rather than being refused outright.
+                info!(
+                    %mint, size, alpha_addon, max_size,
+                    "alpha add-on would breach the per-trade ceiling — buying the base size"
+                );
+            } else if let Some(reason) = affordable(total) {
+                info!(
+                    %mint, size, alpha_addon, %reason,
+                    "cannot afford the alpha add-on — buying the base size"
+                );
+            } else {
+                info!(%mint, from = size, to = total, alpha_addon, "alpha add-on applied");
+                applied_addon = alpha_addon;
+                size = total;
                 lamports = (size * 1e9) as u64;
                 quote = jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps).await;
             }
@@ -1255,7 +1282,7 @@ impl Sniper {
                             }
                         }
                         return self
-                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now, alpha)
+                            .execute_curve_buy(mint, &owner, size, tokens_ui, reason, plan, now, applied_addon)
                             .await;
                     }
                     Err(e) => {
@@ -1338,7 +1365,7 @@ impl Sniper {
                 info!(%mint, size, tokens_out, would_succeed, %reason,
                       "sniper: DRY RUN SMART BUY (nothing signed)");
                 self.audit_smart_buy(&owner, mint, size, reason,
-                    if would_succeed { "would-succeed" } else { "would-FAIL" }, alpha).await;
+                    if would_succeed { "would-succeed" } else { "would-FAIL" }, applied_addon).await;
                 BuyOutcome::Rehearsed { mint: mint.into(), sol_in: size, tokens_out, would_succeed }
             }
             Mode::Armed(cap) => {
@@ -1349,7 +1376,7 @@ impl Sniper {
                 self.reserve(mint, size, now);
                 let res = self.submitter.send_versioned(&tx_b64, cap.wallet.keypair()).await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(&owner, mint, size, reason, &outcome, alpha).await;
+                self.audit_smart_buy(&owner, mint, size, reason, &outcome, applied_addon).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1370,13 +1397,13 @@ impl Sniper {
         reason: &str,
         plan: crate::execute::ExecutionPlan,
         now: DateTime<Utc>,
-        alpha: bool,
+        alpha_addon: f64,
     ) -> BuyOutcome {
         match &self.mode {
             Mode::DryRun { .. } => {
                 info!(%mint, size, tokens_out, %reason,
                       "sniper: DRY RUN CURVE BUY (nothing signed)");
-                self.audit_smart_buy(owner, mint, size, reason, "would-succeed", alpha).await;
+                self.audit_smart_buy(owner, mint, size, reason, "would-succeed", alpha_addon).await;
                 BuyOutcome::Rehearsed {
                     mint: mint.into(),
                     sol_in: size,
@@ -1393,7 +1420,7 @@ impl Sniper {
                     .send(&plan.instructions, &cap.wallet.pubkey(), cap.wallet.keypair())
                     .await;
                 let (outcome, result) = classify_submission(res);
-                self.audit_smart_buy(owner, mint, size, reason, &outcome, alpha).await;
+                self.audit_smart_buy(owner, mint, size, reason, &outcome, alpha_addon).await;
                 BuyOutcome::Submitted { mint: mint.into(), sol_in: size, tokens_out, result }
             }
         }
@@ -1483,13 +1510,13 @@ impl Sniper {
         sol: f64,
         reason: &str,
         outcome: &str,
-        alpha: bool,
+        alpha_addon: f64,
     ) {
         if self.cfg.audit_log.is_empty() {
             return;
         }
         let armed = matches!(self.mode, Mode::Armed(_));
-        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed, alpha);
+        let record = smart_buy_record(owner, mint, sol, reason, outcome, armed, alpha_addon);
         if let Err(e) = append_line(&self.cfg.audit_log, &record).await {
             warn!(error = %e, "failed to write smart buy audit");
         }
@@ -1574,18 +1601,8 @@ impl Sniper {
         state: &Arc<crate::exits::ExitStateStore>,
         alerter: &crate::alerts::Alerter,
     ) -> (usize, usize) {
-        let live0 = self.settings.snapshot();
-        let rules = live0.exits.clone();
-        // EITHER lane being on is enough to run the sweep.
-        //
-        // Gating the whole sweep on the normal switch made "auto-sell off" also
-        // mean "Alpha exits off", silently and with no screen saying so — an
-        // Alpha position with a stop configured would have sat there
-        // unprotected. The two ladders are separate strategies; the switch that
-        // turns one off must not turn the other off with it.
-        let alpha_on =
-            live0.alpha_enabled && live0.alpha_exits.orders.iter().any(|o| o.is_armed());
-        if (!rules.enabled && !alpha_on) || self.kill_switch_engaged() {
+        let rules = self.settings.snapshot().exits;
+        if !rules.enabled || self.kill_switch_engaged() {
             return (0, 0);
         }
         let Some(owner) = self.owner() else { return (0, 0) };
@@ -1720,35 +1737,10 @@ impl Sniper {
         let breakeven_buffer =
             (self.cfg.sell_slippage_bps as f64 / 10_000.0).clamp(0.01, 0.03);
 
-        // ALPHA positions are planned under the Alpha TP/SL, everything else
-        // under the normal ladder. Two calls over disjoint sets rather than one
-        // rule set with exceptions inside it: `plan_exits` stays a pure
-        // function of (rules, positions), and the normal ladder is not touched
-        // by Alpha existing.
-        let live = self.settings.snapshot();
-        let alpha_mints = if live.alpha_enabled {
-            crate::positions::alpha_mints_from_audit(&audit)
-        } else {
-            std::collections::HashSet::new()
-        };
-        let (alpha_held, normal_held): (Vec<_>, Vec<_>) =
-            holdings.iter().cloned().partition(|h| alpha_mints.contains(&h.mint));
-
-        let (mut sells, mut closed) =
-            crate::exits::plan_exits(&rules, state, &normal_held, breakeven_buffer);
-        if !alpha_held.is_empty() {
-            let mut arules = live.alpha_exit_rules(&rules);
-            // Alpha's own ladder runs on Alpha's own switch. Without this the
-            // inherited `enabled` would come from the normal rules, and
-            // `plan_exits` returns nothing at all when that is off.
-            if alpha_on {
-                arules.enabled = true;
-            }
-            let (a_sells, a_closed) =
-                crate::exits::plan_exits(&arules, state, &alpha_held, breakeven_buffer);
-            sells.extend(a_sells);
-            closed.extend(a_closed);
-        }
+        // ONE ladder for one position. Alpha adds size to a normal entry, so
+        // there is no separate kind of position to route to separate exits.
+        let (sells, closed) =
+            crate::exits::plan_exits(&rules, state, &holdings, breakeven_buffer);
         for mint in closed {
             state.forget(&mint);
         }
@@ -1913,35 +1905,17 @@ impl Sniper {
     }
 
     /// Turn the supply-share ceiling on or off, keeping the tuned percentage.
-    /// Smart-money SOL volume Alpha requires on top of the wallet. 0 = off.
-    pub fn set_alpha_min_smart_sol(&self, v: f64) -> Result<String, String> {
-        if v < 0.0 || v.is_nan() || v.is_infinite() {
-            return Err("volume must be zero or positive".into());
-        }
-        self.settings.update(|s| {
-            s.alpha_min_smart_sol = v;
-            Ok(if v > 0.0 {
-                format!("alpha also needs {v} SOL of smart-money volume")
-            } else {
-                "alpha volume requirement off — the wallet alone triggers it".to_string()
-            })
-        })
-    }
-
     /// Most concurrent positions a lane may hold. 0 = unlimited.
-    pub fn set_max_open_positions(&self, lane: Lane, v: u32) -> Result<String, String> {
+    pub fn set_max_open_positions(&self, v: u32) -> Result<String, String> {
         if v > 50 {
             return Err("that is not a concentration limit".into());
         }
         self.settings.update(|s| {
-            match lane {
-                Lane::Normal => s.max_open_positions = v,
-                Lane::Alpha => s.alpha_max_open_positions = v,
-            }
+            s.max_open_positions = v;
             Ok(if v == 0 {
-                format!("{} open positions unlimited", lane.label())
+                "open positions unlimited".to_string()
             } else {
-                format!("{} limited to {v} open position{}", lane.label(), if v == 1 { "" } else { "s" })
+                format!("limited to {v} open position{}", if v == 1 { "" } else { "s" })
             })
         })
     }
@@ -1952,9 +1926,9 @@ impl Sniper {
             s.alpha_enabled = !s.alpha_enabled;
             Ok(if s.alpha_enabled {
                 if s.alpha_buy_sol > 0.0 {
-                    format!("alpha mode ON — {} SOL per alpha entry", s.alpha_buy_sol)
+                    format!("alpha ON — adds {} SOL when a proven wallet is in", s.alpha_buy_sol)
                 } else {
-                    "alpha mode ON — set a buy amount before it can trade".to_string()
+                    "alpha ON — set an add-on amount for it to do anything".to_string()
                 }
             } else {
                 "alpha mode off".to_string()
@@ -1962,7 +1936,7 @@ impl Sniper {
         })
     }
 
-    /// SOL per Alpha entry. Bounded by the same ceiling as every other buy.
+    /// Extra SOL added when a qualifying Alpha wallet is in the token.
     pub fn set_alpha_buy_sol(&self, v: f64) -> Result<String, String> {
         if v < 0.0 || v.is_nan() || v.is_infinite() {
             return Err("amount must be zero or positive".into());
@@ -1976,9 +1950,9 @@ impl Sniper {
         self.settings.update(|s| {
             s.alpha_buy_sol = v;
             Ok(if v > 0.0 {
-                format!("alpha buy amount set to {v} SOL")
+                format!("alpha adds {v} SOL on top of the normal size")
             } else {
-                "alpha buy amount cleared — alpha cannot trade until it is set".to_string()
+                "alpha add-on cleared — trades use the normal size".to_string()
             })
         })
     }
@@ -2050,26 +2024,19 @@ impl Sniper {
         }
     }
 
-    /// How many positions this lane currently holds open.
+    /// How many positions the bot currently holds open.
     ///
     /// A position is open when the bot bought it AND the wallet still holds
-    /// some. Counted per lane from the audit tag, so an Alpha entry never
-    /// consumes the normal trigger's allowance or the reverse.
+    /// some.
     ///
     /// `None` means the count could not be established. Callers must treat that
     /// as a refusal rather than as zero: reading "no positions" from a failed
     /// query is how a limit of 1 quietly becomes a limit of none at all.
-    pub async fn open_positions(&self, alpha_lane: bool) -> Option<usize> {
+    pub async fn open_positions(&self) -> Option<usize> {
         let owner = self.owner()?.to_string();
         let audit = tokio::fs::read_to_string(&self.cfg.audit_log).await.ok()?;
-        let basis = crate::positions::cost_basis_from_audit(&audit);
-        if basis.is_empty() {
-            return Some(0);
-        }
-        let alpha_mints = crate::positions::alpha_mints_from_audit(&audit);
-        // A mint Alpha opened belongs to the Alpha lane, whatever else also
-        // bought it — the same rule that routes its exits.
-        let mints = crate::positions::mints_in_lane(basis.into_keys(), &alpha_mints, alpha_lane);
+        let mints: Vec<String> =
+            crate::positions::cost_basis_from_audit(&audit).into_keys().collect();
         if mints.is_empty() {
             return Some(0);
         }
@@ -2149,14 +2116,13 @@ impl Sniper {
     ///
     /// A toggle, not a level: the rule is "it went up, it came back to cost,
     /// get out flat", which has nothing to configure.
-    pub fn toggle_breakeven(&self, lane: Lane) -> Result<String, String> {
+    pub fn toggle_breakeven(&self) -> Result<String, String> {
         self.settings.update(|s| {
-            let r = s.rules_mut(lane);
-            r.breakeven = !r.breakeven;
-            Ok(if r.breakeven {
-                format!("{} break-even ON", lane.label())
+            s.exits.breakeven = !s.exits.breakeven;
+            Ok(if s.exits.breakeven {
+                "break-even ON — a position that returns to cost is closed flat".to_string()
             } else {
-                format!("{} break-even off", lane.label())
+                "break-even off".to_string()
             })
         })
     }
@@ -2241,9 +2207,9 @@ impl Sniper {
     }
 
     /// Add an empty order for the operator to configure.
-    pub fn add_order(&self, lane: Lane) -> Result<String, String> {
+    pub fn add_order(&self) -> Result<String, String> {
         self.settings.update(|s| {
-            let r = s.rules_mut(lane);
+            let r = &mut s.exits;
             if r.orders.len() >= crate::exits::MAX_ORDERS {
                 return Err(format!("at most {} orders", crate::exits::MAX_ORDERS));
             }
@@ -2254,9 +2220,9 @@ impl Sniper {
         })
     }
 
-    pub fn remove_order(&self, lane: Lane, idx: usize) -> Result<String, String> {
+    pub fn remove_order(&self, idx: usize) -> Result<String, String> {
         self.settings.update(|s| {
-            let r = s.rules_mut(lane);
+            let r = &mut s.exits;
             if idx >= r.orders.len() {
                 return Err("no such order".into());
             }
@@ -2266,12 +2232,12 @@ impl Sniper {
     }
 
     /// Set an order's trigger, as a percent move from cost. Negative is a stop.
-    pub fn set_order_trigger(&self, lane: Lane, idx: usize, at_pct: i32) -> Result<String, String> {
+    pub fn set_order_trigger(&self, idx: usize, at_pct: i32) -> Result<String, String> {
         if !(-99..=100_000).contains(&at_pct) {
             return Err("trigger must be between -99% and +100000%".into());
         }
         self.settings.update(|s| {
-            let Some(o) = s.rules_mut(lane).orders.get_mut(idx) else {
+            let Some(o) = s.exits.orders.get_mut(idx) else {
                 return Err("no such order".into());
             };
             o.at_pct = at_pct;
@@ -2288,7 +2254,6 @@ impl Sniper {
     /// Set how much of the ORIGINAL position an order sells.
     pub fn set_order_amount(
         &self,
-        lane: Lane,
         idx: usize,
         amount_pct: u8,
     ) -> Result<String, String> {
@@ -2296,11 +2261,11 @@ impl Sniper {
             return Err("amount cannot exceed 100%".into());
         }
         self.settings.update(|s| {
-            let Some(o) = s.rules_mut(lane).orders.get_mut(idx) else {
+            let Some(o) = s.exits.orders.get_mut(idx) else {
                 return Err("no such order".into());
             };
             o.amount_pct = amount_pct;
-            let total = s.rules(lane).target_total_pct();
+            let total = s.exits.target_total_pct();
             Ok(if amount_pct == 0 {
                 format!("order {} off", idx + 1)
             } else if total > 100 {
@@ -2313,16 +2278,16 @@ impl Sniper {
         })
     }
 
-    pub fn set_trailing(&self, lane: Lane, pct: u8) -> Result<String, String> {
+    pub fn set_trailing(&self, pct: u8) -> Result<String, String> {
         if pct >= 100 {
             return Err("a 100% trailing stop would never trigger".into());
         }
         self.settings.update(|s| {
-            s.rules_mut(lane).trailing_pct = pct;
+            s.exits.trailing_pct = pct;
             Ok(if pct == 0 {
-                format!("{} trailing stop off", lane.label())
+                "trailing stop off".to_string()
             } else {
-                format!("{} trailing stop at -{pct}% from peak", lane.label())
+                format!("trailing stop at -{pct}% from peak")
             })
         })
     }

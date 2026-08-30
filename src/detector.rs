@@ -1090,68 +1090,6 @@ impl Detector {
                 }
             }
 
-            // --- ALPHA SMART MONEY MODE. A SECOND, INDEPENDENT TRIGGER.
-            //
-            // Evaluated on its own terms: not nested inside the volume trigger
-            // above, not gated on `auto_buy`, and not suppressed by it having
-            // already fired. Alpha asks "did a wallet with a track record buy
-            // this?" and nothing else, so a token no volume threshold would
-            // ever admit still gets bought when the right wallet steps in — and
-            // a token both agree on is entered by both, which is the point.
-            #[cfg(feature = "sniper")]
-            {
-                let alpha_live = self.sniper.live();
-                if alpha_live.alpha_enabled
-                    // Same cohort filter the volume trigger uses. Performance
-                    // is not the only question: the excluded cohorts are full
-                    // of launch bundlers whose entries sit inside creation
-                    // bundles and cannot be followed at any price, however good
-                    // their measured record looks.
-                    && self.wallets.in_groups(&buy.wallet, &self.cfg.tracked.auto_buy_groups)
-                    && self.alpha_qualified(&buy.wallet)
-                {
-                    // SECOND PIECE OF EVIDENCE, when configured.
-                    //
-                    // Identity says the buyer is good; it does not say this
-                    // entry was a real position rather than a dust-sized look.
-                    // Requiring volume alongside it makes both agree before any
-                    // money moves. Checked AFTER qualification because it is
-                    // the more expensive lookup of the two.
-                    let need = alpha_live.alpha_min_smart_sol;
-                    let ok = if need > 0.0 {
-                        let smart_sol = {
-                            let tracker = match self.conviction.lock() {
-                                Ok(t) => t,
-                                Err(p) => p.into_inner(),
-                            };
-                            tracker.sol_in_window(&buy.mint, Instant::now())
-                        };
-                        if smart_sol < need {
-                            info!(
-                                mint = %buy.mint,
-                                smart_sol,
-                                need,
-                                "skip: alpha smart-money volume below the threshold"
-                            );
-                            false
-                        } else {
-                            info!(
-                                mint = %buy.mint,
-                                smart_sol,
-                                need,
-                                "alpha volume confirmed"
-                            );
-                            true
-                        }
-                    } else {
-                        true
-                    };
-                    if ok {
-                        self.spawn_alpha_buy(&buy.mint, &buy.wallet).await;
-                    }
-                }
-            }
-
             if let Some(signal) = signal {
                 self.metrics.incr(&self.metrics.conviction_signals);
                 // The triggering buy becomes the reference trade for every
@@ -1224,50 +1162,6 @@ impl Detector {
         cache.as_ref().map(|(_, s)| s.contains(wallet)).unwrap_or(false)
     }
 
-    /// Fire an ALPHA buy, once per token, on its own size and exits.
-    #[cfg(feature = "sniper")]
-    async fn spawn_alpha_buy(&self, mint: &str, wallet: &str) {
-        {
-            let mut seen = self.alpha_bought.lock().unwrap_or_else(|p| p.into_inner());
-            if !seen.insert(mint.to_string()) {
-                return;
-            }
-        }
-        // Survives a restart, unlike the set above. See `already_alpha_holding`.
-        if self.sniper.already_alpha_holding(mint).await {
-            info!(%mint, "alpha already holds this token — not opening a second position");
-            return;
-        }
-        let label = self
-            .wallets
-            .get(wallet)
-            .map(|w| w.name.clone())
-            .unwrap_or_else(|| crate::wallets::short_address(wallet));
-        let reason = format!("alpha wallet {label}");
-        info!(%mint, %wallet, %label, "alpha buy triggered");
-
-        let outcome = self.sniper.alpha_buy(mint, &reason).await;
-        info!(%mint, ?outcome, "alpha buy");
-
-        // Released on failure so a retry is possible. Holding the mint after a
-        // refusal would mean one transient rejection — a momentary low balance,
-        // a rate limit — permanently excluded that token from Alpha.
-        if !matches!(
-            outcome,
-            crate::sniper::BuyOutcome::Submitted {
-                result: crate::sniper::SubmitOutcome::Executed { .. },
-                ..
-            }
-        ) {
-            let mut seen = self.alpha_bought.lock().unwrap_or_else(|p| p.into_inner());
-            seen.remove(mint);
-        }
-
-        if let Some(msg) = crate::alerts::render_alpha_buy(mint, &label, &outcome) {
-            self.alerter.send_html(msg).await;
-        }
-    }
-
     /// Fire a smart-money buy, once per token, and tell the group either way.
     ///
     /// Deduped by mint for the process lifetime: a signal keeps accumulating
@@ -1292,8 +1186,42 @@ impl Detector {
             info!(%mint, "already holding — not opening a second position");
             return;
         }
-        let reason = format!("{wallets} tracked wallets in window");
-        let outcome = self.sniper.buy_mint(mint, &reason).await;
+        // IS A QUALIFYING ALPHA WALLET IN THIS TOKEN?
+        //
+        // Asked here, on a trade the normal trigger has already approved.
+        // Alpha never reaches this point on its own — it only decides whether
+        // an already-valid entry is worth extra size.
+        let alpha_wallet = {
+            let buyers = {
+                let tracker = match self.conviction.lock() {
+                    Ok(t) => t,
+                    Err(p) => p.into_inner(),
+                };
+                tracker.buyers_in_window(mint, Instant::now())
+            };
+            buyers.into_iter().find(|w| {
+                self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
+                    && self.alpha_qualified(w)
+            })
+        };
+
+        let reason = match &alpha_wallet {
+            Some(w) => {
+                let label = self
+                    .wallets
+                    .get(w)
+                    .map(|x| x.name.clone())
+                    .unwrap_or_else(|| crate::wallets::short_address(w));
+                info!(%mint, wallet = %w, %label, "alpha wallet in this token — adding size");
+                format!("{wallets} tracked wallets in window · alpha {label}")
+            }
+            None => format!("{wallets} tracked wallets in window"),
+        };
+        let outcome = if alpha_wallet.is_some() {
+            self.sniper.buy_mint_with_alpha(mint, &reason).await
+        } else {
+            self.sniper.buy_mint(mint, &reason).await
+        };
         info!(%mint, wallets, ?outcome, "smart-money buy");
 
         // A REFUSAL IS NOT A POSITION.

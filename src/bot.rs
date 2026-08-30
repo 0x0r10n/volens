@@ -752,35 +752,19 @@ impl Bot {
         if data == "set:alpha" {
             return Some(self.alpha_screen());
         }
-        // Order screens for BOTH ladders. The `a` prefix selects Alpha; the
-        // bare form is the normal one.
         #[cfg(feature = "sniper")]
         if data == "set:ladder" {
-            return Some(self.ladder_screen(crate::sniper::Lane::Normal));
-        }
-        #[cfg(feature = "sniper")]
-        if data == "set:aladder" {
-            return Some(self.ladder_screen(crate::sniper::Lane::Alpha));
-        }
-        #[cfg(feature = "sniper")]
-        if let Some(n) = data.strip_prefix("set:aorder") {
-            if let Ok(i) = n.parse::<usize>() {
-                return Some(self.order_screen(crate::sniper::Lane::Alpha, i));
-            }
+            return Some(self.ladder_screen());
         }
         #[cfg(feature = "sniper")]
         if let Some(n) = data.strip_prefix("set:order") {
             if let Ok(i) = n.parse::<usize>() {
-                return Some(self.order_screen(crate::sniper::Lane::Normal, i));
+                return Some(self.order_screen(i));
             }
         }
         #[cfg(feature = "sniper")]
         if data == "set:trailing" {
             return Some(self.stop_screen("trailing"));
-        }
-        #[cfg(feature = "sniper")]
-        if data == "set:atrailing" {
-            return Some(self.stop_screen("atrailing"));
         }
         #[cfg(feature = "sniper")]
         if let Some(field) = data.strip_prefix("set:") {
@@ -1806,10 +1790,8 @@ impl Bot {
             "smartsol" => ("smart-money volume", "e.g. <code>2</code> (SOL), 0 = off"),
             "tokenvol" => ("token volume", "e.g. <code>15</code> (SOL), 0 = off"),
             "maxsupply" => ("max share of supply", "e.g. <code>2</code> (percent), 0 = no limit"),
-            "alphabuy" => ("alpha buy amount", "e.g. <code>0.05</code> (SOL)"),
+            "alphabuy" => ("alpha add-on amount", "e.g. <code>0.05</code> (SOL)"),
             "maxopen" => ("max open positions", "e.g. <code>2</code>, 0 = unlimited"),
-            "alphamaxopen" => ("alpha max open positions", "e.g. <code>2</code>, 0 = unlimited"),
-            "alphasmartsol" => ("alpha smart volume", "e.g. <code>5</code> (SOL), 0 = off"),
             "addtier" => (
                 "market-cap band",
                 "Send three values: <b>min max size</b>\n\n<code>50k 100k 0.2</code>   $50K–$100K buys 0.2 SOL\n<code>1m 2m 0.75</code>   $1M–$2M buys 0.75 SOL\n<code>2m 0 1.0</code>   $2M and above buys 1 SOL\n\nUse <b>0</b> as the max for “and above”.",
@@ -1819,11 +1801,11 @@ impl Bot {
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
             "maxmcap" => ("max market cap", "e.g. <code>75000</code> (USD)"),
             "maximpact" => ("max price impact", "e.g. <code>400</code> (bps)"),
-            f if f.starts_with("ordt") || f.starts_with("aordt") => (
+            f if f.starts_with("ordt") => (
                 "trigger",
                 "e.g. <code>150</code> for a +150% target, or <code>-30</code> for a stop",
             ),
-            f if f.starts_with("orda") || f.starts_with("aorda") => {
+            f if f.starts_with("orda") => {
                 ("amount", "e.g. <code>35</code> (% of the original position)")
             }
             "wd_amount" => ("amount to withdraw", "e.g. <code>0.25</code> (SOL)"),
@@ -2074,7 +2056,6 @@ impl Bot {
     /// "More targets"; nothing is lost, it is just no longer the default view.
     #[cfg(feature = "sniper")]
     fn exits_screen(&self) -> (String, serde_json::Value) {
-        use crate::sniper::Lane;
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
@@ -2120,11 +2101,10 @@ impl Bot {
               "callback_data": "setv:breakeven_on:toggle"}],
             [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
-        let _ = Lane::Normal;
         (text, rows)
     }
 
-    /// ALPHA SMART MONEY MODE.
+    /// ALPHA — a conviction layer on the normal trigger, not a strategy.
     #[cfg(feature = "sniper")]
     fn alpha_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
@@ -2134,38 +2114,20 @@ impl Bot {
         let onoff = if live.alpha_enabled { "🟢 On" } else { "⚪ Off" };
         let amt_s = format!("{} SOL", live.alpha_buy_sol);
 
-        let open_s = if live.alpha_max_open_positions == 0 {
-            "unlimited".to_string()
-        } else {
-            live.alpha_max_open_positions.to_string()
-        };
-        let vol_s = if live.alpha_min_smart_sol > 0.0 {
-            format!("{} SOL", live.alpha_min_smart_sol)
-        } else {
-            "off".to_string()
-        };
         let mut text = format!(
             "⭐ <b>Alpha</b> · {onoff}\n\n\
-             Buy amount    <b>{amt_s}</b>\n\
-             Smart volume  <b>{vol_s}</b>\n\
-             Max open      <b>{open_s}</b>\n\
-             Orders        <b>{}</b>",
-            crate::exits::describe_orders(&live.alpha_exits)
+             Add-on  <b>{amt_s}</b>\n\n\
+             <i>When a proven wallet is in a token auto-buy already wants, \
+             this much is added on top. It never opens a trade on its own.</i>"
         );
         if live.alpha_enabled && live.alpha_buy_sol <= 0.0 {
-            text.push_str("\n\n⚠️ Set a buy amount.");
-        }
-        if live.alpha_enabled && !live.alpha_exits.orders.iter().any(|o| o.is_armed()) {
-            text.push_str("\n\n⚠️ No orders — Alpha uses the auto-sell ladder until you add one.");
+            text.push_str("\n\n⚠️ Add-on is 0 — trades use the normal size.");
         }
 
         let rows = serde_json::json!({ "inline_keyboard": [
             [{"text": format!("Alpha · {onoff}"), "callback_data": "setv:alpha_on:toggle"}],
-            [{"text": format!("💰 Buy · {amt_s}"), "callback_data": "set:alphabuy"},
-             {"text": "📋 Orders", "callback_data": "set:aladder"}],
-            [{"text": format!("💸 Smart volume · {vol_s}"), "callback_data": "set:alphasmartsol"},
-             {"text": format!("📌 Max open · {open_s}"), "callback_data": "set:alphamaxopen"}],
-            [{"text": "◀️ Back", "callback_data": "cmd:settings"}],
+            [{"text": format!("💰 Add-on · {amt_s}"), "callback_data": "set:alphabuy"},
+             {"text": "◀️ Back", "callback_data": "cmd:settings"}],
         ]});
         (text, rows)
     }
@@ -2176,14 +2138,11 @@ impl Bot {
     /// separate strategies but identical controls, and two copies of a screen
     /// this fiddly would drift.
     #[cfg(feature = "sniper")]
-    fn ladder_screen(&self, lane: crate::sniper::Lane) -> (String, serde_json::Value) {
-        use crate::sniper::Lane;
+    fn ladder_screen(&self) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let live = sniper.live();
-        let e = live.rules(lane).clone();
-        let tag = lane.tag();
+        let e = sniper.live().exits;
 
         // Sorted the way they fire: stops first, then targets low to high.
         let mut shown: Vec<(usize, crate::exits::SellOrder)> =
@@ -2204,7 +2163,7 @@ impl Bot {
             body.push_str("none\n");
         }
 
-        let mut text = format!("📋 <b>{} orders</b>\n\n<code>{body}</code>", lane.label());
+        let mut text = format!("📋 <b>Orders</b>\n\n<code>{body}</code>");
         text.push_str(&format!("\nTargets total <b>{total}%</b>"));
         if total > 100 {
             text.push_str("  ⚠️ over 100%");
@@ -2220,42 +2179,33 @@ impl Bot {
                 format!("🎯 +{}% → {}%", o.at_pct, o.amount_pct)
             };
             rows.push(serde_json::json!([
-                {"text": label, "callback_data": format!("set:{tag}order{i}")},
-                {"text": "✕", "callback_data": format!("setv:{tag}delorder:{i}")},
+                {"text": label, "callback_data": format!("set:order{i}")},
+                {"text": "✕", "callback_data": format!("setv:delorder:{i}")},
             ]));
         }
         if e.orders.len() < crate::exits::MAX_ORDERS {
             rows.push(serde_json::json!([
-                {"text": "➕ Add order", "callback_data": format!("setv:{tag}addorder:1")}
+                {"text": "➕ Add order", "callback_data": "setv:addorder:1"}
             ]));
         }
-        // Trailing and break-even belong to the strategy, so each lane carries
-        // its own rather than Alpha silently inheriting the normal one.
         let tr = if e.trailing_pct > 0 { format!("−{}%", e.trailing_pct) } else { "off".into() };
         let be = if e.breakeven { "on" } else { "off" };
         rows.push(serde_json::json!([
-            {"text": format!("📉 Trailing · {tr}"), "callback_data": format!("set:{tag}trailing")},
-            {"text": format!("🔒 Break-even · {be}"),
-             "callback_data": format!("setv:{tag}breakeven_on:toggle")},
+            {"text": format!("📉 Trailing · {tr}"), "callback_data": "set:trailing"},
+            {"text": format!("🔒 Break-even · {be}"), "callback_data": "setv:breakeven_on:toggle"},
         ]));
-        let back = match lane {
-            Lane::Normal => "set:exits".to_string(),
-            Lane::Alpha => "set:alpha".to_string(),
-        };
-        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": back}]));
+        rows.push(serde_json::json!([{"text": "◀️ Back", "callback_data": "set:exits"}]));
         (text, serde_json::json!({ "inline_keyboard": rows }))
     }
 
     #[cfg(feature = "sniper")]
-    fn order_screen(&self, lane: crate::sniper::Lane, idx: usize) -> (String, serde_json::Value) {
+    fn order_screen(&self, idx: usize) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let live = sniper.live();
-        let orders = live.rules(lane).orders.clone();
-        let tag = lane.tag();
+        let orders = sniper.live().exits.orders;
         let Some(o) = orders.get(idx).copied() else {
-            return self.ladder_screen(lane);
+            return self.ladder_screen();
         };
         // Named by what it IS, not by its index. "Order 3" told you nothing
         // about whether you were editing protection or profit-taking.
@@ -2287,7 +2237,7 @@ impl Bot {
                 .map(|t| serde_json::json!({
                     "text": format!("{}{}{}%", if *t == o.at_pct { "✓ " } else { "" },
                                     if *t > 0 { "+" } else { "" }, t),
-                    "callback_data": format!("setv:{tag}ordt{idx}:{t}"),
+                    "callback_data": format!("setv:ordt{idx}:{t}"),
                 }))
                 .collect()
         };
@@ -2295,10 +2245,10 @@ impl Bot {
             .iter()
             .map(|a| serde_json::json!({
                 "text": format!("{}{}%", if *a == o.amount_pct { "✓ " } else { "" }, a),
-                "callback_data": format!("setv:{tag}orda{idx}:{a}"),
+                "callback_data": format!("setv:orda{idx}:{a}"),
             }))
             .collect();
-        let noop = format!("set:{tag}order{idx}");
+        let noop = format!("set:order{idx}");
         let kb = serde_json::json!({"inline_keyboard": [
             [{"text": "🛑 — stop below cost —", "callback_data": noop}],
             row(&[-50, -35, -25, -15]),
@@ -2308,40 +2258,36 @@ impl Bot {
             [{"text": "— how much to sell —", "callback_data": noop}],
             amts[..3].to_vec(),
             amts[3..].to_vec(),
-            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:{tag}ordt{idx}")},
-             {"text": "✏️ Custom amount", "callback_data": format!("ask:{tag}orda{idx}")}],
-            [{"text": "✕ Remove", "callback_data": format!("setv:{tag}delorder:{idx}")},
-             {"text": "◀️ Back", "callback_data": format!("set:{tag}ladder")}],
+            [{"text": "✏️ Custom trigger", "callback_data": format!("ask:ordt{idx}")},
+             {"text": "✏️ Custom amount", "callback_data": format!("ask:orda{idx}")}],
+            [{"text": "✕ Remove", "callback_data": format!("setv:delorder:{idx}")},
+             {"text": "◀️ Back", "callback_data": "set:ladder"}],
         ]});
         (text, kb)
     }
 
     /// Editor for the trailing stop.
     #[cfg(feature = "sniper")]
-    fn stop_screen(&self, which: &str) -> (String, serde_json::Value) {
-        use crate::sniper::Lane;
+    fn stop_screen(&self, _which: &str) -> (String, serde_json::Value) {
         let Some(sniper) = &self.sniper else {
             return ("⚪ <b>Sniper not configured</b>".to_string(), back_to_settings());
         };
-        let lane = if which.starts_with('a') { Lane::Alpha } else { Lane::Normal };
-        let tag = lane.tag();
-        let cur = sniper.live().rules(lane).trailing_pct;
+        let cur = sniper.live().exits.trailing_pct;
         let text = format!(
-            "📉 <b>{} trailing stop</b>\n\nCurrent <b>{}</b>",
-            lane.label(),
+            "📉 <b>Trailing stop</b>\n\nCurrent <b>{}</b>",
             if cur > 0 { format!("−{cur}%") } else { "off".into() }
         );
         let opts: Vec<serde_json::Value> = [20u8, 30, 40, 50, 60, 75]
             .iter()
             .map(|p| serde_json::json!({
                 "text": format!("{}−{}%", if *p == cur { "✓ " } else { "" }, p),
-                "callback_data": format!("setv:{tag}trail:{p}"),
+                "callback_data": format!("setv:trail:{p}"),
             }))
             .collect();
         let kb = serde_json::json!({"inline_keyboard": [
             opts[..3].to_vec(), opts[3..].to_vec(),
-            [{"text": "🚫 Off", "callback_data": format!("setv:{tag}trail:0")}],
-            [{"text": "◀️ Back", "callback_data": format!("set:{tag}ladder")}],
+            [{"text": "🚫 Off", "callback_data": "setv:trail:0"}],
+            [{"text": "◀️ Back", "callback_data": "set:ladder"}],
         ]});
         (text, kb)
     }
@@ -2349,7 +2295,6 @@ impl Bot {
     /// Apply an auto-sell change. Returns None if `field` is not one of ours.
     #[cfg(feature = "sniper")]
     fn apply_exit_setting(&self, field: &str, value: &str) -> Option<(String, serde_json::Value)> {
-        use crate::sniper::Lane as L;
         let sniper = self.sniper.as_ref()?;
         let (res, screen): (Result<String, String>, String) = match field {
             "exits_on" => (sniper.toggle_exits(), "exits".into()),
@@ -2358,46 +2303,28 @@ impl Bot {
             "supplycap_on" => (sniper.toggle_supply_cap(), "supplycap".into()),
             "cleartiers" => (sniper.clear_buy_tiers(), "tiers".into()),
             "deltier" => (sniper.remove_buy_tier(value.parse().ok()?), "tiers".into()),
-            "breakeven_on" => (sniper.toggle_breakeven(L::Normal), "ladder".into()),
-            "abreakeven_on" => (sniper.toggle_breakeven(L::Alpha), "aladder".into()),
+            "breakeven_on" => (sniper.toggle_breakeven(), "ladder".into()),
             "alpha_on" => (sniper.toggle_alpha(), "alpha".into()),
-            "trail" => (sniper.set_trailing(L::Normal, value.parse().ok()?), "trailing".into()),
-            "atrail" => (sniper.set_trailing(L::Alpha, value.parse().ok()?), "atrailing".into()),
-            "addorder" => (sniper.add_order(L::Normal), "ladder".into()),
-            "aaddorder" => (sniper.add_order(L::Alpha), "aladder".into()),
-            "delorder" => (sniper.remove_order(L::Normal, value.parse().ok()?), "ladder".into()),
-            "adelorder" => (sniper.remove_order(L::Alpha, value.parse().ok()?), "aladder".into()),
-            f if f.starts_with("aordt") => {
-                let i: usize = f[5..].parse().ok()?;
-                (sniper.set_order_trigger(L::Alpha, i, value.parse().ok()?), format!("aorder{i}"))
-            }
-            f if f.starts_with("aorda") => {
-                let i: usize = f[5..].parse().ok()?;
-                (sniper.set_order_amount(L::Alpha, i, value.parse().ok()?), format!("aorder{i}"))
-            }
+            "trail" => (sniper.set_trailing(value.parse().ok()?), "trailing".into()),
+            "addorder" => (sniper.add_order(), "ladder".into()),
+            "delorder" => (sniper.remove_order(value.parse().ok()?), "ladder".into()),
             f if f.starts_with("ordt") => {
                 let i: usize = f[4..].parse().ok()?;
-                (sniper.set_order_trigger(L::Normal, i, value.parse().ok()?), format!("order{i}"))
+                (sniper.set_order_trigger(i, value.parse().ok()?), format!("order{i}"))
             }
             f if f.starts_with("orda") => {
                 let i: usize = f[4..].parse().ok()?;
-                (sniper.set_order_amount(L::Normal, i, value.parse().ok()?), format!("order{i}"))
+                (sniper.set_order_amount(i, value.parse().ok()?), format!("order{i}"))
             }
             _ => return None,
         };
         info!(field, value, ok = res.is_ok(), "auto-sell setting changed from telegram");
-        let (text, kb) = if let Some(n) = screen.strip_prefix("aorder") {
-            self.order_screen(L::Alpha, n.parse().unwrap_or(0))
-        } else if let Some(n) = screen.strip_prefix("order") {
-            self.order_screen(L::Normal, n.parse().unwrap_or(0))
+        let (text, kb) = if let Some(n) = screen.strip_prefix("order") {
+            self.order_screen(n.parse().unwrap_or(0))
         } else if screen == "ladder" {
-            self.ladder_screen(L::Normal)
-        } else if screen == "aladder" {
-            self.ladder_screen(L::Alpha)
+            self.ladder_screen()
         } else if screen == "trailing" {
             self.stop_screen("trailing")
-        } else if screen == "atrailing" {
-            self.stop_screen("atrailing")
         } else if screen == "autobuy" {
             self.autobuy_screen()
         } else if screen == "volume" {
@@ -2482,18 +2409,8 @@ impl Bot {
                     if live.max_open_positions == 0 { "unlimited".to_string() }
                     else { live.max_open_positions.to_string() },
                     vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
-                "alphasmartsol" => ("⭐ Alpha smart volume",
-                    "SOL the tracked cohort must have put in before Alpha buys. 0 = wallet alone.",
-                    if live.alpha_min_smart_sol <= 0.0 { "off".to_string() }
-                    else { format!("{} SOL", live.alpha_min_smart_sol) },
-                    vec![0.0, 1.0, 2.0, 5.0, 10.0, 20.0], " SOL", false),
-                "alphamaxopen" => ("⭐ Alpha max open",
-                    "Most positions Alpha may hold at once. 0 = unlimited.",
-                    if live.alpha_max_open_positions == 0 { "unlimited".to_string() }
-                    else { live.alpha_max_open_positions.to_string() },
-                    vec![1.0, 2.0, 3.0, 5.0, 10.0, 0.0], "", false),
-                "alphabuy" => ("⭐ Alpha buy amount",
-                    "SOL per Alpha entry.",
+                "alphabuy" => ("⭐ Alpha add-on",
+                    "Extra SOL added when a proven wallet is in the token.",
                     format!("{} SOL", live.alpha_buy_sol),
                     vec![0.01, 0.02, 0.05, 0.1, 0.25, 0.5], " SOL", false),
                 "smartsol" => ("💸 Smart-money volume",
@@ -2619,9 +2536,7 @@ impl Bot {
             "tokenvol" => sniper.set_min_token_volume(v),
             "maxsupply" => sniper.set_max_supply_pct(v),
             "alphabuy" => sniper.set_alpha_buy_sol(v),
-            "maxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Normal, v as u32),
-            "alphamaxopen" => sniper.set_max_open_positions(crate::sniper::Lane::Alpha, v as u32),
-            "alphasmartsol" => sniper.set_alpha_min_smart_sol(v),
+            "maxopen" => sniper.set_max_open_positions(v as u32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
@@ -3915,8 +3830,8 @@ mod tests {
         // order that can never fire becomes possible again.
         let orders = sn2.live().exits.orders;
         let first_target = orders.iter().position(|o| o.is_armed() && !o.is_stop()).unwrap();
-        sn2.set_order_amount(crate::sniper::Lane::Normal, first_target, 100).unwrap();
-        let (lt, _) = b.ladder_screen(crate::sniper::Lane::Normal);
+        sn2.set_order_amount(first_target, 100).unwrap();
+        let (lt, _) = b.ladder_screen();
         assert!(
             lt.contains("Targets total"),
             "the ladder must show the running total:\n{lt}"
@@ -3961,14 +3876,14 @@ mod tests {
         let exits = b.exits_screen().1.to_string();
         assert!(exits.contains("setv:exits_on:toggle"), "no on/off");
         assert!(exits.contains("set:trailing"), "no trailing stop");
-        let ladder = b.ladder_screen(crate::sniper::Lane::Normal).1.to_string();
+        let ladder = b.ladder_screen().1.to_string();
         assert!(ladder.contains("setv:addorder:"), "cannot add an order");
         assert!(ladder.contains("setv:delorder:"), "cannot remove an order");
         let exits = ladder;
         // Every default order opens an editor with presets and a typed option.
         for i in 0..5 {
             assert!(exits.contains(&format!("set:order{i}")), "order {i} not tappable");
-            let ord = b.order_screen(crate::sniper::Lane::Normal, i).1.to_string();
+            let ord = b.order_screen(i).1.to_string();
             assert!(ord.contains(&format!("setv:ordt{i}:")), "order {i} has no trigger presets");
             assert!(ord.contains(&format!("setv:orda{i}:")), "order {i} has no amount presets");
             assert!(ord.contains(&format!("ask:ordt{i}")), "order {i} has no custom trigger");

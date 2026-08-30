@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn the_reader_understands_what_the_writer_actually_writes() {
         let rec = crate::sniper::smart_buy_record(
-            "OWNER", "MINT_A", 0.05, "4 tracked wallets in window", "confirmed:sig", true, false,
+            "OWNER", "MINT_A", 0.05, "4 tracked wallets in window", "confirmed:sig", true, 0.0,
         );
         let basis = cost_basis_from_audit(&rec.to_string());
         let a = basis
@@ -261,7 +261,7 @@ mod tests {
 
         // …and a rehearsal from the same writer must NOT become a position.
         let dry = crate::sniper::smart_buy_record(
-            "OWNER", "MINT_A", 0.05, "r", "would-succeed", false, false,
+            "OWNER", "MINT_A", 0.05, "r", "would-succeed", false, 0.0,
         );
         assert!(cost_basis_from_audit(&dry.to_string()).is_empty());
     }
@@ -404,7 +404,7 @@ mod tests {
         let log = format!(
             "{}\n{}",
             crate::sniper::smart_buy_record(
-                "O", "MINT_A", 0.05, "r", "confirmed:s1", true, false
+                "O", "MINT_A", 0.05, "r", "confirmed:s1", true, 0.0
             ),
             alpha_line("MINT_A", "armed", "confirmed:s2")
         );
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn a_normal_buy_is_not_an_alpha_position() {
         let log = crate::sniper::smart_buy_record(
-            "O", "MINT_A", 0.05, "r", "confirmed:s", true, false,
+            "O", "MINT_A", 0.05, "r", "confirmed:s", true, 0.0,
         )
         .to_string();
         assert!(alpha_mints_from_audit(&log).is_empty());
