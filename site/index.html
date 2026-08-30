@@ -408,7 +408,10 @@
       <span class="btn">💰 Buying · 0.08 SOL</span>
       <span class="btn">🎚 Selling · −25% / +100%</span>
     </div>
-    <div class="btnrow"><span class="btn acc">⭐ Alpha · on · 0.05 SOL</span></div>
+    <div class="btnrow">
+      <span class="btn acc">⭐ Alpha · on · 0.02 SOL</span>
+      <span class="btn">🔄 Rebound · off</span>
+    </div>
     <div class="btnrow">
       <span class="btn">🔎 Filters · off</span>
       <span class="btn">🛡 Limits · 10/day</span>
@@ -422,14 +425,15 @@
         <tr><td><strong>🤖 Auto-buy</strong></td><td>The master switch, and the SOL threshold that triggers an entry.</td></tr>
         <tr><td><strong>💰 Buying</strong></td><td>Trade size, slippage, max market cap, market-cap bands, supply cap.</td></tr>
         <tr><td><strong>🎚 Selling</strong></td><td>The exit order table, break-even, trailing stop.</td></tr>
-        <tr><td><strong>⭐ Alpha</strong></td><td>The second buy trigger, its buy amount, and its own order table.</td></tr>
+        <tr><td><strong>⭐ Alpha</strong></td><td>On/off and the add-on amount. Adds size to trades auto-buy already made.</td></tr>
+        <tr><td><strong>🔄 Rebound</strong></td><td>Its own trigger, size, exits and limit — for tokens that trade again later.</td></tr>
         <tr><td><strong>🔎 Filters</strong></td><td>Volume confirmation, pool liquidity, curve floor.</td></tr>
-        <tr><td><strong>🛡 Limits</strong></td><td>Trades per day.</td></tr>
+        <tr><td><strong>🛡 Limits</strong></td><td>Trades per day, and how many positions may be open at once.</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>Auto-buy and Alpha each sit alone because they are the two switches that decide whether any of the rest matters. They are independent — either, both, or neither.</p>
+  <p>Auto-buy sits alone because it is the switch that decides whether any of the rest matters. Alpha changes the <em class="term">size</em> of what auto-buy does; Rebound is the one genuinely separate strategy.</p>
 </section>
 
 <hr class="div">
@@ -536,65 +540,112 @@ Targets total <span class="c-acc">80%</span>
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">06</span>Alpha smart money</h2>
-  <p class="lede">A second buy trigger that asks a different question: not <em class="term">how much</em> smart money bought, but <em class="term">whose</em>.</p>
+  <h2><span class="num">06</span>Alpha — size, not signal</h2>
+  <p class="lede">Alpha does not find trades. It decides that a trade auto-buy already wants is worth more money.</p>
 
-  <p>Normal auto-buy fires on aggregate volume — enough tracked SOL went into one token. It does not care which wallets moved it. Alpha scores the tracked wallets on how their past calls actually performed, promotes the ones that clear a bar, and buys when one of <strong>those</strong> wallets buys, whatever the volume did.</p>
+  <p>The bot scores every tracked wallet on how its past calls actually performed. When auto-buy fires on a token, Alpha asks one question: <strong>is a wallet with a proven record among the buyers?</strong> If so, it adds a fixed amount on top of the size already chosen. If not, the trade executes at the normal size.</p>
 
   <div class="screen">
     <div class="title">⭐ Alpha · 🟢 On</div>
     <div class="console" style="margin:0 0 12px">
-Buy amount  <span class="c-acc">0.05 SOL</span>
-Orders      <span class="c-go">-15% / +250%</span>
+Add-on  <span class="c-acc">0.02 SOL</span>
     </div>
     <div class="btnrow"><span class="btn on">Alpha · 🟢 On</span></div>
     <div class="btnrow">
-      <span class="btn">💰 Buy · 0.05 SOL</span>
-      <span class="btn">📋 Orders</span>
+      <span class="btn">💰 Add-on · 0.02 SOL</span>
+      <span class="btn">◀️ Back</span>
     </div>
   </div>
 
-  <h3>It is genuinely separate</h3>
-  <ul class="plain">
-    <li><strong>Its own buy amount.</strong> Not the normal trade size, and the market-cap bands never resize it — the amount you set is the amount it spends.</li>
-    <li><strong>Its own order table.</strong> Same controls as the normal one, entirely separate storage. Changing one never touches the other.</li>
-    <li><strong>Independent of auto-buy.</strong> Run either, both, or neither. Both can fire on the same token — that is the strongest case, not a bug.</li>
-    <li><strong>Same safety vetoes.</strong> Every guard that runs before a normal buy runs before an Alpha buy, on the same code path.</li>
-  </ul>
+  <p>Two controls, and that is the whole mode. There is no separate trigger, no separate exits and no separate position limit — because there is no separate position. One entry, one ladder, one set of limits.</p>
 
-  <h3>Which wallets qualify</h3>
-  <p>Scored from the call history you can already see — which tracked wallets bought each announced token, and the peak that token reached. Nothing new is recorded, so a wallet's score can always be reconciled against the leaderboard.</p>
+  <div class="note">
+    <span class="h">Order matters</span>
+    <p>The add-on is applied <strong>after</strong> the market-cap band picks the base size. Adding first would inflate the valuation estimate and let conviction quietly move a token into a different band. Every limit afterwards — ceiling, affordability, price impact, supply share, daily cap, max open — measures the <strong>combined total</strong>, because that is what leaves the wallet.</p>
+  </div>
+
+  <p>If the add-on would breach the per-trade ceiling, or you cannot afford it, <strong>the trade still executes at the base size</strong>. The add-on is the discretionary half, so it is what gives way — refusing a trade the normal rules already approved because of an optional extra would be the wrong way round.</p>
+
+  <h3>Which wallets count</h3>
+  <p>Scored from the call history you can already see: which tracked wallets bought each announced token, and the peak that token reached. Nothing extra is recorded, so any score can be reconciled against the leaderboard.</p>
 
   <div class="tablewrap">
     <table>
       <thead><tr><th>Rule</th><th>Default</th></tr></thead>
       <tbody>
-        <tr><td>Resolved calls needed</td><td>8</td></tr>
-        <tr><td>Share of them reaching 2×</td><td>35%</td></tr>
+        <tr><td>Resolved calls needed</td><td>20</td></tr>
+        <tr><td>Share of them reaching 2×</td><td>51%</td></tr>
+        <tr><td>Median call must reach</td><td>1.5×</td></tr>
         <tr><td>Must have bought within</td><td>72 hours</td></tr>
-        <tr><td>Looking back over</td><td>7 days</td></tr>
-        <tr><td>A call counts as resolved after</td><td>1 hour</td></tr>
+        <tr><td>Looking back over</td><td>30 days</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>That last row matters more than it looks. A token called ten minutes ago has not had time to go anywhere, and counting it as a miss would penalise the busiest wallets hardest — exactly backwards. Fresh calls prove a wallet is <em class="term">active</em>; only matured ones count toward its <em class="term">record</em>.</p>
+  <p>Three of those rules exist because of things that went wrong. <strong>Hit rate alone promoted a wallet whose median call did 1.00×</strong> — half its picks went nowhere, and it cleared the bar anyway. <strong>A bar of 35% admitted half the book</strong>, because a wallet's rate is only ever measured on tokens that got called, and the median wallet already scores ~33% there. And <strong>a call nobody managed to price is not a miss</strong> — two thirds of calls were never re-priced at all, so counting them measured the pricing sweep rather than the wallet.</p>
 
-  <p>These live in the host config, not Telegram. Which wallets get trusted with money is a decision to make deliberately, not a slider to nudge between trades. On the current book, <strong>68 of 1,117 tracked wallets qualify</strong>.</p>
+  <p>Scoring is continuous. Resolved calls are archived when the tracker retires them, so a wallet's record accumulates over 30 days rather than being rebuilt from whatever is still being tracked. The wallets are re-ranked daily.</p>
 
-  <div class="note">
-    <span class="h">Set a buy amount, or nothing happens</span>
-    <p>Alpha switched on with the amount left at zero looks armed and does nothing. If its order table is also empty, Alpha positions fall back to the normal auto-sell ladder — the screen says so rather than leaving a position with no exits at all.</p>
-  </div>
-
-  <h3>When both trigger on one token</h3>
-  <p>There is still one position on chain, with one balance. Both buys count toward its cost basis, and <strong>Alpha's orders govern the exit</strong> — it is the more specific thesis, and letting the general rules take over would mean the Alpha settings did nothing on precisely the signals the mode exists to catch.</p>
+  <p>These thresholds live in the host config, not Telegram. Which wallets get trusted with money is a decision to make deliberately, not a slider to move between trades.</p>
 </section>
 
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">07</span>Sizing by market cap</h2>
+  <h2><span class="num">07</span>Rebound — the tokens that come back</h2>
+  <p class="lede">Every token smart money touches is watched for days afterwards. Some of them start trading again.</p>
+
+  <p>The other two modes fire while tracked wallets are buying. Rebound watches what happens next. A token enters the watchlist automatically the moment tracked money touches it, and stays there for a configurable window — 72 hours by default. Nothing is bought on entry: the watchlist is a list, not a position.</p>
+
+  <p>If the token goes quiet and then <strong>starts trading again on fresh volume from anyone at all</strong>, you get an alert. If a buy amount is configured, it is also bought — once.</p>
+
+  <div class="console">
+<span class="c-acc">🔄 TRADING AGAIN</span> · PEPE · <span class="c-dim">7TGAy4G9…pump</span>
+14.2 SOL in the last few minutes  ·  watched 31h
+87% below where smart money bought
+  </div>
+  <p>That last line is the point. "A token is trading" is unremarkable; "a token that fell 87% is trading again" is the thing worth looking at. The price is captured when the watch opens, so the drawdown is measured against where the tracked wallets actually were.</p>
+
+  <div class="note">
+    <span class="h">It has to leave before it can come back</span>
+    <p>A token joins the watchlist at the exact moment wallets are buying it, so its volume is at its highest right then. Nothing can fire until the token has been observed <strong>below</strong> the threshold at least once. Without that rule Rebound would trigger on everything within seconds of adding it, and would just be a slower copy of auto-buy.</p>
+  </div>
+
+  <h3>Fresh volume, not lifetime volume</h3>
+  <p>The trigger measures volume in a short rolling window, not since the token was first seen. Cumulative volume only ever grows, so a threshold against it fires once on every token that has ever traded and says nothing about whether anything is happening <em class="term">now</em>.</p>
+
+  <div class="screen">
+    <div class="title">🔄 Rebound · ⚪ Off</div>
+    <div class="console" style="margin:0 0 12px">
+Buy       <span class="c-dim">0 SOL</span>
+Volume    <span class="c-dim">not set</span>
+Watch     <span class="c-acc">72h</span>
+Max open  <span class="c-acc">1</span>
+Orders    <span class="c-dim">none</span>
+    </div>
+    <div class="btnrow"><span class="btn">Rebound · ⚪ Off</span></div>
+    <div class="btnrow">
+      <span class="btn">💰 Buy · 0 SOL</span>
+      <span class="btn">💸 Volume · not set</span>
+    </div>
+    <div class="btnrow">
+      <span class="btn">⏳ Watch · 72h</span>
+      <span class="btn">📌 Max open · 1</span>
+    </div>
+    <div class="btnrow">
+      <span class="btn">📋 Orders</span>
+      <span class="btn">◀️ Back</span>
+    </div>
+  </div>
+
+  <p><strong>Alerts do not need a buy amount.</strong> Turn Rebound on with just a volume threshold and you get the signal feed with no trades — which is how the buy amount should be chosen: from what you actually see, over a few days.</p>
+
+  <p>Rebound is genuinely independent: its own trigger, size, exit ladder and position limit. It shares every safety veto, because those are written once. It will not buy a token you already hold — its thesis is a re-entry after the move, not adding to something open.</p>
+
+  <p>Alerts are capped at five per pass so a low threshold cannot flood the group; anything not announced is picked up on the next pass rather than lost.</p>
+</section>
+
+  <h2><span class="num">08</span>Sizing by market cap</h2>
   <p class="lede">One SOL amount for every token treats a $20K launch like a $2M one.</p>
 
   <div class="screen">
@@ -625,8 +676,8 @@ $500K–$1M    →  0.50 SOL
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">08</span>What runs before every buy</h2>
-  <p class="lede">Seven checks. Any one refuses the trade.</p>
+  <h2><span class="num">09</span>What runs before every buy</h2>
+  <p class="lede">Every one of these refuses the trade on its own.</p>
 
   <div class="tablewrap">
     <table>
@@ -640,17 +691,25 @@ $500K–$1M    →  0.50 SOL
         <tr><td class="mono">Token-2022</td><td>Extensions that can change the rules under you.</td></tr>
         <tr><td class="mono">Price impact</td><td>Your own order would move the price more than the limit.</td></tr>
         <tr><td class="mono">Trades/day</td><td>You've hit today's ceiling.</td></tr>
+        <tr><td class="mono">Max open</td><td>You already hold as many positions as you allow. Rebound counts its own separately.</td></tr>
       </tbody>
     </table>
   </div>
 
   <p>All of them <strong>fail closed</strong>. If a check can't be read — network down, price missing — it refuses rather than assuming the best. A skipped trade costs nothing; a wrong one costs money.</p>
+
+  <p>They run on the <strong>total</strong> size, including the Alpha add-on, and every mode goes through them. Rebound has its own trigger and exits but not its own copy of these — a parallel path would be a second place for a check to be forgotten.</p>
+
+  <div class="note">
+    <span class="h">Max open positions defaults to 1</span>
+    <p>Concentration is deliberate. A bot that opens a position on every signal it likes spreads the same balance across trades it cannot then size properly, and on a small wallet it runs out of fees before it runs out of signals. Raise it under <strong>Limits</strong> once you know what you want.</p>
+  </div>
 </section>
 
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">09</span>Reading the alerts</h2>
+  <h2><span class="num">10</span>Reading the alerts</h2>
   <p class="lede">What lands in the group, and what it means.</p>
 
   <h3>A buy</h3>
@@ -659,15 +718,15 @@ $500K–$1M    →  0.50 SOL
 0.08 SOL  ·  entry $41.2K
 confirmed 4fPt56PL…
   </div>
-  <p>Short mint, size, entry market cap, and where the transaction landed. Tap <strong>Positions</strong> for live P&amp;L and per-position sell buttons.</p>
+  <p>Short mint, size, entry market cap, and where the transaction landed. Tap <strong>Positions</strong> for live P&amp;L and per-position sell buttons. When a proven wallet was among the buyers, the size includes the Alpha add-on — there is no separate message for it, because it is not a separate trade.</p>
 
-  <h3>An Alpha buy</h3>
+  <h3>A rebound</h3>
   <div class="console">
-<span class="c-acc">⭐ ALPHA BUY</span> · <span class="c-dim">Grizzl…8ppump</span>
-0.05 SOL  ·  cupseyy
-confirmed 4fPt56PL…
+<span class="c-acc">🔄 TRADING AGAIN</span> · PEPE · <span class="c-dim">7TGAy4G9…pump</span>
+14.2 SOL in the last few minutes  ·  watched 31h
+87% below where smart money bought
   </div>
-  <p>Named after the wallet that triggered it. If the volume trigger also fires on the same token you get both messages — two decisions, two sizes, and the position is now the sum of them.</p>
+  <p>A watched token that went quiet and started trading again. This fires whether or not Rebound is configured to buy, so it works as a signal feed on its own. If a buy is configured you get a separate <code>🔄 REBOUND BUY</code> message when one lands.</p>
 
   <h3>A sell</h3>
   <div class="console">
@@ -700,7 +759,7 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">10</span>What the signal is actually worth</h2>
+  <h2><span class="num">11</span>What the signal is actually worth</h2>
   <p class="lede">Measured over 2,018 priced tokens. Read both columns together.</p>
 
   <div class="tablewrap">
@@ -730,7 +789,7 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">11</span>A safe first session</h2>
+  <h2><span class="num">12</span>A safe first session</h2>
   <p class="lede">In order. The whole point is that the last step is boring.</p>
 
   <ol class="steps">
@@ -755,8 +814,8 @@ No fills observed, so it cannot be priced — or sold — right now.
       <p>Add one order under <strong>Selling → Orders</strong>: trigger <code>−25%</code>, amount <code>100%</code>. Wide enough to sit outside the spread — <code>−5%</code> will stop you out on entry. Add targets later, once you have watched a few trades.</p>
     </li>
     <li>
-      <h3>Leave Alpha off for the first session</h3>
-      <p>One trigger at a time. You cannot tell which one produced a result if both are running, and Alpha spends its own amount on top of everything auto-buy does.</p>
+      <h3>Leave Alpha and Rebound off for the first session</h3>
+      <p>One thing at a time. Alpha increases the size of every qualifying trade, and Rebound opens trades of its own — both make a first session harder to read.</p>
     </li>
     <li>
       <h3>Resume, and watch the first trade land</h3>
@@ -772,7 +831,7 @@ No fills observed, so it cannot be priced — or sold — right now.
 <hr class="div">
 
 <section class="col">
-  <h2><span class="num">12</span>Honest limits</h2>
+  <h2><span class="num">13</span>Honest limits</h2>
   <p class="lede">Things worth knowing before trusting it with size.</p>
 
   <ul class="plain">
@@ -785,6 +844,7 @@ No fills observed, so it cannot be priced — or sold — right now.
     <li><strong>Don't share the trading wallet with another app.</strong> The bot reconstructs cost basis from its own trade log, so a manual buy or sell made elsewhere from the same wallet is invisible to it — positions and P&amp;L drift until the next reconciliation.</li>
     <li><strong>Alpha scores from the call, not from each wallet's own entry.</strong> Per-wallet fill prices aren't recorded, so a wallet that bought late is credited with a little more than it earned. The sample minimum is set high enough that this can't promote a wallet on its own.</li>
     <li><strong>Keep enough SOL for fees.</strong> Exits cost a fee, and a routed exit can need rent up front. A wallet too empty to pay it cannot sell — the stop fires and is rejected.</li>
+    <li><strong>Token account rent is not returned automatically.</strong> Every buy creates a token account holding ~0.00204 SOL of rent. Selling empties it but does not close it, so that SOL stays locked until you reclaim it yourself. At a 0.01 SOL trade size that is a fifth of the position, on every token — it is the main argument for trading larger than that.</li>
   </ul>
 </section>
 
