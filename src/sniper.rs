@@ -1074,7 +1074,11 @@ impl Sniper {
         // CAN WE ACTUALLY AFFORD THIS?
         //
         // A buy costs the trade size PLUS rent for the token account it creates
-        // (~0.00204 SOL, reclaimed when the position closes) PLUS fees. Without
+        // PLUS fees. That rent — ~0.00204 SOL — stays locked after the position
+        // is sold: selling empties the account but does not close it, and this
+        // bot does not close them. At small trade sizes it is a large share of
+        // the position, so it is reclaimed manually rather than silently
+        // assumed back. Without
         // this check the bot builds, simulates and submits a transaction that
         // the System Program then rejects:
         //
@@ -2165,73 +2169,6 @@ impl Sniper {
                 "alpha add-on cleared — trades use the normal size".to_string()
             })
         })
-    }
-
-    /// Close emptied token accounts and take the rent back.
-    ///
-    /// Runs as its own transaction, deliberately NOT bundled into the sell.
-    /// Appending a close to the exit would mean a failed rent reclaim takes the
-    /// EXIT down with it, and an exit that does not land is far more expensive
-    /// than rent that stays locked one cycle longer. Here a failure costs
-    /// nothing and simply retries next time.
-    ///
-    /// Returns how many accounts were closed.
-    pub async fn reclaim_rent(&self) -> usize {
-        // Nothing to sign in a dry run, and nothing to reclaim either.
-        let Mode::Armed(cap) = &self.mode else { return 0 };
-        if self.kill_switch_engaged() {
-            return 0;
-        }
-        let Some(owner) = self.owner() else { return 0 };
-        let owner_s = owner.to_string();
-        let Ok(audit) = tokio::fs::read_to_string(&self.cfg.audit_log).await else { return 0 };
-        let mints: Vec<String> =
-            crate::positions::cost_basis_from_audit(&audit).into_keys().collect();
-        if mints.is_empty() {
-            return 0;
-        }
-        let Some(empties) = self.rpc.empty_token_atas(&owner_s, &mints).await else { return 0 };
-        if empties.is_empty() {
-            return 0;
-        }
-
-        // Bounded per transaction: each close is an instruction, and an
-        // oversized transaction is rejected outright.
-        const MAX_PER_TX: usize = 12;
-        let mut ixs = Vec::new();
-        for (ata, program) in empties.iter().take(MAX_PER_TX) {
-            let (Ok(ata_pk), Ok(prog_pk)) = (crate::tx::pk(ata), crate::tx::pk(program)) else {
-                continue;
-            };
-            match spl_token_interface::instruction::close_account(
-                &prog_pk, &ata_pk, &owner, &owner, &[],
-            ) {
-                Ok(ix) => ixs.push(ix),
-                Err(e) => warn!(%ata, error = %e, "could not build a close instruction"),
-            }
-        }
-        if ixs.is_empty() {
-            return 0;
-        }
-        let count = ixs.len();
-        match self.submitter.send(&ixs, &cap.wallet.pubkey(), cap.wallet.keypair()).await {
-            Ok(sub) if sub.definitely_did_not_execute() => {
-                warn!(count, "rent reclaim did not land");
-                0
-            }
-            Ok(_) => {
-                info!(
-                    count,
-                    reclaimed_sol = count as f64 * 0.00203928,
-                    "closed emptied token accounts and reclaimed their rent"
-                );
-                count
-            }
-            Err(e) => {
-                warn!(error = %format!("{e:#}"), "rent reclaim failed");
-                0
-            }
-        }
     }
 
     /// How many positions the bot currently holds open, in one lane.

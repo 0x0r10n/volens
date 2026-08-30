@@ -633,36 +633,6 @@ impl Detector {
             });
         }
 
-        // RENT RECLAIM. Emptied token accounts hold ~0.00204 SOL each, which
-        // at a 0.01 SOL trade size is a fifth of the position sitting locked.
-        //
-        // On its own timer rather than inside the exit sweep: this must never
-        // be able to delay or fail a sell.
-        #[cfg(feature = "sniper")]
-        {
-            let sniper = self.sniper.clone();
-            let mut shutdown = shutdown.clone();
-            tokio::spawn(async move {
-                // Shortly after boot, then hourly. Sooner than that and it
-                // races the sells it is cleaning up after.
-                let mut every = Duration::from_secs(900);
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(every) => {}
-                        _ = shutdown.changed() => {
-                            if *shutdown.borrow() { return; }
-                            continue;
-                        }
-                    }
-                    every = Duration::from_secs(3600);
-                    let closed = sniper.reclaim_rent().await;
-                    if closed > 0 {
-                        info!(closed, "rent reclaim complete");
-                    }
-                }
-            });
-        }
-
         // DAILY WALLET RANKING.
         // DAILY WALLET RANKING. Scores are continuous — a wallet's record
         // accumulates across the whole lookback — so this is a periodic
