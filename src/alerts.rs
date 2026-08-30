@@ -662,6 +662,47 @@ pub fn render_smart_buy(
     })
 }
 
+/// Announce that a WATCHED token is trading again.
+///
+/// Fires on the observation, not on a trade: the mode watches every token
+/// tracked money touched for days afterwards, and a token that went to nothing
+/// and then started trading again is worth seeing whether or not the bot is
+/// configured to buy it. That is also how the thresholds get chosen — by
+/// watching these first.
+///
+/// `since_watch` is the multiple against the price when the watch opened, which
+/// is what separates "a token is trading" from "a token that fell 90% is
+/// trading again".
+#[cfg(feature = "sniper")]
+pub fn render_rebound_signal(
+    mint: &str,
+    symbol: Option<&str>,
+    fresh_volume_sol: f64,
+    since_watch: Option<f64>,
+    hours_watched: f64,
+) -> String {
+    let short = crate::conviction::short_mint(mint);
+    // The ticker if we have one, with the mint underneath to tap and copy —
+    // a bare mint is unreadable and a bare ticker cannot be acted on.
+    let head = match symbol {
+        Some(s) if !s.is_empty() => format!("{} · <code>{}</code>", escape_html(s), escape_html(mint)),
+        _ => format!("<code>{}</code>", escape_html(&short)),
+    };
+    let drawdown = match since_watch {
+        // Below where smart money was: the interesting case, and the one the
+        // mode exists for.
+        Some(m) if m > 0.0 && m < 0.95 => {
+            format!("\n{:.0}% below where smart money bought", (1.0 - m) * 100.0)
+        }
+        Some(m) if m >= 1.05 => format!("\n{m:.2}x since it was watched"),
+        _ => String::new(),
+    };
+    format!(
+        "🔄 <b>TRADING AGAIN</b> · {head}\n\
+         {fresh_volume_sol:.1} SOL in the last few minutes · watched {hours_watched:.0}h{drawdown}"
+    )
+}
+
 /// Announce a REBOUND entry.
 ///
 /// Marked distinctly from a smart buy: the token was bought because it started

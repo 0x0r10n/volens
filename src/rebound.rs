@@ -38,6 +38,34 @@ pub struct Watch {
     /// Set once a rebound entry has been taken for this cycle.
     #[serde(default)]
     pub triggered: bool,
+    /// Set once the rebound has been ANNOUNCED for this cycle.
+    ///
+    /// Deliberately separate from `triggered`. Watching is worth reporting on
+    /// its own — a token that rugged and started trading again is the whole
+    /// point of the mode — and that reporting must not depend on whether a buy
+    /// was configured, allowed, or successful. Two flags means the alert fires
+    /// once and the entry is still available if the buy was refused.
+    #[serde(default)]
+    pub alerted: bool,
+    /// Has this token actually gone quiet since the watch opened?
+    ///
+    /// THE condition that makes this a rebound rather than a follow. A token
+    /// joins the watchlist at the exact moment tracked wallets are buying it,
+    /// so its fresh volume is at its highest right then — without this, every
+    /// watched token would trigger within seconds of being added and the mode
+    /// would just be a slower copy of the normal trigger.
+    ///
+    /// Set by the watcher the first time it observes volume BELOW the
+    /// threshold. Nothing can fire until then.
+    #[serde(default)]
+    pub went_quiet: bool,
+    /// Price per token when the watch opened, if the stream could price it.
+    ///
+    /// What makes the alert readable: "trading again" is unremarkable on its
+    /// own, and "trading again at 0.11x of where smart money bought it" is the
+    /// thing worth looking at.
+    #[serde(default)]
+    pub price_at_watch: Option<f64>,
 }
 
 impl Watch {
@@ -55,6 +83,9 @@ pub enum Skip {
     Expired,
     /// Fresh volume was below the threshold.
     TooQuiet,
+    /// Still busy from the activity that put it on the watchlist. A rebound is
+    /// a RETURN, so the token has to go quiet before it can come back.
+    NeverQuiet,
 }
 
 /// The observation pool.
@@ -108,7 +139,13 @@ impl ReboundPool {
     ///
     /// Returns true when this began a new cycle, so the caller can log it once
     /// rather than on every buy in the same token.
-    pub fn observe(&mut self, mint: &str, now: DateTime<Utc>, watch_secs: i64) -> bool {
+    pub fn observe(
+        &mut self,
+        mint: &str,
+        now: DateTime<Utc>,
+        watch_secs: i64,
+        price: Option<f64>,
+    ) -> bool {
         match self.watching.get_mut(mint) {
             Some(w) => {
                 // Only an EXPIRED or already-spent watch restarts. Refreshing on
@@ -117,6 +154,9 @@ impl ReboundPool {
                 if w.triggered || w.expired(now, watch_secs) {
                     w.since = now;
                     w.triggered = false;
+                    w.alerted = false;
+                    w.went_quiet = false;
+                    w.price_at_watch = price;
                     self.dirty = true;
                     true
                 } else {
@@ -124,8 +164,17 @@ impl ReboundPool {
                 }
             }
             None => {
-                self.watching
-                    .insert(mint.to_string(), Watch { mint: mint.to_string(), since: now, triggered: false });
+                self.watching.insert(
+                    mint.to_string(),
+                    Watch {
+                        mint: mint.to_string(),
+                        since: now,
+                        triggered: false,
+                        alerted: false,
+                        went_quiet: false,
+                        price_at_watch: price,
+                    },
+                );
                 self.dirty = true;
                 true
             }
@@ -163,12 +212,71 @@ impl ReboundPool {
         if w.expired(now, watch_secs) {
             return Err(Skip::Expired);
         }
+        if !w.went_quiet {
+            return Err(Skip::NeverQuiet);
+        }
         // A threshold of zero would fire on any token that has traded at all,
         // which is every token in the pool.
         if min_volume_sol <= 0.0 || fresh_volume_sol < min_volume_sol {
             return Err(Skip::TooQuiet);
         }
         Ok(())
+    }
+
+    /// Is this token worth ANNOUNCING right now?
+    ///
+    /// The same volume test as `evaluate`, against the alert's own once-per-cycle
+    /// flag. Kept separate so a token can be reported even when no buy is
+    /// configured — which is the normal state while thresholds are being chosen.
+    pub fn evaluate_alert(
+        &self,
+        mint: &str,
+        fresh_volume_sol: f64,
+        min_volume_sol: f64,
+        now: DateTime<Utc>,
+        watch_secs: i64,
+    ) -> Result<(), Skip> {
+        let Some(w) = self.watching.get(mint) else { return Err(Skip::NotWatched) };
+        if w.alerted {
+            return Err(Skip::AlreadyTriggered);
+        }
+        if w.expired(now, watch_secs) {
+            return Err(Skip::Expired);
+        }
+        // It has to have LEFT before it can come back.
+        if !w.went_quiet {
+            return Err(Skip::NeverQuiet);
+        }
+        if min_volume_sol <= 0.0 || fresh_volume_sol < min_volume_sol {
+            return Err(Skip::TooQuiet);
+        }
+        Ok(())
+    }
+
+    /// What the token was worth when the watch opened, and how long ago.
+    pub fn context(&self, mint: &str) -> Option<(Option<f64>, DateTime<Utc>)> {
+        self.watching.get(mint).map(|w| (w.price_at_watch, w.since))
+    }
+
+    /// Record that a token is currently below the threshold.
+    ///
+    /// Returns true the first time, so the caller can log the transition once.
+    pub fn mark_quiet(&mut self, mint: &str) -> bool {
+        match self.watching.get_mut(mint) {
+            Some(w) if !w.went_quiet => {
+                w.went_quiet = true;
+                self.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn mark_alerted(&mut self, mint: &str) {
+        if let Some(w) = self.watching.get_mut(mint) {
+            w.alerted = true;
+            self.dirty = true;
+        }
     }
 
     /// Spend this token's entry for the current cycle.
@@ -239,22 +347,24 @@ mod tests {
     #[test]
     fn a_touched_token_enters_the_pool_once() {
         let mut p = ReboundPool::new();
-        assert!(p.observe("M", now(), WATCH), "first touch opens a cycle");
-        assert!(!p.observe("M", now(), WATCH), "a second touch is the same cycle");
+        assert!(p.observe("M", now(), WATCH, None), "first touch opens a cycle");
+        assert!(!p.observe("M", now(), WATCH, None), "a second touch is the same cycle");
         assert_eq!(p.len(), 1);
     }
 
     #[test]
     fn fresh_volume_over_the_threshold_triggers() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 12.0, 10.0, now(), WATCH), Ok(()));
     }
 
     #[test]
     fn quiet_tokens_do_not_trigger() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 4.0, 10.0, now(), WATCH), Err(Skip::TooQuiet));
     }
 
@@ -263,7 +373,8 @@ mod tests {
     #[test]
     fn a_zero_threshold_never_triggers() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 999.0, 0.0, now(), WATCH), Err(Skip::TooQuiet));
     }
 
@@ -278,7 +389,8 @@ mod tests {
     #[test]
     fn a_token_only_triggers_once_per_cycle() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()));
         p.mark_triggered("M");
         assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Err(Skip::AlreadyTriggered));
@@ -289,7 +401,8 @@ mod tests {
     #[test]
     fn evaluating_alone_does_not_spend_the_entry() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()));
         assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()), "still armed");
     }
@@ -297,7 +410,8 @@ mod tests {
     #[test]
     fn the_window_closes() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         let later = now() + Duration::seconds(WATCH + 1);
         assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Err(Skip::Expired));
         assert_eq!(p.expire(later, WATCH), 1);
@@ -309,10 +423,17 @@ mod tests {
     #[test]
     fn a_new_touch_after_triggering_starts_a_fresh_cycle() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         p.mark_triggered("M");
         let later = now() + Duration::seconds(3600);
-        assert!(p.observe("M", later, WATCH), "a new cycle opened");
+        assert!(p.observe("M", later, WATCH, None), "a new cycle opened");
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, later, WATCH),
+            Err(Skip::NeverQuiet),
+            "a fresh cycle must see it go quiet again first"
+        );
+        p.mark_quiet("M");
         assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Ok(()));
     }
 
@@ -321,9 +442,10 @@ mod tests {
     #[test]
     fn a_touch_during_a_live_cycle_does_not_extend_it() {
         let mut p = ReboundPool::new();
-        p.observe("M", now(), WATCH);
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
         let mid = now() + Duration::seconds(WATCH - 60);
-        assert!(!p.observe("M", mid, WATCH));
+        assert!(!p.observe("M", mid, WATCH, None));
         let after = now() + Duration::seconds(WATCH + 1);
         assert_eq!(p.evaluate("M", 50.0, 10.0, after, WATCH), Err(Skip::Expired));
     }
@@ -337,8 +459,10 @@ mod tests {
         let p = path.to_string_lossy().to_string();
 
         let mut pool = ReboundPool::new();
-        pool.observe("A", now(), WATCH);
-        pool.observe("B", now(), WATCH);
+        pool.observe("A", now(), WATCH, None);
+        pool.mark_quiet("A");
+        pool.observe("B", now(), WATCH, None);
+        pool.mark_quiet("B");
         pool.mark_triggered("B");
         save_watches(&p, &pool.watches());
 
@@ -353,6 +477,79 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The alert must not depend on a buy being configured — reporting that a
+    /// token is trading again is the point of the mode, and thresholds get
+    /// chosen by watching those reports first.
+    #[test]
+    fn alerting_and_buying_are_independent() {
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
+
+        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, now(), WATCH), Ok(()));
+        p.mark_alerted("M");
+        assert_eq!(
+            p.evaluate_alert("M", 50.0, 10.0, now(), WATCH),
+            Err(Skip::AlreadyTriggered),
+            "announced once per cycle"
+        );
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, now(), WATCH),
+            Ok(()),
+            "but the entry is still available"
+        );
+    }
+
+    /// THE condition that separates a rebound from a follow. A token joins the
+    /// watchlist while tracked wallets are buying it, so its volume is at its
+    /// highest right then — firing on that would make this a slower copy of the
+    /// normal trigger rather than a re-entry.
+    #[test]
+    fn a_token_must_go_quiet_before_it_can_rebound() {
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+        assert_eq!(
+            p.evaluate("M", 999.0, 10.0, now(), WATCH),
+            Err(Skip::NeverQuiet),
+            "still busy from the buying that put it on the list"
+        );
+        assert_eq!(
+            p.evaluate_alert("M", 999.0, 10.0, now(), WATCH),
+            Err(Skip::NeverQuiet),
+            "and it must not be announced either"
+        );
+
+        assert!(p.mark_quiet("M"), "the first quiet observation is the transition");
+        assert!(!p.mark_quiet("M"), "and it is recorded only once");
+        assert_eq!(p.evaluate("M", 999.0, 10.0, now(), WATCH), Ok(()), "now it is a rebound");
+    }
+
+    /// A refused buy must not silence the next cycle's alert either.
+    #[test]
+    fn a_new_cycle_re_arms_both_flags() {
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+        p.mark_quiet("M");
+        p.mark_alerted("M");
+        p.mark_triggered("M");
+        let later = now() + Duration::seconds(3600);
+        assert!(p.observe("M", later, WATCH, None));
+        p.mark_quiet("M");
+        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, later, WATCH), Ok(()));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Ok(()));
+    }
+
+    /// The price at watch time is what makes "trading again" readable as
+    /// "trading again at a tenth of where smart money bought it".
+    #[test]
+    fn the_watch_price_is_kept_for_context() {
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, Some(0.000_02));
+        let (price, since) = p.context("M").unwrap();
+        assert_eq!(price, Some(0.000_02));
+        assert_eq!(since, now());
+    }
+
     /// Saving is batched off the hot path, so the pool has to be able to say
     /// whether it changed. A missed flag means a lost watch.
     #[test]
@@ -360,11 +557,13 @@ mod tests {
         let mut p = ReboundPool::new();
         assert!(!p.take_dirty(), "a fresh pool has nothing to save");
 
-        p.observe("A", now(), WATCH);
+        p.observe("A", now(), WATCH, None);
+        p.mark_quiet("A");
         assert!(p.take_dirty(), "a new watch");
         assert!(!p.take_dirty(), "and the flag clears");
 
-        p.observe("A", now(), WATCH);
+        p.observe("A", now(), WATCH, None);
+        p.mark_quiet("A");
         assert!(!p.take_dirty(), "a repeat touch in the same cycle changes nothing");
 
         p.mark_triggered("A");
@@ -381,6 +580,9 @@ mod tests {
             mint: "A".into(),
             since: now(),
             triggered: false,
+            alerted: false,
+            went_quiet: true,
+            price_at_watch: None,
         }]);
         assert!(!p.take_dirty());
     }
@@ -399,8 +601,10 @@ mod tests {
     #[test]
     fn watches_survive_a_round_trip() {
         let mut p = ReboundPool::new();
-        p.observe("A", now(), WATCH);
-        p.observe("B", now(), WATCH);
+        p.observe("A", now(), WATCH, None);
+        p.mark_quiet("A");
+        p.observe("B", now(), WATCH, None);
+        p.mark_quiet("B");
         p.mark_triggered("B");
         let restored = ReboundPool::from_watches(p.watches());
         assert_eq!(restored.len(), 2);

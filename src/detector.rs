@@ -411,6 +411,7 @@ impl Detector {
             let prices = self.prices.clone();
             let alerter = self.alerter.clone();
             let pool = self.rebound.clone();
+            let signals = self.signals.clone();
             let state_path = self.cfg.sniper.rebound_state_path.clone();
             // Fresh volume means RECENT volume. The signal window is what the
             // rest of the bot already treats as "now", so it is reused rather
@@ -467,8 +468,82 @@ impl Detector {
                         continue;
                     }
 
+                    // A badly-chosen threshold could match hundreds of watched
+                    // tokens at once. Capped per pass so Telegram is never
+                    // flooded: an un-announced token keeps its flag and is
+                    // picked up on the next pass, so nothing is lost — the
+                    // reports are just spread out.
+                    const MAX_ALERTS_PER_PASS: usize = 5;
+                    let mut alerted = 0usize;
+
                     for mint in watching {
                         let fresh = prices.volume_sol_in(&mint, fresh_window);
+
+                        // BELOW the threshold is the state a rebound comes back
+                        // FROM. Recorded first, because a token added while its
+                        // buyers were still active has never been quiet and
+                        // cannot rebound until it has.
+                        if fresh < live.rebound_min_volume_sol {
+                            let first = {
+                                let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                                p.mark_quiet(&mint)
+                            };
+                            if first {
+                                debug!(%mint, fresh_volume = fresh, "rebound: gone quiet — armed");
+                            }
+                            continue;
+                        }
+
+                        // ANNOUNCE FIRST, and independently of buying. A token
+                        // that fell to nothing and started trading again is
+                        // worth seeing whether or not a buy is configured.
+                        let (announce, ctx) = {
+                            let p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                            (
+                                p.evaluate_alert(
+                                    &mint,
+                                    fresh,
+                                    live.rebound_min_volume_sol,
+                                    now,
+                                    watch_secs,
+                                ),
+                                p.context(&mint),
+                            )
+                        };
+                        if announce.is_ok() && alerted < MAX_ALERTS_PER_PASS {
+                            alerted += 1;
+                            let (watch_price, since) = ctx.unwrap_or((None, now));
+                            let hours = (now - since).num_minutes() as f64 / 60.0;
+                            let since_watch = watch_price.and_then(|p0| {
+                                (p0 > 0.0).then(|| {
+                                    prices
+                                        .price_sol(&mint, std::time::Duration::from_secs(3600))
+                                        .map(|p| p.price_sol / p0)
+                                })
+                            }).flatten();
+                            let symbol = signals.symbol_of(&mint);
+                            info!(
+                                %mint,
+                                fresh_volume = fresh,
+                                since_watch = since_watch.unwrap_or(0.0),
+                                hours,
+                                "rebound: trading again"
+                            );
+                            {
+                                let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                                p.mark_alerted(&mint);
+                            }
+                            alerter
+                                .send_html(crate::alerts::render_rebound_signal(
+                                    &mint,
+                                    symbol.as_deref(),
+                                    fresh,
+                                    since_watch,
+                                    hours,
+                                ))
+                                .await;
+                        }
+
                         let armed = {
                             let p = pool.lock().unwrap_or_else(|e| e.into_inner());
                             p.evaluate(
@@ -485,12 +560,6 @@ impl Detector {
                         if armed.is_err() {
                             continue;
                         }
-                        info!(
-                            %mint,
-                            fresh_volume = fresh,
-                            need = live.rebound_min_volume_sol,
-                            "rebound: triggered — fresh volume on a watched token"
-                        );
                         let reason = format!("rebound: {fresh:.2} SOL fresh volume");
                         let outcome = sniper.rebound_buy(&mint, &reason).await;
                         // The entry is spent only when the buy actually landed.
@@ -1139,10 +1208,18 @@ impl Detector {
                     let watch_secs = live.rebound_watch_hours.max(1) * 3600;
                     // Marks the pool dirty; the watcher loop persists it. This
                     // runs on the stream's hot path, so it must not touch disk.
+                    // The price now, so a later rebound can be described as
+                    // "trading again at a fraction of where smart money was"
+                    // rather than just "trading again". Read outside the lock.
+                    let price_now = self
+                        .prices
+                        .price_sol(&buy.mint, std::time::Duration::from_secs(3600))
+                        .map(|p| p.price_sol);
                     let (opened, watching) = {
                         let mut pool =
                             self.rebound.lock().unwrap_or_else(|p| p.into_inner());
-                        let opened = pool.observe(&buy.mint, chrono::Utc::now(), watch_secs);
+                        let opened =
+                            pool.observe(&buy.mint, chrono::Utc::now(), watch_secs, price_now);
                         (opened, pool.len())
                     };
                     if opened {

@@ -162,6 +162,14 @@ impl SignalStore {
         self.lock().values().cloned().collect()
     }
 
+    /// The ticker for a mint, if this token was ever announced.
+    ///
+    /// Cheap single lookup rather than cloning the whole store: used by alerts
+    /// that fire per token, where a bare mint is unreadable.
+    pub fn symbol_of(&self, mint: &str) -> Option<String> {
+        self.lock().get(mint).map(|r| r.symbol.clone()).filter(|s| !s.is_empty())
+    }
+
     #[cfg(test)]
     pub fn contains(&self, mint: &str) -> bool {
         self.lock().contains_key(mint)
