@@ -2259,20 +2259,6 @@ impl Sniper {
         })
     }
 
-    /// Turn volume confirmation on or off.
-    ///
-    /// A real bypass, not "thresholds at zero": switching it off cannot leave a
-    /// stray threshold quietly filtering entries.
-    pub fn toggle_volume_mode(&self) -> Result<String, String> {
-        self.settings.update(|s| {
-            s.volume_mode = !s.volume_mode;
-            Ok(if s.volume_mode {
-                "volume confirmation ON — smart money must be corroborated by volume".into()
-            } else {
-                "volume confirmation OFF — wallet count alone decides".to_string()
-            })
-        })
-    }
 
     /// SOL the tracked cohort must have put in. 0 = not required.
     pub fn set_min_smart_sol_in(&self, v: f64) -> Result<String, String> {
@@ -2289,20 +2275,6 @@ impl Sniper {
         })
     }
 
-    /// Observed SOL traded in the token. 0 = not required.
-    pub fn set_min_token_volume(&self, v: f64) -> Result<String, String> {
-        if v < 0.0 || !v.is_finite() {
-            return Err("value must be zero or a positive number".into());
-        }
-        self.settings.update(|s| {
-            s.min_token_volume_sol = v;
-            Ok(if v == 0.0 {
-                "token volume no longer required".to_string()
-            } else {
-                format!("token volume must reach {v} SOL")
-            })
-        })
-    }
 
     /// Turn smart-money auto-buy on or off.
     ///

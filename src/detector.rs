@@ -1304,24 +1304,7 @@ impl Detector {
                     }
 
                     if sol_ok {
-                        // Token-volume confirmation, unchanged in spirit: it
-                        // can only ever BLOCK a signal the trigger admitted.
-                        let passed = if live.volume_mode && live.min_token_volume_sol > 0.0 {
-                            let window = Duration::from_secs(self.cfg.tracked.window_secs);
-                            let token_vol = self.prices.volume_sol_in(&buy.mint, window);
-                            let ok = token_vol >= live.min_token_volume_sol;
-                            info!(
-                                mint = %buy.mint,
-                                token_volume = token_vol,
-                                need_volume = live.min_token_volume_sol,
-                                passed = ok,
-                                "volume confirmation"
-                            );
-                            ok
-                        } else {
-                            true
-                        };
-                        if passed {
+                        {
                             info!(
                                 mint = %buy.mint,
                                 smart_sol,

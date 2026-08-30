@@ -186,21 +186,10 @@ pub struct LiveSettings {
     #[serde(default)]
     pub max_supply_pct: f64,
 
-    /// Require volume confirmation on top of the wallet count.
-    ///
-    /// Smart money stays the trigger; this only ever makes entry HARDER. Both
-    /// thresholds are additional AND conditions applied before the existing
-    /// safety vetoes, and neither can admit a token the wallet count rejected.
-    #[serde(default)]
-    pub volume_mode: bool,
     /// SOL the tracked cohort must have put in, inside the signal window.
     /// 0 = not required.
     #[serde(default)]
     pub min_smart_sol_in: f64,
-    /// Total observed SOL traded in the token, inside the signal window.
-    /// 0 = not required.
-    #[serde(default)]
-    pub min_token_volume_sol: f64,
 }
 
 /// One market-cap band and the size to buy inside it.
@@ -345,9 +334,7 @@ impl LiveSettings {
             max_open_positions: one_position(),
             supply_cap: false,
             max_supply_pct: 0.0,
-            volume_mode: false,
             min_smart_sol_in: 0.0,
-            min_token_volume_sol: 0.0,
         }
     }
 
