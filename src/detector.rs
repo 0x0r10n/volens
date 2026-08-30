@@ -420,11 +420,32 @@ impl Detector {
             let mut shutdown = shutdown.clone();
             tokio::spawn(async move {
                 let every = Duration::from_secs(30);
+                // The watchlist is ~15,700 entries after 72 hours, about 2MB of
+                // JSON, and a save rewrites all of it. New tokens arrive
+                // constantly, so it is dirty on nearly every pass — saving each
+                // time would put roughly 6GB a day of writes on the same disk
+                // the trading path uses. Losing a few minutes of observations
+                // to a crash costs nothing: the token is re-observed the next
+                // time tracked money touches it.
+                const SAVE_EVERY: Duration = Duration::from_secs(300);
+                let mut last_save = Instant::now();
                 loop {
                     tokio::select! {
                         _ = tokio::time::sleep(every) => {}
                         _ = shutdown.changed() => {
-                            if *shutdown.borrow() { return; }
+                            if *shutdown.borrow() {
+                                // Flush on the way out so a clean restart keeps
+                                // everything, not just the last checkpoint.
+                                let snapshot = {
+                                    let mut p =
+                                        pool.lock().unwrap_or_else(|e| e.into_inner());
+                                    p.take_dirty().then(|| p.watches())
+                                };
+                                if let Some(w) = snapshot {
+                                    crate::rebound::save_watches(&state_path, &w);
+                                }
+                                return;
+                            }
                             continue;
                         }
                     }
@@ -458,8 +479,15 @@ impl Detector {
                     // seconds on the stream's own thread. Losing a few seconds
                     // of observations to a crash costs nothing: the token is
                     // re-observed the next time it is touched.
-                    if dirty {
+                    if dirty && last_save.elapsed() >= SAVE_EVERY {
                         crate::rebound::save_watches(&state_path, &snapshot);
+                        last_save = Instant::now();
+                    } else if dirty {
+                        // Put the flag back: this pass did not persist, so the
+                        // change is still outstanding and the next eligible pass
+                        // must pick it up.
+                        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                        p.set_dirty();
                     }
 
                     // Nothing can trigger without a threshold, and a zero one
@@ -476,23 +504,35 @@ impl Detector {
                     const MAX_ALERTS_PER_PASS: usize = 5;
                     let mut alerted = 0usize;
 
-                    for mint in watching {
-                        let fresh = prices.volume_sol_in(&mint, fresh_window);
-
+                    // Every watched token's volume under ONE lock, and the
+                    // quiet ones marked under one more. Per-token locking here
+                    // meant ~31,000 acquisitions a pass against the same mutex
+                    // the stream writes fills through.
+                    let volumes = prices.volumes_sol_in(&watching, fresh_window);
+                    let (busy, quiet): (Vec<&String>, Vec<&String>) = watching
+                        .iter()
+                        .partition(|m| {
+                            volumes.get(*m).copied().unwrap_or(0.0)
+                                >= live.rebound_min_volume_sol
+                        });
+                    if !quiet.is_empty() {
                         // BELOW the threshold is the state a rebound comes back
-                        // FROM. Recorded first, because a token added while its
-                        // buyers were still active has never been quiet and
-                        // cannot rebound until it has.
-                        if fresh < live.rebound_min_volume_sol {
-                            let first = {
-                                let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
-                                p.mark_quiet(&mint)
-                            };
-                            if first {
-                                debug!(%mint, fresh_volume = fresh, "rebound: gone quiet — armed");
+                        // FROM. A token added while its buyers were still
+                        // active has never been quiet and cannot rebound yet.
+                        let mut newly = 0usize;
+                        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                        for m in quiet {
+                            if p.mark_quiet(m) {
+                                newly += 1;
                             }
-                            continue;
                         }
+                        if newly > 0 {
+                            debug!(newly, "rebound: tokens gone quiet — now armed");
+                        }
+                    }
+
+                    for mint in busy.into_iter().cloned() {
+                        let fresh = volumes.get(&mint).copied().unwrap_or(0.0);
 
                         // ANNOUNCE FIRST, and independently of buying. A token
                         // that fell to nothing and started trading again is

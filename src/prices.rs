@@ -539,6 +539,32 @@ impl PriceIndex {
     /// and nothing since scores identically to one doing 400 SOL right now.
     /// "Volume is building" is a statement about a window, and a lifetime
     /// counter cannot express it at all.
+    /// Fresh volume for MANY mints under a single lock.
+    ///
+    /// The rebound watcher asks about every watched token on every pass —
+    /// ~15,700 of them after 72 hours. Calling `volume_sol_in` per mint takes
+    /// this lock once per token, and the same lock is held constantly by the
+    /// stream writing fills, so that many acquisitions contend with the hot
+    /// ingest path. One acquisition serves the whole sweep.
+    pub fn volumes_sol_in(
+        &self,
+        mints: &[String],
+        window: Duration,
+    ) -> std::collections::HashMap<String, f64> {
+        let map = self.tokens();
+        let cutoff = volume_bucket(Instant::now()).saturating_sub(window_buckets(window));
+        mints
+            .iter()
+            .map(|m| {
+                let v = map
+                    .get(m)
+                    .map(|s| s.vol.iter().filter(|(b, _)| *b >= cutoff).map(|(_, v)| *v).sum())
+                    .unwrap_or(0.0);
+                (m.clone(), v)
+            })
+            .collect()
+    }
+
     pub fn volume_sol_in(&self, mint: &str, window: Duration) -> f64 {
         let map = self.tokens();
         let Some(series) = map.get(mint) else { return 0.0 };

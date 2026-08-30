@@ -114,6 +114,15 @@ impl ReboundPool {
         std::mem::take(&mut self.dirty)
     }
 
+    /// Put the flag back when a caller took it but did not persist.
+    ///
+    /// Saving is throttled, so a pass can observe changes it does not write.
+    /// Without this the flag would be consumed and those changes would never be
+    /// persisted at all.
+    pub fn set_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn len(&self) -> usize {
         self.watching.len()
     }
@@ -522,6 +531,17 @@ mod tests {
         assert!(p.mark_quiet("M"), "the first quiet observation is the transition");
         assert!(!p.mark_quiet("M"), "and it is recorded only once");
         assert_eq!(p.evaluate("M", 999.0, 10.0, now(), WATCH), Ok(()), "now it is a rebound");
+    }
+
+    /// Saving is throttled, so a pass can take the flag without writing. The
+    /// change must not be lost when that happens.
+    #[test]
+    fn an_unpersisted_change_can_be_put_back() {
+        let mut p = ReboundPool::new();
+        p.observe("A", now(), WATCH, None);
+        assert!(p.take_dirty());
+        p.set_dirty();
+        assert!(p.take_dirty(), "still outstanding for the next eligible pass");
     }
 
     /// A refused buy must not silence the next cycle's alert either.

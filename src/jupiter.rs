@@ -441,11 +441,25 @@ pub async fn throttle() {
 mod throttle_tests {
     use super::*;
 
+    /// Serialises every test that touches the throttle.
+    ///
+    /// The pacing state is PROCESS-WIDE — that is the whole point of it, since
+    /// three loops share one budget — but Rust runs tests in parallel threads,
+    /// so without this they race each other and the suite fails intermittently
+    /// on whichever one lost. A flaky suite is worse than a slow one here:
+    /// these tests gate deploys of code that spends money.
+    static THROTTLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn exclusive() -> std::sync::MutexGuard<'static, ()> {
+        THROTTLE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// The gap must be enforced between request STARTS, independent of how
     /// long each request takes — otherwise the same code floods on a fast
     /// host and behaves on a slow one.
     #[tokio::test]
     async fn requests_are_spaced_by_at_least_the_interval() {
+        let _guard = exclusive();
         set_min_interval_ms(120);
         let start = std::time::Instant::now();
         for _ in 0..4 {
@@ -466,6 +480,7 @@ mod throttle_tests {
     /// than trust a constant.
     #[test]
     fn spacing_widens_on_a_rate_limit_and_recovers_on_success() {
+        let _guard = exclusive();
         set_min_interval_ms(1000);
         assert_eq!(current_interval_ms(), 1000);
 
@@ -491,6 +506,7 @@ mod throttle_tests {
     /// and the operator should move to the paid endpoint.
     #[test]
     fn backoff_is_capped() {
+        let _guard = exclusive();
         set_min_interval_ms(1000);
         for _ in 0..50 {
             note_rate_limited();
@@ -503,6 +519,7 @@ mod throttle_tests {
     /// which is the whole reason the throttle is global.
     #[tokio::test]
     async fn concurrent_callers_share_one_budget() {
+        let _guard = exclusive();
         set_min_interval_ms(100);
         let start = std::time::Instant::now();
         let mut set = Vec::new();
