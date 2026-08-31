@@ -1621,7 +1621,13 @@ impl Detector {
                                 self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
                             })
                             .collect();
-                        (wallets, tracker.sol_in_window(&buy.mint, now))
+                        // Volume from the SAME cohorts the count is filtered
+                        // by. Using the unfiltered total meant excluded
+                        // wallets could trigger a buy on their own.
+                        let sol = tracker.sol_in_window_from(&buy.mint, now, |w| {
+                            self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
+                        });
+                        (wallets, sol)
                     };
 
                     // A threshold of 0 means "not configured", NOT "buy

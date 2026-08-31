@@ -145,6 +145,39 @@ impl ConvictionTracker {
     /// COUNT because five wallets putting in 0.05 SOL each is a different
     /// signal from five putting in 5 SOL each, and the count cannot tell them
     /// apart.
+    /// SOL in the window from a CHOSEN set of wallets.
+    ///
+    /// # Why the unfiltered version is the wrong trigger
+    ///
+    /// `auto_buy_groups` exists to exclude cohorts that cannot be followed —
+    /// launch bundlers whose entries sit inside creation bundles, and a whale
+    /// group measured at 4555 moves for a 1.02x. The wallet COUNT respected
+    /// that filter; the SOL total did not, and the SOL total is what fires the
+    /// trade.
+    ///
+    /// So a token bought entirely by excluded wallets still accumulated volume
+    /// and triggered. Measured live: 405 of 1481 triggers fired with ZERO
+    /// eligible wallets — 27% of all entries came from cohorts we had
+    /// deliberately decided not to follow, including the two worst trades of
+    /// the day (one -75% in nine seconds).
+    pub fn sol_in_window_from(
+        &self,
+        mint: &str,
+        now: Instant,
+        allowed: impl Fn(&str) -> bool,
+    ) -> f64 {
+        self.tokens
+            .get(mint)
+            .map(|b| {
+                b.iter()
+                    .filter(|x| now.duration_since(x.at) < self.window)
+                    .filter(|x| allowed(&x.wallet))
+                    .map(|x| x.sol)
+                    .sum()
+            })
+            .unwrap_or(0.0)
+    }
+
     pub fn sol_in_window(&self, mint: &str, now: Instant) -> f64 {
         self.tokens
             .get(mint)
@@ -552,6 +585,49 @@ mod tests {
         assert_eq!(t.buyers_in_window("MINT", now).len(), 1);
     }
     use super::*;
+
+    /// THE bug: the wallet count respected `auto_buy_groups`, the SOL total did
+    /// not, and the SOL total is what fires the trade. Live, 405 of 1481
+    /// triggers came from cohorts we had explicitly excluded.
+    #[test]
+    fn trigger_volume_counts_only_allowed_cohorts() {
+        let mut t = ConvictionTracker::new(
+            Duration::from_secs(600),
+            2,
+            Duration::from_secs(86_400),
+        );
+        let now = Instant::now();
+        let utc = Utc::now();
+        t.record("M", "good1", "g1", 3.0, 0.0, now, utc);
+        t.record("M", "bundler", "b", 40.0, 0.0, now, utc);
+        t.record("M", "good2", "g2", 2.0, 0.0, now, utc);
+
+        let allowed = |w: &str| w.starts_with("good");
+        assert_eq!(
+            t.sol_in_window_from("M", now, allowed),
+            5.0,
+            "only the followable wallets count toward the trigger"
+        );
+        assert_eq!(
+            t.sol_in_window("M", now),
+            45.0,
+            "the unfiltered total still reports everything, for display"
+        );
+    }
+
+    /// A token bought only by excluded wallets must contribute nothing.
+    #[test]
+    fn excluded_cohorts_alone_cannot_trigger() {
+        let mut t = ConvictionTracker::new(
+            Duration::from_secs(600),
+            2,
+            Duration::from_secs(86_400),
+        );
+        let now = Instant::now();
+        t.record("M", "bundler1", "b", 30.0, 0.0, now, Utc::now());
+        t.record("M", "bundler2", "b", 30.0, 0.0, now, Utc::now());
+        assert_eq!(t.sol_in_window_from("M", now, |w| w.starts_with("good")), 0.0);
+    }
 
     const MINT: &str = "TokenMint111111111111111111111111111111111";
 
