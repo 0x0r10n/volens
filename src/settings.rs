@@ -132,6 +132,21 @@ pub struct LiveSettings {
     /// 0 = never triggers — see `ReboundPool::evaluate`.
     #[serde(default)]
     pub rebound_min_volume_sol: f64,
+    /// At or below this, the token counts as DEAD.
+    ///
+    /// Deliberately its own number rather than reusing the trigger. With one
+    /// threshold, a token hovering either side of it looked like a death and a
+    /// recovery every few passes; the gap between this and
+    /// `rebound_min_volume_sol` is what noise cannot cross.
+    #[serde(default = "default_dead_volume")]
+    pub rebound_dead_volume_sol: f64,
+    /// How long a token must stay dead before a recovery counts, in minutes.
+    ///
+    /// The other half of the fix. Measured over 116 live rebounds, 77% fired
+    /// within an hour of being watched and the median waited 17 minutes —
+    /// because a single quiet pass was enough to arm one.
+    #[serde(default = "default_min_dead_mins")]
+    pub rebound_min_dead_mins: i64,
     /// SOL per rebound entry.
     #[serde(default)]
     pub rebound_buy_sol: f64,
@@ -336,6 +351,8 @@ impl LiveSettings {
             rebound_enabled: false,
             rebound_watch_hours: default_rebound_hours(),
             rebound_min_volume_sol: 0.0,
+            rebound_dead_volume_sol: default_dead_volume(),
+            rebound_min_dead_mins: default_min_dead_mins(),
             rebound_buy_sol: 0.0,
             rebound_buy_enabled: false,
             rebound_exits: empty_rules(),
@@ -719,6 +736,16 @@ mod tests {
 
 fn default_rebound_hours() -> i64 {
     72
+}
+
+fn default_dead_volume() -> f64 {
+    0.5
+}
+
+/// Six hours. Long enough that the token has genuinely stopped, short enough
+/// that a real recovery inside a 72-hour window still qualifies.
+fn default_min_dead_mins() -> i64 {
+    360
 }
 
 /// Rebound starts with NO orders. `ExitRules::default()` carries the normal

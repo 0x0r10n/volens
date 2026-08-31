@@ -1816,6 +1816,8 @@ impl Bot {
             "rbuy" => ("rebound buy amount", "e.g. <code>0.05</code> (SOL)"),
             "rvol" => ("rebound volume", "e.g. <code>10</code> (SOL of fresh volume)"),
             "rwatch" => ("rebound watch duration", "e.g. <code>72</code> (hours)"),
+            "rdead" => ("dead volume", "e.g. <code>0.5</code> (SOL), below this is dead"),
+            "rdeadfor" => ("minimum time dead", "e.g. <code>360</code> (minutes)"),
             "rmaxopen" => ("rebound max open positions", "e.g. <code>2</code>, 0 = unlimited"),
             f if f.starts_with("rordt") => (
                 "trigger",
@@ -2149,6 +2151,12 @@ impl Bot {
             "not set".to_string()
         };
         let watch = format!("{}h", live.rebound_watch_hours);
+        let dead = format!("{} SOL", live.rebound_dead_volume_sol);
+        let deadfor = if live.rebound_min_dead_mins >= 60 {
+            format!("{}h", live.rebound_min_dead_mins / 60)
+        } else {
+            format!("{}m", live.rebound_min_dead_mins)
+        };
         let open_s = if live.rebound_max_open == 0 {
             "unlimited".to_string()
         } else {
@@ -2159,7 +2167,8 @@ impl Bot {
             "🔄 <b>Rebound</b> · {onoff}\n\n\
              Buying    <b>{buying}</b>\n\
              Buy size  <b>{amt}</b>\n\
-             Volume    <b>{vol}</b>\n\
+             Back above <b>{vol}</b>\n\
+             Dead below <b>{dead}</b> for <b>{deadfor}</b>\n\
              Watch     <b>{watch}</b>\n\
              Max open  <b>{open_s}</b>\n\
              Orders    <b>{}</b>\n\n\
@@ -2179,7 +2188,9 @@ impl Bot {
             [{"text": format!("💰 Buying · {buying}"),
               "callback_data": "setv:rebound_buy_on:toggle"},
              {"text": format!("🧮 Buy size · {amt}"), "callback_data": "set:rbuy"}],
-            [{"text": format!("💸 Volume · {vol}"), "callback_data": "set:rvol"},
+            [{"text": format!("💸 Back above · {vol}"), "callback_data": "set:rvol"},
+             {"text": format!("💀 Dead below · {dead}"), "callback_data": "set:rdead"}],
+            [{"text": format!("⌛ Dead for · {deadfor}"), "callback_data": "set:rdeadfor"},
              {"text": format!("⏳ Watch · {watch}"), "callback_data": "set:rwatch"}],
             [{"text": format!("📌 Max open · {open_s}"), "callback_data": "set:rmaxopen"}],
             [{"text": "📋 Orders", "callback_data": "set:rladder"},
@@ -2607,6 +2618,14 @@ impl Bot {
                         format!("{} SOL", live.rebound_min_volume_sol)
                     } else { "not set".to_string() },
                     vec![1.0, 2.0, 5.0, 10.0, 25.0, 50.0], " SOL", false),
+                "rdead" => ("💀 Dead below",
+                    "At or below this the token counts as dead. Must be under the rebound threshold.",
+                    format!("{} SOL", live.rebound_dead_volume_sol),
+                    vec![0.0, 0.1, 0.25, 0.5, 1.0, 2.0], " SOL", false),
+                "rdeadfor" => ("⌛ Dead for",
+                    "How long it must stay dead before a recovery counts, in minutes.",
+                    format!("{} min", live.rebound_min_dead_mins),
+                    vec![30.0, 60.0, 180.0, 360.0, 720.0, 1440.0], " min", false),
                 "rwatch" => ("⏳ Rebound watch",
                     "How long a touched token stays on the watchlist, in hours.",
                     format!("{}h", live.rebound_watch_hours),
@@ -2743,6 +2762,8 @@ impl Bot {
             "rbuy" => sniper.set_rebound_buy_sol(v),
             "rvol" => sniper.set_rebound_min_volume(v),
             "rwatch" => sniper.set_rebound_watch_hours(v as i64),
+            "rdead" => sniper.set_rebound_dead_volume(v),
+            "rdeadfor" => sniper.set_rebound_min_dead_mins(v as i64),
             "rmaxopen" => sniper.set_rebound_max_open(v as u32),
             "maxsize" => sniper.set_max_trade_size(v),
             "dailycap" => sniper.set_daily_cap(v),

@@ -47,18 +47,25 @@ pub struct Watch {
     /// once and the entry is still available if the buy was refused.
     #[serde(default)]
     pub alerted: bool,
-    /// Has this token actually gone quiet since the watch opened?
+    /// When this token went DEAD, if it currently is.
     ///
-    /// THE condition that makes this a rebound rather than a follow. A token
-    /// joins the watchlist at the exact moment tracked wallets are buying it,
-    /// so its fresh volume is at its highest right then — without this, every
-    /// watched token would trigger within seconds of being added and the mode
-    /// would just be a slower copy of the normal trigger.
+    /// THE condition that makes this a rebound rather than a follow, and the
+    /// earlier version of it did not work. It was a bool set the first time
+    /// volume dipped below the TRIGGER threshold — which a token hovering
+    /// either side of that line satisfies in one 30-second pass. Measured over
+    /// 116 live rebounds: 77% fired within an hour of being watched, median 17
+    /// MINUTES, and not one waited 4 hours on a 72-hour window. The mode was
+    /// buying the tail of the same pump auto-buy had already traded.
     ///
-    /// Set by the watcher the first time it observes volume BELOW the
-    /// threshold. Nothing can fire until then.
+    /// Two things fix it. Death is measured against its OWN much lower
+    /// threshold, so there is a gap between "dead" and "back" that noise cannot
+    /// cross; and it must PERSIST, so a single quiet pass is not a death.
+    ///
+    /// Cleared the moment volume rises above the dead line — the token is alive
+    /// again, so the clock restarts. That also gives one rebound per death
+    /// cycle for free.
     #[serde(default)]
-    pub went_quiet: bool,
+    pub dead_since: Option<DateTime<Utc>>,
     /// Price when the REBOUND alert fired, and the message it was announced in.
     ///
     /// The baseline for follow-up updates: "3.2x" on a rebound means since the
@@ -84,6 +91,17 @@ impl Watch {
     pub fn expired(&self, now: DateTime<Utc>, watch_secs: i64) -> bool {
         (now - self.since).num_seconds() > watch_secs
     }
+
+    /// Dead, and dead for long enough to count.
+    ///
+    /// A single quiet pass is not a death — that is precisely what let 77% of
+    /// rebounds fire within an hour of being watched.
+    pub fn dead_long_enough(&self, now: DateTime<Utc>, min_dead_secs: i64) -> bool {
+        match self.dead_since {
+            Some(t) => (now - t).num_seconds() >= min_dead_secs,
+            None => false,
+        }
+    }
 }
 
 /// Why a token did not produce a rebound entry. Returned rather than logged so
@@ -95,9 +113,10 @@ pub enum Skip {
     Expired,
     /// Fresh volume was below the threshold.
     TooQuiet,
-    /// Still busy from the activity that put it on the watchlist. A rebound is
-    /// a RETURN, so the token has to go quiet before it can come back.
-    NeverQuiet,
+    /// Never died, or has not been dead long enough. A rebound is a RETURN, so
+    /// the token has to stop trading — and stay stopped — before it can come
+    /// back.
+    NotDeadEnough,
 }
 
 /// The observation pool.
@@ -176,7 +195,7 @@ impl ReboundPool {
                     w.since = now;
                     w.triggered = false;
                     w.alerted = false;
-                    w.went_quiet = false;
+                    w.dead_since = None;
                     w.alert_price = None;
                     w.alert_msg_id = None;
                     w.reported_multiple = 0.0;
@@ -195,7 +214,7 @@ impl ReboundPool {
                         since: now,
                         triggered: false,
                         alerted: false,
-                        went_quiet: false,
+                        dead_since: None,
                         alert_price: None,
                         alert_msg_id: None,
                         reported_multiple: 0.0,
@@ -224,6 +243,7 @@ impl ReboundPool {
     /// Pure: it does not mutate. `mark_triggered` is separate so a buy that is
     /// refused downstream — by a safety veto, a position limit — does not burn
     /// the token's one entry for the cycle.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         &self,
         mint: &str,
@@ -231,6 +251,7 @@ impl ReboundPool {
         min_volume_sol: f64,
         now: DateTime<Utc>,
         watch_secs: i64,
+        min_dead_secs: i64,
     ) -> Result<(), Skip> {
         let Some(w) = self.watching.get(mint) else { return Err(Skip::NotWatched) };
         if w.triggered {
@@ -239,8 +260,8 @@ impl ReboundPool {
         if w.expired(now, watch_secs) {
             return Err(Skip::Expired);
         }
-        if !w.went_quiet {
-            return Err(Skip::NeverQuiet);
+        if !w.dead_long_enough(now, min_dead_secs) {
+            return Err(Skip::NotDeadEnough);
         }
         // A threshold of zero would fire on any token that has traded at all,
         // which is every token in the pool.
@@ -255,6 +276,7 @@ impl ReboundPool {
     /// The same volume test as `evaluate`, against the alert's own once-per-cycle
     /// flag. Kept separate so a token can be reported even when no buy is
     /// configured — which is the normal state while thresholds are being chosen.
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate_alert(
         &self,
         mint: &str,
@@ -262,6 +284,7 @@ impl ReboundPool {
         min_volume_sol: f64,
         now: DateTime<Utc>,
         watch_secs: i64,
+        min_dead_secs: i64,
     ) -> Result<(), Skip> {
         let Some(w) = self.watching.get(mint) else { return Err(Skip::NotWatched) };
         if w.alerted {
@@ -270,9 +293,9 @@ impl ReboundPool {
         if w.expired(now, watch_secs) {
             return Err(Skip::Expired);
         }
-        // It has to have LEFT before it can come back.
-        if !w.went_quiet {
-            return Err(Skip::NeverQuiet);
+        // It has to have LEFT, and stayed gone, before it can come back.
+        if !w.dead_long_enough(now, min_dead_secs) {
+            return Err(Skip::NotDeadEnough);
         }
         if min_volume_sol <= 0.0 || fresh_volume_sol < min_volume_sol {
             return Err(Skip::TooQuiet);
@@ -285,17 +308,31 @@ impl ReboundPool {
         self.watching.get(mint).map(|w| (w.price_at_watch, w.since))
     }
 
-    /// Record that a token is currently below the threshold.
+    /// Record that a token is below the DEAD line right now.
     ///
-    /// Returns true the first time, so the caller can log the transition once.
-    pub fn mark_quiet(&mut self, mint: &str) -> bool {
+    /// Returns true only on the transition into death, so the caller can log it
+    /// once rather than every pass.
+    pub fn mark_dead(&mut self, mint: &str, now: DateTime<Utc>) -> bool {
         match self.watching.get_mut(mint) {
-            Some(w) if !w.went_quiet => {
-                w.went_quiet = true;
+            Some(w) if w.dead_since.is_none() => {
+                w.dead_since = Some(now);
                 self.dirty = true;
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Record that a token is trading above the dead line.
+    ///
+    /// Resets the death clock: a token that traded is not dead, and its
+    /// previous stint does not count toward the next one.
+    pub fn mark_alive(&mut self, mint: &str) {
+        if let Some(w) = self.watching.get_mut(mint)
+            && w.dead_since.is_some()
+        {
+            w.dead_since = None;
+            self.dirty = true;
         }
     }
 
@@ -406,16 +443,16 @@ mod tests {
     fn fresh_volume_over_the_threshold_triggers() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 12.0, 10.0, now(), WATCH), Ok(()));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 12.0, 10.0, now(), WATCH, 0), Ok(()));
     }
 
     #[test]
     fn quiet_tokens_do_not_trigger() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 4.0, 10.0, now(), WATCH), Err(Skip::TooQuiet));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 4.0, 10.0, now(), WATCH, 0), Err(Skip::TooQuiet));
     }
 
     /// A threshold of zero would fire on every token in the pool, which is
@@ -424,14 +461,14 @@ mod tests {
     fn a_zero_threshold_never_triggers() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 999.0, 0.0, now(), WATCH), Err(Skip::TooQuiet));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 999.0, 0.0, now(), WATCH, 0), Err(Skip::TooQuiet));
     }
 
     #[test]
     fn a_token_nobody_tracked_is_not_watched() {
         let p = ReboundPool::new();
-        assert_eq!(p.evaluate("M", 999.0, 1.0, now(), WATCH), Err(Skip::NotWatched));
+        assert_eq!(p.evaluate("M", 999.0, 1.0, now(), WATCH, 0), Err(Skip::NotWatched));
     }
 
     /// One entry per cycle. A token trading steadily above the threshold would
@@ -440,10 +477,10 @@ mod tests {
     fn a_token_only_triggers_once_per_cycle() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH, 0), Ok(()));
         p.mark_triggered("M");
-        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Err(Skip::AlreadyTriggered));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH, 0), Err(Skip::AlreadyTriggered));
     }
 
     /// Marking is separate from evaluating precisely so a refused buy does not
@@ -452,18 +489,18 @@ mod tests {
     fn evaluating_alone_does_not_spend_the_entry() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()));
-        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH), Ok(()), "still armed");
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH, 0), Ok(()));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, now(), WATCH, 0), Ok(()), "still armed");
     }
 
     #[test]
     fn the_window_closes() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
+        p.mark_dead("M", now());
         let later = now() + Duration::seconds(WATCH + 1);
-        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Err(Skip::Expired));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH, 0), Err(Skip::Expired));
         assert_eq!(p.expire(later, WATCH), 1);
         assert!(p.is_empty());
     }
@@ -474,17 +511,17 @@ mod tests {
     fn a_new_touch_after_triggering_starts_a_fresh_cycle() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
+        p.mark_dead("M", now());
         p.mark_triggered("M");
         let later = now() + Duration::seconds(3600);
         assert!(p.observe("M", later, WATCH, None), "a new cycle opened");
         assert_eq!(
-            p.evaluate("M", 50.0, 10.0, later, WATCH),
-            Err(Skip::NeverQuiet),
+            p.evaluate("M", 50.0, 10.0, later, WATCH, 0),
+            Err(Skip::NotDeadEnough),
             "a fresh cycle must see it go quiet again first"
         );
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Ok(()));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH, 0), Ok(()));
     }
 
     /// ...but a touch DURING a live, unspent cycle must not keep pushing the
@@ -493,11 +530,11 @@ mod tests {
     fn a_touch_during_a_live_cycle_does_not_extend_it() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
+        p.mark_dead("M", now());
         let mid = now() + Duration::seconds(WATCH - 60);
         assert!(!p.observe("M", mid, WATCH, None));
         let after = now() + Duration::seconds(WATCH + 1);
-        assert_eq!(p.evaluate("M", 50.0, 10.0, after, WATCH), Err(Skip::Expired));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, after, WATCH, 0), Err(Skip::Expired));
     }
 
     /// The whole point of persisting: a 72-hour window must outlive a deploy.
@@ -510,20 +547,20 @@ mod tests {
 
         let mut pool = ReboundPool::new();
         pool.observe("A", now(), WATCH, None);
-        pool.mark_quiet("A");
+        pool.mark_dead("A", now());
         pool.observe("B", now(), WATCH, None);
-        pool.mark_quiet("B");
+        pool.mark_dead("B", now());
         pool.mark_triggered("B");
         save_watches(&p, &pool.watches());
 
         let restored = ReboundPool::from_watches(load_watches(&p));
         assert_eq!(restored.len(), 2, "both watches came back");
         assert_eq!(
-            restored.evaluate("B", 50.0, 1.0, now(), WATCH),
+            restored.evaluate("B", 50.0, 1.0, now(), WATCH, 0),
             Err(Skip::AlreadyTriggered),
             "and B is still spent — a restart must not re-arm it"
         );
-        assert_eq!(restored.evaluate("A", 50.0, 1.0, now(), WATCH), Ok(()));
+        assert_eq!(restored.evaluate("A", 50.0, 1.0, now(), WATCH, 0), Ok(()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -534,17 +571,17 @@ mod tests {
     fn alerting_and_buying_are_independent() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
+        p.mark_dead("M", now());
 
-        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, now(), WATCH), Ok(()));
+        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, now(), WATCH, 0), Ok(()));
         p.mark_alerted("M");
         assert_eq!(
-            p.evaluate_alert("M", 50.0, 10.0, now(), WATCH),
+            p.evaluate_alert("M", 50.0, 10.0, now(), WATCH, 0),
             Err(Skip::AlreadyTriggered),
             "announced once per cycle"
         );
         assert_eq!(
-            p.evaluate("M", 50.0, 10.0, now(), WATCH),
+            p.evaluate("M", 50.0, 10.0, now(), WATCH, 0),
             Ok(()),
             "but the entry is still available"
         );
@@ -559,19 +596,19 @@ mod tests {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
         assert_eq!(
-            p.evaluate("M", 999.0, 10.0, now(), WATCH),
-            Err(Skip::NeverQuiet),
+            p.evaluate("M", 999.0, 10.0, now(), WATCH, 0),
+            Err(Skip::NotDeadEnough),
             "still busy from the buying that put it on the list"
         );
         assert_eq!(
-            p.evaluate_alert("M", 999.0, 10.0, now(), WATCH),
-            Err(Skip::NeverQuiet),
+            p.evaluate_alert("M", 999.0, 10.0, now(), WATCH, 0),
+            Err(Skip::NotDeadEnough),
             "and it must not be announced either"
         );
 
-        assert!(p.mark_quiet("M"), "the first quiet observation is the transition");
-        assert!(!p.mark_quiet("M"), "and it is recorded only once");
-        assert_eq!(p.evaluate("M", 999.0, 10.0, now(), WATCH), Ok(()), "now it is a rebound");
+        assert!(p.mark_dead("M", now()), "the first quiet observation is the transition");
+        assert!(!p.mark_dead("M", now()), "and it is recorded only once");
+        assert_eq!(p.evaluate("M", 999.0, 10.0, now(), WATCH, 0), Ok(()), "now it is a rebound");
     }
 
     /// Saving is throttled, so a pass can take the flag without writing. The
@@ -585,19 +622,85 @@ mod tests {
         assert!(p.take_dirty(), "still outstanding for the next eligible pass");
     }
 
+    /// THE bug this replaced. A bool set on one quiet pass meant a token that
+    /// hovered either side of the trigger looked like a death and a recovery
+    /// within a minute. Live: 77% of rebounds fired inside an hour, median 17
+    /// minutes, on a 72-hour window.
+    #[test]
+    fn a_brief_dip_is_not_a_death() {
+        const SIX_H: i64 = 6 * 3600;
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+
+        // Dips below the dead line, then recovers a minute later.
+        p.mark_dead("M", now());
+        let soon = now() + Duration::seconds(60);
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, soon, WATCH, SIX_H),
+            Err(Skip::NotDeadEnough),
+            "one quiet minute is not a death"
+        );
+
+        // Still dead six hours later — now it counts.
+        let later = now() + Duration::seconds(SIX_H + 1);
+        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH, SIX_H), Ok(()));
+    }
+
+    /// Trading above the dead line resets the clock: a token that traded is not
+    /// dead, and its previous stint does not count toward the next one.
+    #[test]
+    fn coming_back_to_life_restarts_the_clock() {
+        const SIX_H: i64 = 6 * 3600;
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+        p.mark_dead("M", now());
+
+        // Five hours dead, then a trade.
+        p.mark_alive("M");
+        let t = now() + Duration::seconds(5 * 3600);
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, t, WATCH, SIX_H),
+            Err(Skip::NotDeadEnough),
+            "the earlier stint does not carry over"
+        );
+
+        // Dies again; the six hours start from here.
+        p.mark_dead("M", t);
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, t + Duration::seconds(SIX_H - 60), WATCH, SIX_H),
+            Err(Skip::NotDeadEnough)
+        );
+        assert_eq!(
+            p.evaluate("M", 50.0, 10.0, t + Duration::seconds(SIX_H + 1), WATCH, SIX_H),
+            Ok(())
+        );
+    }
+
+    /// A token that never stops trading can never rebound, however loud it gets.
+    #[test]
+    fn a_token_that_never_dies_never_rebounds() {
+        let mut p = ReboundPool::new();
+        p.observe("M", now(), WATCH, None);
+        let later = now() + Duration::seconds(48 * 3600);
+        assert_eq!(
+            p.evaluate("M", 999.0, 10.0, later, WATCH, 6 * 3600),
+            Err(Skip::NotDeadEnough)
+        );
+    }
+
     /// A refused buy must not silence the next cycle's alert either.
     #[test]
     fn a_new_cycle_re_arms_both_flags() {
         let mut p = ReboundPool::new();
         p.observe("M", now(), WATCH, None);
-        p.mark_quiet("M");
+        p.mark_dead("M", now());
         p.mark_alerted("M");
         p.mark_triggered("M");
         let later = now() + Duration::seconds(3600);
         assert!(p.observe("M", later, WATCH, None));
-        p.mark_quiet("M");
-        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, later, WATCH), Ok(()));
-        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH), Ok(()));
+        p.mark_dead("M", now());
+        assert_eq!(p.evaluate_alert("M", 50.0, 10.0, later, WATCH, 0), Ok(()));
+        assert_eq!(p.evaluate("M", 50.0, 10.0, later, WATCH, 0), Ok(()));
     }
 
     /// The price at watch time is what makes "trading again" readable as
@@ -619,12 +722,12 @@ mod tests {
         assert!(!p.take_dirty(), "a fresh pool has nothing to save");
 
         p.observe("A", now(), WATCH, None);
-        p.mark_quiet("A");
+        p.mark_dead("A", now());
         assert!(p.take_dirty(), "a new watch");
         assert!(!p.take_dirty(), "and the flag clears");
 
         p.observe("A", now(), WATCH, None);
-        p.mark_quiet("A");
+        p.mark_dead("A", now());
         assert!(!p.take_dirty(), "a repeat touch in the same cycle changes nothing");
 
         p.mark_triggered("A");
@@ -642,7 +745,7 @@ mod tests {
             since: now(),
             triggered: false,
             alerted: false,
-            went_quiet: true,
+            dead_since: Some(now()),
             alert_price: None,
             alert_msg_id: None,
             reported_multiple: 0.0,
@@ -666,13 +769,13 @@ mod tests {
     fn watches_survive_a_round_trip() {
         let mut p = ReboundPool::new();
         p.observe("A", now(), WATCH, None);
-        p.mark_quiet("A");
+        p.mark_dead("A", now());
         p.observe("B", now(), WATCH, None);
-        p.mark_quiet("B");
+        p.mark_dead("B", now());
         p.mark_triggered("B");
         let restored = ReboundPool::from_watches(p.watches());
         assert_eq!(restored.len(), 2);
-        assert_eq!(restored.evaluate("B", 50.0, 1.0, now(), WATCH), Err(Skip::AlreadyTriggered));
-        assert_eq!(restored.evaluate("A", 50.0, 1.0, now(), WATCH), Ok(()));
+        assert_eq!(restored.evaluate("B", 50.0, 1.0, now(), WATCH, 0), Err(Skip::AlreadyTriggered));
+        assert_eq!(restored.evaluate("A", 50.0, 1.0, now(), WATCH, 0), Ok(()));
     }
 }

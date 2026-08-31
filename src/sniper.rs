@@ -2070,6 +2070,39 @@ impl Sniper {
         })
     }
 
+    /// At or below this, a token counts as dead.
+    pub fn set_rebound_dead_volume(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("volume must be zero or positive".into());
+        }
+        let trigger = self.settings.snapshot().rebound_min_volume_sol;
+        if trigger > 0.0 && v >= trigger {
+            return Err(format!(
+                "dead ({v}) must be below the rebound threshold ({trigger}) — \
+                 the gap between them is what noise cannot cross"
+            ));
+        }
+        self.settings.update(|s| {
+            s.rebound_dead_volume_sol = v;
+            Ok(format!("a token is dead at or below {v} SOL"))
+        })
+    }
+
+    /// How long a token must stay dead before a recovery counts.
+    pub fn set_rebound_min_dead_mins(&self, m: i64) -> Result<String, String> {
+        if !(0..=10_080).contains(&m) {
+            return Err("must be between 0 and 10080 minutes".into());
+        }
+        self.settings.update(|s| {
+            s.rebound_min_dead_mins = m;
+            Ok(if m == 0 {
+                "no minimum death — any dip counts (not recommended)".to_string()
+            } else {
+                format!("must stay dead {m} min before a recovery counts")
+            })
+        })
+    }
+
     pub fn set_rebound_watch_hours(&self, h: i64) -> Result<String, String> {
         if !(1..=720).contains(&h) {
             return Err("watch duration must be between 1 and 720 hours".into());

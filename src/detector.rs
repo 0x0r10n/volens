@@ -559,27 +559,19 @@ impl Detector {
                     // meant ~31,000 acquisitions a pass against the same mutex
                     // the stream writes fills through.
                     let volumes = prices.volumes_sol_in(&watching, fresh_window);
-                    let (busy, quiet): (Vec<&String>, Vec<&String>) = watching
+                    let min_dead_secs = live.rebound_min_dead_mins.max(0) * 60;
+                    let busy: Vec<&String> = watching
                         .iter()
-                        .partition(|m| {
+                        .filter(|m| {
                             volumes.get(*m).copied().unwrap_or(0.0)
                                 >= live.rebound_min_volume_sol
-                        });
-                    if !quiet.is_empty() {
-                        // BELOW the threshold is the state a rebound comes back
-                        // FROM. A token added while its buyers were still
-                        // active has never been quiet and cannot rebound yet.
-                        let mut newly = 0usize;
-                        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
-                        for m in quiet {
-                            if p.mark_quiet(m) {
-                                newly += 1;
-                            }
-                        }
-                        if newly > 0 {
-                            debug!(newly, "rebound: tokens gone quiet — now armed");
-                        }
-                    }
+                        })
+                        .collect();
+
+                    // DEATH STATE IS UPDATED AFTER the triggers are evaluated,
+                    // further down. Doing it here would clear `dead_since` on
+                    // the very pass that sees the recovery — the condition
+                    // would erase its own precondition and could never fire.
 
                     for mint in busy.into_iter().cloned() {
                         let fresh = volumes.get(&mint).copied().unwrap_or(0.0);
@@ -596,6 +588,7 @@ impl Detector {
                                     live.rebound_min_volume_sol,
                                     now,
                                     watch_secs,
+                                    min_dead_secs,
                                 ),
                                 p.context(&mint),
                             )
@@ -662,6 +655,7 @@ impl Detector {
                                 live.rebound_min_volume_sol,
                                 now,
                                 watch_secs,
+                                min_dead_secs,
                             )
                         };
                         // Only the interesting outcome is logged. "Too quiet" is
@@ -697,6 +691,35 @@ impl Detector {
                             crate::alerts::render_rebound_buy(&mint, fresh, &outcome)
                         {
                             alerter.send_html(msg).await;
+                        }
+                    }
+
+                    // DEATH STATE, updated LAST.
+                    //
+                    // After the triggers, never before: clearing `dead_since`
+                    // on the same pass that sees the recovery would erase the
+                    // precondition the trigger just used, and nothing could
+                    // ever fire. Rising above the dead line resets the clock,
+                    // which also gives one rebound per death cycle for free.
+                    {
+                        let mut p = pool.lock().unwrap_or_else(|e| e.into_inner());
+                        let mut newly_dead = 0usize;
+                        for m in &watching {
+                            let v = volumes.get(m).copied().unwrap_or(0.0);
+                            if v <= live.rebound_dead_volume_sol {
+                                if p.mark_dead(m, now) {
+                                    newly_dead += 1;
+                                }
+                            } else {
+                                p.mark_alive(m);
+                            }
+                        }
+                        if newly_dead > 0 {
+                            debug!(
+                                newly_dead,
+                                dead_below = live.rebound_dead_volume_sol,
+                                "rebound: tokens went dead"
+                            );
                         }
                     }
                 }
