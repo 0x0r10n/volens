@@ -886,6 +886,29 @@ impl Sniper {
         })
     }
 
+    /// Refuse tokens valued below this. 0 = no floor.
+    pub fn set_min_market_cap(&self, v: f64) -> Result<String, String> {
+        if v < 0.0 || v.is_nan() || v.is_infinite() {
+            return Err("value must be zero or positive".into());
+        }
+        let env = self.settings.envelope();
+        let live = self.settings.snapshot();
+        let max = live.effective_max_market_cap(&env);
+        if v > 0.0 && max > 0.0 && v >= max {
+            return Err(format!(
+                "floor ${v:.0} must be below the ceiling ${max:.0} — nothing would qualify"
+            ));
+        }
+        self.settings.update(|s| {
+            s.min_market_cap_usd = v;
+            Ok(if v > 0.0 {
+                format!("refusing tokens valued under ${v:.0}")
+            } else {
+                "market-cap floor removed".to_string()
+            })
+        })
+    }
+
     /// Tighten the tolerated price impact.
     pub fn set_max_impact_bps(&self, v: u32) -> Result<String, String> {
         let hard = self.settings.envelope().max_price_impact_bps;
@@ -1132,12 +1155,20 @@ impl Sniper {
         let mut lamports = (size * 1e9) as u64;
         let jup = Jupiter::new(&self.cfg.jupiter_base_url);
         let max_mcap = live.effective_max_market_cap(&env);
+        // The FLOOR. Checked wherever the ceiling is, and the pair is what
+        // decides whether the valuation has to be read at all — a floor-only
+        // configuration must not be silently skipped.
+        let min_mcap = live.min_market_cap_usd;
+        let need_mcap = max_mcap > 0.0 || min_mcap > 0.0;
         let (mint_info, quote, supply) = tokio::join!(
             self.rpc.mint_info(mint),
             jup.quote(WSOL_MINT, mint, lamports, live.slippage_bps),
-            // Fetched when EITHER guard needs it, and not otherwise.
+            // Fetched when EITHER bound needs it, and not otherwise. Gating
+            // this on the ceiling alone would leave a floor-only configuration
+            // with no supply to measure against — the setting would be
+            // accepted, displayed, and quietly do nothing.
             async {
-                if max_mcap > 0.0 {
+                if need_mcap {
                     self.rpc.token_supply(mint).await
                 } else {
                     None
@@ -1322,16 +1353,23 @@ impl Sniper {
                         }
                         let tokens_ui =
                             plan.quote.expected_out as f64 / 10f64.powi(decimals as i32);
-                        if max_mcap > 0.0 {
+                        if need_mcap {
                             let sol_usd =
                                 self.prices.sol_usd(std::time::Duration::from_secs(600));
                             match (tokens_ui > 0.0).then_some(()).and(sol_usd).zip(supply) {
                                 Some((sol_usd, supply)) => {
                                     let mcap = (size / tokens_ui) * supply * sol_usd;
-                                    if mcap >= max_mcap {
+                                    if max_mcap > 0.0 && mcap >= max_mcap {
                                         return BuyOutcome::Refused {
                                             reason: format!(
                                                 "market cap ${mcap:.0} at or above ${max_mcap:.0}"
+                                            ),
+                                        };
+                                    }
+                                    if min_mcap > 0.0 && mcap < min_mcap {
+                                        return BuyOutcome::Refused {
+                                            reason: format!(
+                                                "market cap ${mcap:.0} below the ${min_mcap:.0} floor"
                                             ),
                                         };
                                     }
@@ -1387,14 +1425,19 @@ impl Sniper {
         // Priced from THIS quote rather than the stream index: the quote is the
         // price we are about to pay, and it exists by definition here, so the
         // check cannot be skipped for want of an observation.
-        if max_mcap > 0.0 {
+        if need_mcap {
             // Already UI units above.
             let sol_usd = self.prices.sol_usd(std::time::Duration::from_secs(600));
             match (tokens_out > 0.0).then_some(()).and(sol_usd).zip(supply) {
                 Some((sol_usd, supply)) => {
                     let price_sol = size / tokens_out;
                     let mcap = price_sol * supply * sol_usd;
-                    if mcap >= max_mcap {
+                    if min_mcap > 0.0 && mcap < min_mcap {
+                        return BuyOutcome::Refused {
+                            reason: format!("market cap ${mcap:.0} below the ${min_mcap:.0} floor"),
+                        };
+                    }
+                    if max_mcap > 0.0 && mcap >= max_mcap {
                         return BuyOutcome::Refused {
                             reason: format!("market cap ${mcap:.0} at or above ${max_mcap:.0}"),
                         };

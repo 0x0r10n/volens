@@ -1658,11 +1658,15 @@ impl Bot {
              Default size · <b>{} SOL</b>\n\
              MC bands · <b>{bands}</b>\n\
              Slippage · <b>{} bps</b>\n\
-             Max market cap · <b>{}</b>\n\
-             Supply cap · <b>{cap}</b>\n\n\
-",
+             Market cap · <b>{}</b> to <b>{}</b>\n\
+             Supply cap · <b>{cap}</b>",
             live.trade_size_sol,
             live.slippage_bps,
+            if live.min_market_cap_usd > 0.0 {
+                fmt_usd_cap(live.min_market_cap_usd)
+            } else {
+                "any".to_string()
+            },
             fmt_usd_cap(live.max_market_cap_usd)
         );
         let rows = serde_json::json!({ "inline_keyboard": [
@@ -1670,9 +1674,12 @@ impl Bot {
               "callback_data": "set:size"},
              {"text": format!("📉 Slippage · {} bps", live.slippage_bps),
               "callback_data": "set:slippage"}],
-            [{"text": format!("🏦 Max MC · {}", fmt_usd_cap(live.max_market_cap_usd)),
-              "callback_data": "set:maxmcap"},
-             {"text": format!("📊 MC bands · {}", if live.buy_tiers.is_empty() {
+            [{"text": format!("🏗 Min MC · {}", if live.min_market_cap_usd > 0.0 {
+                fmt_usd_cap(live.min_market_cap_usd) } else { "none".to_string() }),
+              "callback_data": "set:minmcap"},
+             {"text": format!("🏦 Max MC · {}", fmt_usd_cap(live.max_market_cap_usd)),
+              "callback_data": "set:maxmcap"}],
+            [{"text": format!("📊 MC bands · {}", if live.buy_tiers.is_empty() {
                 "off".to_string() } else { live.buy_tiers.len().to_string() }),
               "callback_data": "set:tiers"}],
             [{"text": format!("🪙 Supply cap · {cap}"), "callback_data": "set:supplycap"},
@@ -1834,6 +1841,7 @@ impl Bot {
             "dailycap" => ("daily spend cap", "e.g. <code>0.35</code> (SOL)"),
             "maxtrades" => ("trades per day", "e.g. <code>6</code>"),
             "maxmcap" => ("max market cap", "e.g. <code>75000</code> (USD)"),
+            "minmcap" => ("min market cap", "e.g. <code>15000</code> (USD), 0 = no floor"),
             "maximpact" => ("max price impact", "e.g. <code>400</code> (bps)"),
             f if f.starts_with("ordt") => (
                 "trigger",
@@ -2659,6 +2667,12 @@ impl Bot {
                     "Buys per day. 0 = unlimited.",
                     fmt_eff_u(live.max_trades_per_day, env.max_trades_per_day),
                     vec![0.0, 1.0, 2.0, 3.0, 5.0, 10.0], "", true),
+                "minmcap" => ("🏗 Min market cap",
+                    "Refuse entries valued BELOW this. 0 = no floor.",
+                    if live.min_market_cap_usd > 0.0 {
+                        fmt_usd_cap(live.min_market_cap_usd)
+                    } else { "none".to_string() },
+                    vec![0.0, 10_000.0, 15_000.0, 25_000.0, 50_000.0, 100_000.0], " USD", false),
                 "maxmcap" => ("🏦 Max market cap", "Refuse entries at or above this.",
                     fmt_eff(live.max_market_cap_usd, env.max_market_cap_usd, ""),
                     vec![10_000.0, 25_000.0, 50_000.0, 100_000.0, 250_000.0], " USD", true),
@@ -2769,6 +2783,7 @@ impl Bot {
             "dailycap" => sniper.set_daily_cap(v),
             "maxtrades" => sniper.set_max_trades(v as u32),
             "maxmcap" => sniper.set_max_market_cap(v),
+            "minmcap" => sniper.set_min_market_cap(v),
             "maximpact" => sniper.set_max_impact_bps(v as u32),
             _ => Err("unknown setting".to_string()),
         };

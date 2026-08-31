@@ -68,6 +68,19 @@ pub struct LiveSettings {
     pub daily_cap_sol: f64,
     pub max_trades_per_day: u32,
     pub max_market_cap_usd: f64,
+    /// Refuse tokens valued BELOW this. 0 = no floor.
+    ///
+    /// The ceiling has always had no counterpart, which made the trigger
+    /// backwards: the smaller a token is, the less SOL it takes to clear any
+    /// volume threshold, so the deadest tokens were the easiest to trigger. A
+    /// $4.3K entry lost 18% in 31 seconds — not to the market moving, but
+    /// because 0.1 SOL is a meaningful fraction of a token that size and the
+    /// round trip gives it straight back.
+    ///
+    /// Unlike the caps this only ever REFUSES more, so it needs no host
+    /// envelope: raising it cannot increase risk.
+    #[serde(default)]
+    pub min_market_cap_usd: f64,
     pub max_price_impact_bps: u32,
 
     /// When to sell a position. See `crate::exits`.
@@ -342,6 +355,7 @@ impl LiveSettings {
             daily_cap_sol: 0.0,
             max_trades_per_day: 0,
             max_market_cap_usd: 0.0,
+            min_market_cap_usd: 0.0,
             max_price_impact_bps: 0,
             exits: crate::exits::ExitRules::default(),
             auto_buy: false,
@@ -721,6 +735,29 @@ mod tests {
         s.alpha_buy_sol = 0.75;
         clamp(&mut s, &env);
         assert_eq!(s.alpha_buy_sol, 0.2, "clamped to the ceiling, not refused later");
+    }
+
+    /// The ceiling had no counterpart, which made the trigger backwards: the
+    /// smaller a token, the less SOL it takes to clear any volume threshold. A
+    /// $4.3K entry lost 18% in 31 seconds on nothing but its own round trip.
+    #[test]
+    fn the_market_cap_floor_defaults_to_off() {
+        let env = env();
+        let s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        assert_eq!(s.min_market_cap_usd, 0.0, "no floor until one is chosen");
+    }
+
+    /// A floor at or above the ceiling would qualify nothing at all.
+    #[test]
+    fn a_floor_above_the_ceiling_is_refused() {
+        let env = env();
+        let mut s = LiveSettings::from_envelope(&env, 0.1, "guard");
+        s.max_market_cap_usd = 50_000.0;
+        let max = s.effective_max_market_cap(&env);
+        assert!(max > 0.0);
+        // The setter enforces this; the invariant it protects is that some
+        // band of valuations remains buyable.
+        assert!(60_000.0 >= max, "a floor above the ceiling leaves no window");
     }
 
     #[test]
