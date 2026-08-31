@@ -75,19 +75,264 @@ pub struct Detector {
     sniper: Arc<Sniper>,
     /// Mints already auto-bought, so one signal opens one position.
     #[cfg(feature = "sniper")]
-    smart_bought: std::sync::Mutex<std::collections::HashSet<String>>,
+    smart_bought: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     /// Qualifying Alpha wallets, with the time they were computed.
     ///
     /// Cached because the scoring pass walks the whole signal history and this
     /// is consulted on EVERY tracked buy — roughly 861 a minute. Recomputing it
     /// per buy would put a full history scan in the hot path of the stream.
     #[cfg(feature = "sniper")]
-    alpha_wallets: std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>,
+    alpha_wallets: Arc<std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>>,
+    /// Bounds concurrent buys. See `BuyTask::buy_slots`.
+    #[cfg(feature = "sniper")]
+    buy_slots: Arc<tokio::sync::Semaphore>,
     /// The permanent record wallet scoring is built from.
     alpha_ledger: std::sync::Arc<crate::alpha::ScoreLedger>,
     /// Tokens smart money has touched, watched for a rebound.
     #[cfg(feature = "sniper")]
     rebound: std::sync::Arc<std::sync::Mutex<crate::rebound::ReboundPool>>,
+}
+
+/// The handles a buy needs, owned rather than borrowed.
+///
+/// # Why the buy does not run on the stream task
+///
+/// This used to be `self.spawn_smart_buy(..).await` inside the gRPC handler —
+/// awaited inline despite the name, so every triggered buy blocked stream
+/// consumption for the whole entry path: position count, affordability, quote,
+/// mint safety, submission. Measured at ~1.45s.
+///
+/// The server does not wait. With 54 triggers in ten minutes its send queue
+/// overflowed and it evicted us:
+///
+/// ```text
+///   'Some resource has been exhausted': "client too slow: 1524 updates dropped"
+/// ```
+///
+/// Five of those in three minutes, escalating 1524 → 5663 as each reconnect
+/// replayed a backlog it then fell behind on again. Everything here is already
+/// an `Arc`, so a clone is cheap and the buy can run on its own task while the
+/// stream keeps draining.
+#[cfg(feature = "sniper")]
+#[derive(Clone)]
+struct BuyTask {
+    cfg: Arc<Config>,
+    sniper: Arc<Sniper>,
+    rpc: Arc<RpcClient>,
+    alerter: Arc<Alerter>,
+    wallets: Arc<WalletBook>,
+    prices: Arc<crate::prices::PriceIndex>,
+    signals: Arc<crate::signals::SignalStore>,
+    conviction: Arc<Mutex<ConvictionTracker>>,
+    alpha_ledger: Arc<crate::alpha::ScoreLedger>,
+    smart_bought: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    alpha_wallets: Arc<std::sync::Mutex<Option<(Instant, std::collections::HashSet<String>)>>>,
+    /// Bounds how many buys run at once.
+    ///
+    /// Spawning fixed the stream stalling, but replaced one problem with the
+    /// opposite risk: a burst of triggers would spawn a task each, and every
+    /// one issues RPC calls. Serialised, they were self-limiting; unbounded,
+    /// they would hammer the provider precisely when the market is busiest —
+    /// and a rate-limited provider is how the exit path goes blind.
+    ///
+    /// Four is enough that a buy never waits behind an unrelated one, and few
+    /// enough that a flood cannot turn into a request storm.
+    buy_slots: Arc<tokio::sync::Semaphore>,
+}
+
+#[cfg(feature = "sniper")]
+impl BuyTask {
+    /// Is this wallet currently trusted with Alpha money?
+    ///
+    /// The qualifying set is recomputed at most every five minutes. Scores move
+    /// as calls resolve, not tick by tick, so a fresher answer would cost a full
+    /// history scan per buy to tell us the same thing.
+    #[cfg(feature = "sniper")]
+    fn alpha_qualified(&self, wallet: &str) -> bool {
+        const REFRESH: Duration = Duration::from_secs(300);
+
+        // Staleness is decided under the lock; the REBUILD is not.
+        //
+        // Rebuilding reads and parses the whole score archive — tens of
+        // thousands of rows — and this is called on the tracked-buy path, which
+        // carries roughly 861 transactions a minute. Doing that file work while
+        // holding the lock stalled every other caller behind it on an async
+        // worker thread.
+        //
+        // The timestamp is stamped BEFORE the rebuild, so a burst of callers
+        // arriving together does not each start their own scan.
+        let stale = {
+            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
+            match cache.as_mut() {
+                Some((at, _)) if at.elapsed() < REFRESH => false,
+                Some((at, _)) => {
+                    *at = Instant::now();
+                    true
+                }
+                None => {
+                    // Nothing to serve yet: claim the rebuild with an empty set
+                    // so concurrent callers wait for it rather than duplicating.
+                    *cache = Some((Instant::now(), std::collections::HashSet::new()));
+                    true
+                }
+            }
+        };
+
+        if stale {
+            let rules = self.sniper.alpha_rules();
+            // ARCHIVE first, live store second. The archive is the 30-day
+            // record; the live store is today, which has not been archived yet.
+            // Scoring on the live store alone silently capped every wallet's
+            // record at `track_for_secs` — one day — no matter what the
+            // lookback said.
+            let calls = crate::alpha::merge_calls(self.alpha_ledger.load(), &self.signals.all());
+            let set = crate::alpha::qualifying_set(&calls, &rules, chrono::Utc::now());
+            info!(
+                qualifying = set.len(),
+                of_wallets = self.wallets.len(),
+                calls_scored = calls.len(),
+                lookback_days = rules.lookback_secs / 86_400,
+                min_samples = rules.min_samples,
+                min_hit_rate = rules.min_hit_rate,
+                "alpha wallet set refreshed"
+            );
+            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
+            *cache = Some((Instant::now(), set));
+        }
+
+        let cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
+        cache.as_ref().map(|(_, s)| s.contains(wallet)).unwrap_or(false)
+    }
+
+    /// Fire a smart-money buy, once per token, and tell the group either way.
+    ///
+    /// Deduped by mint for the process lifetime: a signal keeps accumulating
+    /// buys after it crosses the threshold, and each one would otherwise
+    /// trigger another entry into the same position.
+    #[cfg(feature = "sniper")]
+    async fn spawn_smart_buy(&self, mint: &str, wallets: usize) {
+        // Held for the whole entry. Dropped automatically when this returns.
+        let _slot = match self.buy_slots.clone().acquire_owned().await {
+            Ok(s) => s,
+            // Only if the semaphore is closed, which it never is.
+            Err(_) => return,
+        };
+        {
+            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
+            if !seen.insert(mint.to_string()) {
+                return;
+            }
+        }
+        // Second line of defence, and the one that survives a restart: the
+        // in-memory set above is empty on boot, so a token still inside its
+        // window would be bought AGAIN. Holding any of it already means the
+        // position is open.
+        if let Some((owner, _)) = self.sniper.trading_identity()
+            && let Some((raw, _)) = self.rpc.token_balance_raw(&owner.to_string(), mint).await
+            && raw > 0
+        {
+            info!(%mint, "already holding — not opening a second position");
+            return;
+        }
+        // IS A QUALIFYING ALPHA WALLET IN THIS TOKEN?
+        //
+        // Asked here, on a trade the normal trigger has already approved.
+        // Alpha never reaches this point on its own — it only decides whether
+        // an already-valid entry is worth extra size.
+        let alpha_wallet = {
+            let buyers = {
+                let tracker = match self.conviction.lock() {
+                    Ok(t) => t,
+                    Err(p) => p.into_inner(),
+                };
+                tracker.buyers_in_window(mint, Instant::now())
+            };
+            buyers.into_iter().find(|w| {
+                self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
+                    && self.alpha_qualified(w)
+            })
+        };
+
+        let reason = match &alpha_wallet {
+            Some(w) => {
+                let label = self
+                    .wallets
+                    .get(w)
+                    .map(|x| x.name.clone())
+                    .unwrap_or_else(|| crate::wallets::short_address(w));
+                info!(%mint, wallet = %w, %label, "alpha wallet in this token — adding size");
+                format!("{wallets} tracked wallets in window · alpha {label}")
+            }
+            None => format!("{wallets} tracked wallets in window"),
+        };
+        let outcome = if alpha_wallet.is_some() {
+            self.sniper.buy_mint_with_alpha(mint, &reason).await
+        } else {
+            self.sniper.buy_mint(mint, &reason).await
+        };
+        info!(%mint, wallets, ?outcome, "smart-money buy");
+
+        // A REFUSAL IS NOT A POSITION.
+        //
+        // The claim taken above exists to stop a burst of signals opening two
+        // positions in the same token. It was also, accidentally, remembering
+        // that a token had once been unbuyable — and the reasons a buy is
+        // refused are mostly temporary. HALT gets lifted, daily caps reset,
+        // price impact moves, market caps change.
+        //
+        // The cost of getting this wrong was measured: a token refused at
+        // 22:27 because HALT was engaged could never be reconsidered. Nine
+        // minutes later it had 17 eligible buyers, 68 SOL of tracked inflow and
+        // 11,643 SOL of volume, passed every gate — and was silently skipped,
+        // because the mint was already in this set.
+        //
+        // Releasing the claim costs a re-check on the next tracked buy, and
+        // every guard that would permanently reject a token (rug blacklist,
+        // mint authority, freeze) runs before any network call, so a genuinely
+        // bad token is re-refused cheaply.
+        let opened = matches!(
+            outcome,
+            crate::sniper::BuyOutcome::Submitted { .. } | crate::sniper::BuyOutcome::Rehearsed { .. }
+        );
+        if !opened {
+            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
+            seen.remove(mint);
+        }
+        // Entry valuation, computed from the fill we just got rather than a
+        // fresh quote: `tokens_out` and `sol_in` are the price we actually
+        // paid, and by the time an alert renders the market has already moved.
+        // Best-effort — a missing supply or SOL price omits the figure rather
+        // than delaying or blocking the alert.
+        let entry_mcap = match &outcome {
+            // `tokens_out` is UI units on BOTH paths — see `buy_mint`. It was
+            // raw on one of them, and dividing here as well produced an entry
+            // valuation of $21.4B. No conversion belongs at this layer.
+            crate::sniper::BuyOutcome::Submitted { sol_in, tokens_out, .. } if *tokens_out > 0.0 => {
+                match (
+                    self.prices.sol_usd(Duration::from_secs(600)),
+                    self.rpc.token_supply(mint).await,
+                ) {
+                    (Some(sol_usd), Some(supply)) => {
+                        Some((sol_in / tokens_out) * supply * sol_usd)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome, entry_mcap) {
+            self.alerter.send_html(msg).await;
+        }
+
+        // PRIMARY supply-ceiling enforcement: right after the fill, on the
+        // real balance. The sweep repeats this as a fallback, but doing it here
+        // means an oversized position is trimmed in seconds rather than
+        // whenever the next reconciliation happens to come round.
+        if opened {
+            self.sniper.enforce_supply_cap(mint, &self.alerter).await;
+        }
+    }
+
 }
 
 impl Detector {
@@ -175,9 +420,11 @@ impl Detector {
             #[cfg(feature = "sniper")]
             sniper,
             #[cfg(feature = "sniper")]
-            smart_bought: std::sync::Mutex::new(std::collections::HashSet::new()),
+            smart_bought: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             #[cfg(feature = "sniper")]
-            alpha_wallets: std::sync::Mutex::new(None),
+            alpha_wallets: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "sniper")]
+            buy_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             alpha_ledger,
             #[cfg(feature = "sniper")]
             rebound: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1404,7 +1651,15 @@ impl Detector {
                                 wallets = eligible.len(),
                                 "auto-buy triggered on smart-money SOL volume"
                             );
-                            self.spawn_smart_buy(&buy.mint, eligible.len()).await;
+                            // SPAWNED, not awaited. See `BuyTask`: awaiting
+                            // here blocked stream consumption for the whole
+                            // entry path and got us evicted for backpressure.
+                            let task = self.buy_task();
+                            let mint = buy.mint.clone();
+                            let n = eligible.len();
+                            tokio::spawn(async move {
+                                task.spawn_smart_buy(&mint, n).await;
+                            });
                         }
                     }
                 }
@@ -1420,188 +1675,22 @@ impl Detector {
         }
     }
 
-    /// Is this wallet currently trusted with Alpha money?
-    ///
-    /// The qualifying set is recomputed at most every five minutes. Scores move
-    /// as calls resolve, not tick by tick, so a fresher answer would cost a full
-    /// history scan per buy to tell us the same thing.
+    /// Clone the handles a buy needs so it can run off the stream task.
     #[cfg(feature = "sniper")]
-    fn alpha_qualified(&self, wallet: &str) -> bool {
-        const REFRESH: Duration = Duration::from_secs(300);
-
-        // Staleness is decided under the lock; the REBUILD is not.
-        //
-        // Rebuilding reads and parses the whole score archive — tens of
-        // thousands of rows — and this is called on the tracked-buy path, which
-        // carries roughly 861 transactions a minute. Doing that file work while
-        // holding the lock stalled every other caller behind it on an async
-        // worker thread.
-        //
-        // The timestamp is stamped BEFORE the rebuild, so a burst of callers
-        // arriving together does not each start their own scan.
-        let stale = {
-            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
-            match cache.as_mut() {
-                Some((at, _)) if at.elapsed() < REFRESH => false,
-                Some((at, _)) => {
-                    *at = Instant::now();
-                    true
-                }
-                None => {
-                    // Nothing to serve yet: claim the rebuild with an empty set
-                    // so concurrent callers wait for it rather than duplicating.
-                    *cache = Some((Instant::now(), std::collections::HashSet::new()));
-                    true
-                }
-            }
-        };
-
-        if stale {
-            let rules = self.sniper.alpha_rules();
-            // ARCHIVE first, live store second. The archive is the 30-day
-            // record; the live store is today, which has not been archived yet.
-            // Scoring on the live store alone silently capped every wallet's
-            // record at `track_for_secs` — one day — no matter what the
-            // lookback said.
-            let calls = crate::alpha::merge_calls(self.alpha_ledger.load(), &self.signals.all());
-            let set = crate::alpha::qualifying_set(&calls, &rules, chrono::Utc::now());
-            info!(
-                qualifying = set.len(),
-                of_wallets = self.wallets.len(),
-                calls_scored = calls.len(),
-                lookback_days = rules.lookback_secs / 86_400,
-                min_samples = rules.min_samples,
-                min_hit_rate = rules.min_hit_rate,
-                "alpha wallet set refreshed"
-            );
-            let mut cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
-            *cache = Some((Instant::now(), set));
-        }
-
-        let cache = self.alpha_wallets.lock().unwrap_or_else(|p| p.into_inner());
-        cache.as_ref().map(|(_, s)| s.contains(wallet)).unwrap_or(false)
-    }
-
-    /// Fire a smart-money buy, once per token, and tell the group either way.
-    ///
-    /// Deduped by mint for the process lifetime: a signal keeps accumulating
-    /// buys after it crosses the threshold, and each one would otherwise
-    /// trigger another entry into the same position.
-    #[cfg(feature = "sniper")]
-    async fn spawn_smart_buy(&self, mint: &str, wallets: usize) {
-        {
-            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
-            if !seen.insert(mint.to_string()) {
-                return;
-            }
-        }
-        // Second line of defence, and the one that survives a restart: the
-        // in-memory set above is empty on boot, so a token still inside its
-        // window would be bought AGAIN. Holding any of it already means the
-        // position is open.
-        if let Some((owner, _)) = self.sniper.trading_identity()
-            && let Some((raw, _)) = self.rpc.token_balance_raw(&owner.to_string(), mint).await
-            && raw > 0
-        {
-            info!(%mint, "already holding — not opening a second position");
-            return;
-        }
-        // IS A QUALIFYING ALPHA WALLET IN THIS TOKEN?
-        //
-        // Asked here, on a trade the normal trigger has already approved.
-        // Alpha never reaches this point on its own — it only decides whether
-        // an already-valid entry is worth extra size.
-        let alpha_wallet = {
-            let buyers = {
-                let tracker = match self.conviction.lock() {
-                    Ok(t) => t,
-                    Err(p) => p.into_inner(),
-                };
-                tracker.buyers_in_window(mint, Instant::now())
-            };
-            buyers.into_iter().find(|w| {
-                self.wallets.in_groups(w, &self.cfg.tracked.auto_buy_groups)
-                    && self.alpha_qualified(w)
-            })
-        };
-
-        let reason = match &alpha_wallet {
-            Some(w) => {
-                let label = self
-                    .wallets
-                    .get(w)
-                    .map(|x| x.name.clone())
-                    .unwrap_or_else(|| crate::wallets::short_address(w));
-                info!(%mint, wallet = %w, %label, "alpha wallet in this token — adding size");
-                format!("{wallets} tracked wallets in window · alpha {label}")
-            }
-            None => format!("{wallets} tracked wallets in window"),
-        };
-        let outcome = if alpha_wallet.is_some() {
-            self.sniper.buy_mint_with_alpha(mint, &reason).await
-        } else {
-            self.sniper.buy_mint(mint, &reason).await
-        };
-        info!(%mint, wallets, ?outcome, "smart-money buy");
-
-        // A REFUSAL IS NOT A POSITION.
-        //
-        // The claim taken above exists to stop a burst of signals opening two
-        // positions in the same token. It was also, accidentally, remembering
-        // that a token had once been unbuyable — and the reasons a buy is
-        // refused are mostly temporary. HALT gets lifted, daily caps reset,
-        // price impact moves, market caps change.
-        //
-        // The cost of getting this wrong was measured: a token refused at
-        // 22:27 because HALT was engaged could never be reconsidered. Nine
-        // minutes later it had 17 eligible buyers, 68 SOL of tracked inflow and
-        // 11,643 SOL of volume, passed every gate — and was silently skipped,
-        // because the mint was already in this set.
-        //
-        // Releasing the claim costs a re-check on the next tracked buy, and
-        // every guard that would permanently reject a token (rug blacklist,
-        // mint authority, freeze) runs before any network call, so a genuinely
-        // bad token is re-refused cheaply.
-        let opened = matches!(
-            outcome,
-            crate::sniper::BuyOutcome::Submitted { .. } | crate::sniper::BuyOutcome::Rehearsed { .. }
-        );
-        if !opened {
-            let mut seen = self.smart_bought.lock().unwrap_or_else(|p| p.into_inner());
-            seen.remove(mint);
-        }
-        // Entry valuation, computed from the fill we just got rather than a
-        // fresh quote: `tokens_out` and `sol_in` are the price we actually
-        // paid, and by the time an alert renders the market has already moved.
-        // Best-effort — a missing supply or SOL price omits the figure rather
-        // than delaying or blocking the alert.
-        let entry_mcap = match &outcome {
-            // `tokens_out` is UI units on BOTH paths — see `buy_mint`. It was
-            // raw on one of them, and dividing here as well produced an entry
-            // valuation of $21.4B. No conversion belongs at this layer.
-            crate::sniper::BuyOutcome::Submitted { sol_in, tokens_out, .. } if *tokens_out > 0.0 => {
-                match (
-                    self.prices.sol_usd(Duration::from_secs(600)),
-                    self.rpc.token_supply(mint).await,
-                ) {
-                    (Some(sol_usd), Some(supply)) => {
-                        Some((sol_in / tokens_out) * supply * sol_usd)
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        if let Some(msg) = crate::alerts::render_smart_buy(mint, wallets, &outcome, entry_mcap) {
-            self.alerter.send_html(msg).await;
-        }
-
-        // PRIMARY supply-ceiling enforcement: right after the fill, on the
-        // real balance. The sweep repeats this as a fallback, but doing it here
-        // means an oversized position is trimmed in seconds rather than
-        // whenever the next reconciliation happens to come round.
-        if opened {
-            self.sniper.enforce_supply_cap(mint, &self.alerter).await;
+    fn buy_task(&self) -> BuyTask {
+        BuyTask {
+            cfg: self.cfg.clone(),
+            sniper: self.sniper.clone(),
+            rpc: self.rpc.clone(),
+            alerter: self.alerter.clone(),
+            wallets: self.wallets.clone(),
+            prices: self.prices.clone(),
+            signals: self.signals.clone(),
+            conviction: self.conviction.clone(),
+            alpha_ledger: self.alpha_ledger.clone(),
+            smart_bought: self.smart_bought.clone(),
+            alpha_wallets: self.alpha_wallets.clone(),
+            buy_slots: self.buy_slots.clone(),
         }
     }
 
